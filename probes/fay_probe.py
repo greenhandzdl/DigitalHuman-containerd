@@ -1171,7 +1171,7 @@ def check_remote_audio_input(host: str) -> None:
            f"12s 内收到 log 帧 {len(logs)} 条：{logs[:4] or '无'}"
            + ("" if heard else "｜服务端没把这段声音当作语音。三种可能，按代码位置排："
                                "① 10001 上没收到字节（连接被服务端线程提前关掉，"
-                               "参见 patches/origin_fay/0004 修的那个竞态）；"
+                               "参见 patches/fay/0004 修的那个竞态）；"
                                "② recorder 的远程支路没在跑（core/recorder.py:251 的 is_remote 免检）；"
                                "③ 拾音被丢弃 —— wake_word_enabled=false 时只要 FeiFei.speaking "
                                "为 True，读到的帧就直接扔掉（core/recorder.py:267），"

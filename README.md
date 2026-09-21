@@ -14,13 +14,16 @@ containerd/
 ├── .env.example                模板；run.sh 首次执行会复制成 .env 并填随机密钥
 ├── images/
 │   ├── fay.Dockerfile          一份 Dockerfile 靠 ARG FAY_SRC 构建 fay 与 origin_fay 两个镜像
+│   │                         （补丁与依赖清单两份共用：PATCH_DIR / REQS_DIR 默认都指 overlay|patches/fay）
 │   ├── yueshen_rag.Dockerfile  唯一带 chromadb 的 MCP 服务器，单独镜像（不并进 Fay，见「yueshen 知识库」）
 │   └── service.Dockerfile      原样 COPY service/，依赖读它自己的 pyproject.toml
 ├── overlay/                    ★ 覆盖层：不改源码的配置手段
 │   ├── {fay,origin_fay}/system.conf      仓库里不存在，容器里必须有（见下）
 │   ├── {fay,origin_fay,fay-lite}/config.json      关麦克风、关本地播放、换 edge_tts 音色
 │   ├── {fay,origin_fay,fay-lite}/mcp_servers.json  把 id=4 yueshen 从 stdio 换成 sse 指向容器（每实例一份、可写）
-│   └── {fay,origin_fay,service,yueshen_rag}/requirements-docker.txt  收窄过的依赖清单（冲突处理见下）
+│   ├── {fay,origin_fay,fay-lite}/system.conf 等之外，依赖清单只有一份：
+│   │   overlay/fay/requirements-docker.txt     fay 与 origin-fay 共用（两边源码逐字节相同）
+│   └── {service,yueshen_rag}/requirements-docker.txt  其余两个镜像各自的依赖清单（冲突处理见下）
 ├── patches/                    ★ 补丁层：构建期 patch -p1 盖到镜像里的 /app
 ├── seed/                       ★ 种子层：service 的参考语料不在仓库里，这里给一份能自测的
 ├── probes/                     测试件本体：fay_probe.py · adapter_test.py · ue_audit.py
@@ -92,7 +95,7 @@ compose 只把前三个
 | Embedding（记忆检索） | `qwen3-embedding:0.6b` | 609MB，走 `/v1/embeddings`；启动时预热实测 dim=1024。它一加载就会把对话模型挤出显存，所以每轮问答要 8 次 embedding 的链路在这台机器上特别贵 |
 
 模型名除了写死在 `overlay/fay/system.conf` 里，还可以用环境变量盖：
-`FAY_GPT_MODEL_ENGINE` / `FAY_BIG_MODEL_ENGINE`（补丁 `patches/fay/0003`，
+`FAY_GPT_MODEL_ENGINE` / `FAY_BIG_MODEL_ENGINE`（补丁 `patches/fay/0006`，
 不打补丁 = 原行为）。compose 里的 `fay-lite` 就靠它跑 `qwen2.5:1.5b`，
 不用为测试再造一份 system.conf。
 
@@ -127,6 +130,11 @@ compose 只把前三个
 `_call_planner_llm`，走同一张图但多几发 LLM）。在显存够用的机器上是产品力的差别，
 在这台显存被占满的机器上是「一个数量级的墙钟时间」，与容器无关。
 
+> 这一行对照属于**旧基线**：那时的 `fay/` 是 `45b44e9` 那份源码导入，规划器那层是它自己加的。
+> 2026-09-21 起 fork 换成 `chuan918/Fay`（v4.8.1 的直接后代），Python 源码与上游逐字节相同，
+> 这张表量不出现在了 —— 现在两个实例的差别只有 config，不再有代码档。保留它是为了说明
+> 「墙钟时间可以差一个数量级而两处都不是容器的问题」这条判据的来历。
+
 放大链路写死在上游几个数字里 —— `utils/api_embedding_service.py:110` 是
 `timeout=60` + `max_retries=2`，`llm/execution_manager.py:203` 是小模型 `timeout=60`。
 显存不够 → 加载 609MB 的 embedding 模型就得把 6.6GB 的对话模型挤出去，下一轮再换回来 →
@@ -142,10 +150,10 @@ compose 给 `fay` / `origin-fay` 两个服务注入 ——
 
 | 环境变量 | 容器里的值 | 作用 | 补丁 |
 |---|---|---|---|
-| `LLM_REQUEST_TIMEOUT` / `LLM_REQUEST_MAX_RETRIES` | `420` / `0` | 真正的回答给足时间，且不再重发（重发只会让回答更晚） | `fay/0001`、`origin_fay/0001` |
-| `EMBEDDING_TIMEOUT` / `EMBEDDING_MAX_RETRIES` | `90` / `1` | 仿生记忆检索那发 embedding 的预算。**这里吃过一次教训**：起初按「容器里不要死等」压成 `20` / `0`，run #7 否证了它 —— ollama 换入模型实测要 72.9s，20s 必然超时，除了静默落回 `simulation_engine/gpt_structure.py:294` 的模拟向量，还把开机线程堵在一串重试后面，`:8765` 拖到第 61 秒才 bind（见下面「就绪判据」）。90s 按实测最坏值给，换入完成后一发 embedding 只要 0.06s | `fay/0001`、`origin_fay/0002` |
-| `STREAM_REPLY_IDLE_TIMEOUT` | `480` | 回复空闲上限必须 ≥ 上面那条 LLM 超时，否则「模型正在慢慢想」被判成「Fay 卡住」 | `fay/0002`、`origin_fay/0003` |
-| `FAY_GPT_MODEL_ENGINE` / `FAY_BIG_MODEL_ENGINE` | 缺省不注入 | 换掉 `system.conf` 里的模型名，给显存不够的机器留一条「换个吃得下的小模型」的路（`fay-lite` 用这个跑 qwen2.5:1.5b） | `fay/0003` |
+| `LLM_REQUEST_TIMEOUT` / `LLM_REQUEST_MAX_RETRIES` | `420` / `0` | 真正的回答给足时间，且不再重发（重发只会让回答更晚） | `fay/0001` |
+| `EMBEDDING_TIMEOUT` / `EMBEDDING_MAX_RETRIES` | `90` / `1` | 仿生记忆检索那发 embedding 的预算。**这里吃过一次教训**：起初按「容器里不要死等」压成 `20` / `0`，run #7 否证了它 —— ollama 换入模型实测要 72.9s，20s 必然超时，除了静默落回 `simulation_engine/gpt_structure.py:294` 的模拟向量，还把开机线程堵在一串重试后面，`:8765` 拖到第 61 秒才 bind（见下面「就绪判据」）。90s 按实测最坏值给，换入完成后一发 embedding 只要 0.06s | `fay/0002` |
+| `STREAM_REPLY_IDLE_TIMEOUT` | `480` | 回复空闲上限必须 ≥ 上面那条 LLM 超时，否则「模型正在慢慢想」被判成「Fay 卡住」 | `fay/0003` |
+| `FAY_GPT_MODEL_ENGINE` / `FAY_BIG_MODEL_ENGINE` | 缺省不注入 | 换掉 `system.conf` 里的模型名，给显存不够的机器留一条「换个吃得下的小模型」的路（`fay-lite` 用这个跑 qwen2.5:1.5b） | `fay/0006` |
 
 补丁里未设置环境变量时的默认值与上游逐字一致（不打补丁 = 原行为）。
 显存被挤走时问答侧仍会慢到分钟级，那是环境而不是配置问题，探针按下面的三态处理。
@@ -270,11 +278,12 @@ Fay 实例 `fay-lite` 兜住：同一个镜像、同一套补丁、同一份 `sy
 以及 MCP 那一整组不打 LLM 的确定性判据（含 prestart 那三档；剩下 2 条 SKIP 是无头白名单里的
 `window capture` 与本机没起的 FunASR，`yueshen rag` 这一轮已经是两条正面 PASS，见规矩 4）。
 
-顺带两个坑：`origin_fay` 那份 `utils/api_embedding_service.py` 是 **CRLF** 行尾
-（fork 里同路径是 LF），所以同一个逻辑改动在两个仓库是两份不同字节的补丁 ——
-GNU patch 2.8 没有 `--strip-trailing-cr`，`-l/--ignore-whitespace` 也不认 CR。
-补丁生成器也因此必须按 **bytes** 捕获 `diff` 的输出，`text=True` 会走 universal
-newlines 把 `\r` 吞掉，生成出的补丁再也贴不回 CRLF 仓库。
+一个一直咬人的坑：v4.8.1 这份源码里 `utils/api_embedding_service.py`、
+`gui/flask_server.py`、`fay_booter.py`、`utils/config_util.py`、`main.py`（还带 BOM）都是
+**CRLF** 行尾，补丁必须在字节层对得上 —— GNU patch 2.8 没有 `--strip-trailing-cr`，
+`-l/--ignore-whitespace` 也不认 CR，用 LF 上下文生成的补丁一份都贴不上去（旧基线上那 5 份
+就是这么作废的）。补丁生成器因此必须按 **bytes** 捕获 `diff` 的输出，`text=True` 会走
+universal newlines 把 `\r` 吞掉，生成出的补丁再也贴不回 CRLF 仓库。
 另外 `max_tokens` 在这条链路上是有害的：qwen3.5 带思考段，实测 `max_tokens=16`
 时 68.8s 后 `content` 仍是空（直连 ollama 也一样，`eval_count=8` 全花在 reasoning）。
 
@@ -287,7 +296,7 @@ newlines 把 `\r` 吞掉，生成出的补丁再也贴不回 CRLF 仓库。
 | 处理 | 原因 |
 |---|---|
 | 不装 `langchain` 伞包，只装 `langchain-core` + `langchain-openai` | 伞包会把 langgraph 解析到最新，而 `langgraph>=1.2.11` 依赖 `langgraph-sdk>=0.4.2`，后者才要求 `websockets>=14` —— 与上游 `websockets~=10.4` 冲突（`core/wsa_server.py:7` 用 `websockets.legacy`，`core/socket_bridge_service.py:44` 是两参数 handler） |
-| `langgraph>=1.2,<1.2.11` + `langgraph-sdk<0.4`（只给 fork 装） | 不装 langgraph 时 `llm/nlp_cognitive_stream.py:2556` 直接把 `tool_registry` 清空、日志 "workflow tools are disabled and the app will use direct LLM mode"，MCP 工具整条路是死的。上面那个冲突其实可以绕开：PyPI 元数据显示 langgraph 1.2.0~1.2.10 把 sdk 钉在 `<0.4.0`，而 sdk 0.3.x 完全不带 websockets 依赖。实测装进 `langgraph 1.2.2 + sdk 0.3.15`，`websockets` 保持 10.4，fork 唯一的 import 点 `from langgraph.graph import END, START, StateGraph` 通过。上游那份 `requirements.txt:28` 也列了 langgraph，但**没有任何 `.py` import 它**（全仓只有 3 个 notebook、`fay.spec` 和这一行 requirements 提到），那道工具门禁是 fork 自己加的，所以 `overlay/origin_fay/` 不装 |
+| ~~`langgraph>=1.2,<1.2.11` + `langgraph-sdk<0.4`~~（**2026-09-21 起不装**） | 旧基线（`45b44e9` 那份导入）里 `llm/nlp_cognitive_stream.py:2556` 有一道 fork 自己加的门禁：不装 langgraph 就把 `tool_registry` 清空、日志 "workflow tools are disabled and the app will use direct LLM mode"，MCP 工具整条路是死的 —— 当时确实按上面那两行钉版本装上了（实测 `langgraph 1.2.2 + sdk 0.3.15`，`websockets` 保持 10.4）。换成 `chuan918/Fay` 之后全仓只剩 `requirements.txt:28` 那一行提到 langgraph、没有任何 `.py` import 它（`_LANGGRAPH_AVAILABLE` 也 grep 不到），门禁随旧代码一起没了，所以共用的一份清单里不再装 | 
 | 钉 `uvicorn<0.35` | `mcp` 带进来的 uvicorn 0.53 在 `protocols/websockets/auto.py` 直接 import `websockets.server.ServerProtocol`（10.4 没有），MCP SSE 8765 起不来；0.34.3 实测正常 |
 | 钉 `mcp>=1.2,<2`（两个 Fay 都钉，实测解析 1.30.0） | 上游 `requirements.txt:31` 是裸 `mcp`，如今解析到 2.2.0，而 2.x 把 `mcp.server.Server` 换成了高层 `MCPServer`，低层那套 `@server.list_tools()` / `@server.call_tool()` 注册装饰器没有了。两个仓库各有 6 个文件按 1.x 低层 API 写：`faymcp/mcp_server.py:26` + `mcp_servers/{logseq,schedule_manager,window_capture,yueshen_rag}/server.py` + `test/mcp_stdio_example.py`，2.x 下全是 `AttributeError: 'Server' object has no attribute 'list_tools'`。最后一台是 `faymcp/data/mcp_servers.json` 里 `autostart: true` 的「tools」，于是每次开机都白记一条「tools 连接失败」。钉回 1.x 后开机 `tools 已连接`、`/api/mcp/servers/1/tools` 出 5 个工具、`ping` 真回 `pong`。另一条佐证：这台机器开发者自己的 `fay/.venv` 装的就是 `mcp-1.6.0.dist-info` |
 | 补 `aliyun-python-sdk-core` | `main.py:86` 无条件 `from asr import ali_nls` → `asr/ali_nls.py:9` 需要 `aliyunsdkcore`，即使完全不用阿里云 ASR |
@@ -320,8 +329,8 @@ volumes:
 改 `overlay/` 下的文件 → `docker compose restart fay`，**不需要重新 build**。
 只有当上游源码本身更新（`git pull`）时才需要 `./run.sh build`。
 
-必须提供 `system.conf` 的原因：上游提交 `45b44e9` 把 `system.conf` 加进了
-`.gitignore`（只留 `system.conf.bak` 模板），而上游默认启动流程走的远程配置中心
+必须提供 `system.conf` 的原因：上游从 v4.8.1 起就没提交过 `system.conf`（只留
+`system.conf.bak` 模板），fork 的 `ce900d8` 又把它加进了 `.gitignore`，而上游默认启动流程走的远程配置中心
 `http://1.12.69.110:5500` 现已不可达 —— 所以本地既没有配置文件、也拿不到远程配置，
 Fay 原本处于无法启动的状态。另外 `CMD` 里刻意**不传 `-config_center`**：
 `utils/config_util.py:336` 见到该参数就强制走远程，会绕过本地文件。
@@ -335,22 +344,31 @@ RUN for p in /tmp/patches/*.patch; do patch -p1 -d /app --silent < "$p"; done
 ```
 
 补丁用 `diff -ruN a b` 生成（`--- a/... +++ b/...`），所以 `-p1` 正好落到 `/app`。
-目前 14 份：
+目前 10 份：fay 6 + service 2 + yueshen_rag 2。
+
+> **2026-09-21 基线变更**：Fay 侧仍是 6 份，但这 6 份的内容整套换掉了 —— `fay/` 子模块的远端从
+> `chuan114514/-Helpful-Listener-Fay-AI-`（把源码整份导入、与上游无共同历史，导入点 `45b44e9`）
+> 换成 `chuan918/Fay`（`f702528`，上游 `xszyou/Fay` v4.8.1 的直接后代，只多 `.gitignore` /
+> `config.json` / `explain.md` 三处非代码改动）。旧基线上那 5 份 `patches/fay/*` 对新树
+> **一份都贴不上去**（源码不同，且新树这些文件是 CRLF），全部作废；现在这套 fay 补丁直接取
+> 自原来 `patches/origin_fay/` 那 5 份（它们本来就是照 v4.8.1 的字节写的）再加一份 0006。
+> 于是 **fay 与 origin_fay 共用同一套补丁和同一份依赖清单**（两个镜像的 Python 源码逐字节相同，
+> `patches/origin_fay/` 与 `overlay/origin_fay/requirements-docker.txt` 已删）。
+> 下文 Fay 侧标了 `run #N` 或日期的实测数字，凡是在**旧 fork 那份代码**上量的都按原样保留、
+> 不重新解释（它们记录的是当时那个镜像的行为，不再描述现在的 `dh-fay`）；在 `origin-fay` 上
+> 量的那批本来就打在 v4.8.1 上，换基线后仍然是现状。两实例的对照从此量的不再是「fork 改了
+> 什么代码」，而是同一份代码在两份 config 下的差别 —— 想恢复代码档的对照，得回到 `45b44e9`。
 
 | 补丁 | 治什么 |
 |---|---|
 | `patches/service/0001-admin-consultation-events-via-chat-flow.patch` | 上游 `tests/test_admin_ops.py::test_admin_consultation_events` 调 `POST /elder/consultation/classify` 后期望在后台看到留痕，但该端点是**无状态判定**（`app/schemas/consultation.py` 里 `consultation_event_id` 的注释写明"聊天接口中返回"；`log_consultation_event` 只被 `chat_service.py:80` 调用）。补丁把它改走真正产生留痕的聊天链路，语义不变、断言变对 |
 | `patches/service/0002-medication-missed-scan-clock-frozen.patch` | 上游 `tests/test_medication_reminder.py::test_medication_missed_scan` 用 `now - 2h` 造"过去的提醒时刻"，但 `notification_service.slot_local_datetime` 把 `"HH:MM"` 钉到今天、`run_medication_missed_scan` 又跳过相对 `local_now + grace` 仍在未来的时刻 —— 容器本地钟走到 00:00~01:59 时该用例必红（run #25 在 02:0x 撞上）。补丁只在用例里 `monkeypatch` 冻结扫描钟 `_local_now` 到今天 12:00，语义与真实挂钟解耦，`TZ=Asia/Dhaka` 下打完 `1 passed`、原始文件同一 TZ `1 failed`（见「实测通过的链路」的 pytest 段）|
-| `patches/fay/0001-llm-and-embedding-timeouts-env-configurable.patch` | 见上一节：把写死的 60s 超时/重试次数开成环境变量 |
-| `patches/fay/0002-stream-reply-idle-timeout-env-configurable.patch` | `gui/flask_server.py` 里 `_STREAM_READ_IDLE_TIMEOUT = 180` 开成 `STREAM_REPLY_IDLE_TIMEOUT`，让它能排到 LLM 超时之后 |
-| `patches/fay/0003-model-engine-env-overridable.patch` | `utils/config_util.py` 读配置后允许 `FAY_GPT_MODEL_ENGINE` / `FAY_BIG_MODEL_ENGINE` 覆盖模型名，给 `fay-lite` 留一条换轻模型的路 |
-| `patches/origin_fay/0001-llm-timeouts-...` | 与 fay/0001 的 LLM 部分同一件事（上游那份把 LLM 与 embedding 拆在不同文件，所以拆成两份补丁） |
-| `patches/origin_fay/0002-embedding-timeouts-...-CRLF-source.patch` | embedding 部分；上游那份 `api_embedding_service.py` 是 **CRLF** 行尾，必须单独一份字节正确的补丁 |
-| `patches/origin_fay/0003-stream-reply-idle-timeout-...-CRLF-source.patch` | 同 fay/0002，源文件同样是 CRLF |
-| `patches/fay/0004-remote-audio-conn-lifetime-aligned-with-upstream.patch` | fork 的远程音频监听线程：`deviceConnector` 晚于 `thread.start()` 赋值 + 对端 FIN 后在死连接上忙轮询。改回上游那套连接生命周期，见「远程音频输入」一节 |
-| `patches/origin_fay/0004-remote-audio-listener-thread-race-CRLF-source.patch` | 上游 `main.py`/`fay_booter.py` 里那个赋竞态的同一处，行尾是 CRLF |
-| `patches/fay/0005-graceful-stop-no-longer-reports-as-crash.patch` | `docker stop` 一个健康的 Fay 容器会拿到 **exit=1** —— 一次正常的停止被记成崩溃。`stopAll()` 串行 join 把 5 秒清理预算吃光，超时就 `os._exit(1)`。见「优雅停止」一节 |
-| `patches/origin_fay/0005-...-CRLF-source.patch` | 同一件事：上游那份 `main.py` 是 BOM+CRLF（`thread_manager.py` 反倒与 fork 字节相同），所以按字节另生成一份 |
+| `patches/fay/0001-llm-timeouts-env-configurable.patch` | `llm/execution_manager.py` 里写死的 LLM 请求超时/重试开成环境变量，默认值与上游一致（不设变量 = 原行为）。超时链那一节的前提就是这条 |
+| `patches/fay/0002-embedding-timeouts-env-configurable-CRLF-source.patch` | 同一件事的 embedding 半边（上游把 LLM 与 embedding 拆在不同文件，所以是两份补丁）：`api_embedding_service.py` 写死 60s + 2 次重试，本机显存不够时一发 embedding 就超 60s，三轮重试能把问答预算整个吃光。开成 `EMBEDDING_TIMEOUT` / `EMBEDDING_MAX_RETRIES`。源文件是 **CRLF**，补丁必须按字节生成 |
+| `patches/fay/0003-stream-reply-idle-timeout-env-configurable-CRLF-source.patch` | `gui/flask_server.py` 里 `_STREAM_READ_IDLE_TIMEOUT = 180` 开成 `STREAM_REPLY_IDLE_TIMEOUT`，让它能排到 LLM 超时之后（否则「模型正在慢慢想」被判成「Fay 卡住」，`/v1/chat/completions` 返回空 content）。同样是 CRLF 源 |
+| `patches/fay/0004-remote-audio-listener-thread-race-CRLF-source.patch` | `fay_booter.py` 的远程音频监听线程：`__init__` 先 `thread.start()` 后赋 `deviceConnector`，而 `run()` 第一句就读它。`xszyou/Fay@74b49ae` 把 `except: pass`（1 秒后重试、能自愈）改成「记日志 + `__running=False`」，这个竞态于是变成「监听线程一上线就退」+「关掉刚 accept 的 socket」，客户端表现为 connect 之后立刻 ConnectionReset。补丁把赋值挪到 start 之前，见「远程音频输入」一节 |
+| `patches/fay/0005-graceful-stop-no-longer-reports-as-crash-CRLF-source.patch` | `docker stop` 一个健康的 Fay 容器会拿到 **exit=1** —— 一次正常的停止被记成崩溃，`restart: on-failure` 下还会把该停的实例重新拉起。`stopAll()` 串行 join 吃光 5 秒清理预算后走 `os._exit(1)`，改成 `os._exit(0)`。见「优雅停止」一节 |
+| `patches/fay/0006-model-engine-env-overridable-CRLF-source.patch` | `utils/config_util.py` 读完配置后允许 `FAY_GPT_MODEL_ENGINE` / `FAY_BIG_MODEL_ENGINE` 覆盖模型名，给 `fay-lite` 留一条换轻模型的路（不必为它单独写一份只读 system.conf）。不设变量时与上游一字不差 |
 | `patches/yueshen_rag/0001-sse-transport-env-switch.patch` | 上游 `mcp_servers/yueshen_rag/server.py` 只有 stdio transport，容器里没人在 stdin 那头写、Fay 永远连不上。加一条 `YUESHEN_TRANSPORT=sse` 分支（裸 ASGI `(scope,receive,send)` 可调用对象，形状照已被容器验过的 `fay/faymcp/mcp_server.py:538`），让 Fay 用 `mcp_servers.json` 的 ip 直连 `http://<容器名>:8766/sse`；默认仍 stdio，不设变量行为一字不变（见「yueshen 知识库」一节）|
 | `patches/yueshen_rag/0002-embedding-timeout-env.patch` | 上游把 embedding 请求超时写死 30s（`_call_api timeout=30`）。本机显存只够一个模型，ollama 换入嵌入模型实测 72.9s，30s 撞上的表现是 `requests.ReadTimeout` 被 `upsert_chunks` 的 except 吞掉、静默跳过该 chunk，ingest 返回 `success:true / inserted:0`。开成 `YUESHEN_EMBED_TIMEOUT`，默认仍 30 |
 
@@ -993,6 +1011,12 @@ yueshen 层用，成熟镜像维持不带。另一个坑：同一 Dockerfile 并
 
 **第二条是这次新加判据时第一次跑就抓出来的东西**，两条独立的缺陷：
 
+> **基线已换，读这两条前先记一句**：下面量的是**旧** `fay/`（`45b44e9`，与上游无共同历史的
+> 一份源码导入）。2026-09-21 起 `fay/` 子模块指向 `chuan918/Fay@f702528`，那是 v4.8.1 的直接
+> 后代、Python 源码与上游逐字节相同 —— 于是**第 2 条那个 fd/线程泄漏在新基线上不存在**（它
+> 属于旧导入版），只剩第 1 条竞态；两个实例现在共用 `patches/fay/0004` 这一份补丁。两段复测
+> 数字都保留原文，因为它们是当时那两个镜像的真实测量，只是不再描述当前的 `dh-fay`。
+
 1. **`origin_fay`（贴近上游那份）的监听线程一上线就自杀。** 上游提交
    `74b49ae`（"大小模型逻辑重构 + 单模型模式 + 多处优化"）把 `except` 从 `pass`
    改成「打日志 + `__running = False`」并在循环后 `close()` socket，但
@@ -1004,9 +1028,9 @@ yueshen 层用，成熟镜像维持不带。另一个坑：同一 Dockerfile 并
    证据，每条连接一行：
    `[系统] 远程音频设备 User 监听异常，停止监听线程: 'DeviceInputListener' object has no attribute 'deviceConnector'`
    （用户名还是默认的 `User`，说明线程在读到注册帧之前就死了。）
-   → `patches/origin_fay/0004-remote-audio-listener-thread-race-CRLF-source.patch`
+   → `patches/fay/0004-remote-audio-listener-thread-race-CRLF-source.patch`
    只调这两行的顺序，不动上游那套「记日志 + 退出」的语义。
-2. **`fay`（fork 那份）每条远程音频连接泄漏一个 fd 和两个线程。** 它的
+2. **（旧基线）`fay`（fork 那份）每条远程音频连接泄漏一个 fd 和两个线程。** 它的
    `while self.deviceConnector:` 既不查 `__running` 也不判 `recv()` 返回空字节，
    对端优雅关闭（FIN）后线程就在这条死连接上空转，`stop()` 置的 `__running`
    也退不出内层循环。实测（`/proc/1/task` / `/proc/1/fd`，PID 1 就是 `main.py`）：
@@ -1014,7 +1038,7 @@ yueshen 层用，成熟镜像维持不带。另一个坑：同一 Dockerfile 并
    再等 15 秒（keepalive 走完一轮）只回落到 `75/100`；断开完全靠 10 秒一次的心跳
    扫出来（日志里断开时刻总是落在 10s 网格上）。同一份测量在 `dh-origin-fay` 上
    是 `90→92→90` 且 fd 全程不动 —— 它不泄漏，代价是连接根本用不了。
-   → `patches/fay/0004-remote-audio-conn-lifetime-aligned-with-upstream.patch`
+   → `patches/fay/0004-remote-audio-listener-thread-race-CRLF-source.patch`
    把上游 `74b49ae` 的三段（`and self.__running` / `if not data: break` /
    线程退出前 `close()`）移植过来，**并且同时带上顺序修正**：只移植上游那段会把
    fork 也变成第 1 条那个死线程，等于用一个缺陷换另一个。

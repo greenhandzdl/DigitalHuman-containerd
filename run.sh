@@ -22,6 +22,19 @@ ensure_env() {
   python3 tools/gen_keys.py
 }
 
+ensure_origin_fay() {
+  # ../origin_fay 不是第 5 个仓库，而是 ../fay 里 `upstream` remote 的 git worktree，
+  # 所以它不在根仓库里（既没被 submodule 记录，也被 .gitignore 排除），新 clone 拿不到。
+  # 缺就在这里按固定路径补出来 —— 否则 origin-fay 要一路到 Dockerfile 的 COPY 那步
+  # 才报一个看不出原因的错。
+  [ -e ../origin_fay/.git ] && return
+  echo "[run] ../origin_fay 缺失：从 fay 的 upstream remote 建 worktree"
+  git -C ../fay fetch --quiet upstream || {
+    echo "[run] 拉不到 upstream（xszyou/Fay），origin-fay 起不来" >&2; return 1; }
+  git -C ../fay worktree add ../origin_fay upstream-main 2>/dev/null \
+    || git -C ../fay worktree add -b upstream-main ../origin_fay upstream/main
+}
+
 wait_http() { # wait_http <url> <deadline_sec> <name>
   local url=$1 deadline=$((SECONDS + $2)) name=$3
   until curl -fsS --max-time 3 "$url" >/dev/null 2>&1; do
@@ -169,6 +182,7 @@ sys.exit(0 if d.get("fay_forwarded") and (am.get("content") or "").strip() else 
 case "${1:-up}" in
   up)
     ensure_env
+    ensure_origin_fay
     $COMPOSE build
     $COMPOSE up -d
     shift 2>/dev/null || true
@@ -184,6 +198,7 @@ case "${1:-up}" in
     ;;
   test)
     ensure_env
+    ensure_origin_fay
     shift 2>/dev/null || true
     # 只在「构建输入比镜像新」时重建对应服务。两个方向都咬过人：
     #  - `up -d` 只认镜像存不存在，不认镜像是不是比补丁新。改完 patches/ 或
@@ -198,7 +213,7 @@ case "${1:-up}" in
     for svc in fay origin-fay backend yueshen-rag; do
       case "$svc" in
         fay)        src="images/fay.Dockerfile patches/fay overlay/fay" ;;
-        origin-fay) src="images/fay.Dockerfile patches/origin_fay overlay/origin_fay" ;;
+        origin-fay) src="images/fay.Dockerfile patches/fay overlay/origin_fay" ;;
         backend)    src="images/service.Dockerfile patches/service overlay/service" ;;
         yueshen-rag) src="images/yueshen_rag.Dockerfile patches/yueshen_rag overlay/yueshen_rag" ;;
       esac
@@ -324,10 +339,14 @@ case "${1:-up}" in
     shift
     rc=0
     # 表头用 ASCII：printf %-Ns 数的是字节，中文列头会把对齐整个搞坏
-    printf '%-11s %-6s %-20s %-11s %s\n' REPO BRANCH UPSTREAM AHEAD/BEHIND WORKTREE
+    # 列宽按实际值放过：origin_fay 的分支是 upstream-main、上游是 upstream/main，
+    # 各比原来的 6/20 宽，窄一格整张表就错位。
+    printf '%-11s %-14s %-22s %-11s %s\n' REPO BRANCH UPSTREAM AHEAD/BEHIND WORKTREE
     for r in fay origin_fay service ue; do
       d="../$r"
-      [ -d "$d/.git" ] || { echo "$r 不是 git 仓库" >&2; rc=1; continue; }
+      # -e 而不是 -d：origin_fay 现在是 ../fay 里 upstream remote 的 git worktree，
+      # 它的 .git 是一个指回 ../fay/.git/worktrees/ 的文件，不是目录。
+      [ -e "$d/.git" ] || { echo "$r 不是 git 仓库" >&2; rc=1; continue; }
       branch=$(git -C "$d" rev-parse --abbrev-ref HEAD)
       up=$(git -C "$d" rev-parse --abbrev-ref '@{u}' 2>/dev/null || echo NO-UPSTREAM)
       # rev-list --count 用 TAB 分隔左右计数，不换掉就跟下面的 "0/0" 对不上
@@ -335,7 +354,7 @@ case "${1:-up}" in
       counts=${counts:-?/?}
       dirty=$(git -C "$d" status --porcelain | wc -l)
       { [ "$counts" = "0/0" ] && [ "$dirty" = "0" ]; } || rc=1
-      printf '%-11s %-6s %-20s %-11s %s\n' "$r" "$branch" "$up" "$counts" "${dirty} dirty"
+      printf '%-11s %-14s %-22s %-11s %s\n' "$r" "$branch" "$up" "$counts" "${dirty} dirty"
     done
     echo
     echo "[audit] containerd 侧的全部改动都在这些目录里（上游零改动）："
@@ -349,7 +368,7 @@ case "${1:-up}" in
     [ $rc -eq 0 ] && echo "[audit] 上游四个仓库干净" || echo "[audit] 有仓库不干净或与上游分叉" >&2
     exit $rc
     ;;
-  build)   ensure_env; $COMPOSE build ;;
+  build)   ensure_env; ensure_origin_fay; $COMPOSE build ;;
   smoke)   shift; smoke ;;
   ps)      shift; $COMPOSE ps ;;
   logs)    shift; $COMPOSE logs -f --tail=120 ${1:-} ;;

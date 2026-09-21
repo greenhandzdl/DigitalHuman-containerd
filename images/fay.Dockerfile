@@ -30,13 +30,16 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /app
 
-# 同一份 Dockerfile 可以构建两个 Fay 仓库：fay（本项目的 fork）与 origin_fay（上游 v4.8.1）。
-# 两者的 overlay 目录同名区分，见 containerd/overlay/{fay,origin_fay}/。
+# 同一份 Dockerfile 构建两个 Fay 实例：fay（fork，chuan918/Fay）与 origin_fay（上游 v4.8.1）。
+# 只有源码目录按 FAY_SRC 换；补丁与依赖清单两份共用，因为 fork 是上游的直接后代、
+# Python 源码逐字节相同（fork 只多了 .gitignore / config.json / explain.md）。
+# 哪天 fork 又改代码，把这两个 ARG 指回各自的目录即可（overlay/<src>/、patches/<src>/）。
 ARG FAY_SRC=fay
 ARG PATCH_DIR=containerd/patches/fay
+ARG REQS_DIR=containerd/overlay/fay
 
 # 依赖清单单独先拷，保证改业务代码不会击穿 pip 层缓存。
-COPY containerd/overlay/${FAY_SRC}/requirements-docker.txt /tmp/requirements-docker.txt
+COPY ${REQS_DIR}/requirements-docker.txt /tmp/requirements-docker.txt
 RUN pip install --no-cache-dir -r /tmp/requirements-docker.txt
 
 # 原样拷贝上游代码。

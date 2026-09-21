@@ -1,5 +1,9 @@
 # Fay 容器化最小依赖集 —— 不改动 fay 仓库，本文件只存在于 containerd/overlay/。
 #
+# fay 与 origin-fay 两个实例共用这一份（Dockerfile 的 REQS_DIR 默认指向 overlay/fay）：
+# fork（chuan918/Fay）是上游 v4.8.1 的直接后代，只多了 .gitignore / config.json /
+# explain.md 三处非代码改动，Python 源码与上游逐字节相同，所以依赖集也只剩一份。
+#
 # 依据：对 39 个启动链文件的 AST 静态扫描（模块级 import），而非上游那份
 # requirements.txt（它把 ASR/TTS 全供应商、桌面 GUI、知识库索引器都混在一起）。
 # 因此**不装** torch / sentence-transformers / chromadb / opencv / PyQt5 / pygame，
@@ -20,24 +24,16 @@ uvicorn<0.35
 # --- LLM 大脑 (llm/nlp_cognitive_stream.py, llm/execution_manager.py) ---
 # 只装 langchain-core + langchain-openai，不装 langchain 伞包：
 # 伞包会把 langgraph 解析到最新，而 langgraph>=1.2.11 依赖 langgraph-sdk>=0.4.2，
-# 后者才要求 websockets>=14 —— 与上游 requirements.txt 的 websockets~=10.4 冲突
+# 后者要求 websockets>=14 —— 与上游 requirements.txt 的 websockets~=10.4 冲突
 # （core/wsa_server.py:7 用 websockets.legacy，
 # core/socket_bridge_service.py:44 用两参数 handler）。
 # 启动链实际只 import langchain_openai / langchain_core.messages；
 # utils/openai_api/langchain_openai_api.py 用到 langchain.chains 但全仓无人 import。
 #
-# langgraph 必须显式钉版本装上来，否则 MCP 工具调用整条路是死的：
-# llm/nlp_cognitive_stream.py:2556 在 _LANGGRAPH_AVAILABLE 为假时把 tool_registry
-# 清空、退回 direct LLM 模式，「课程知识库」连上了也不会被真正调用。
-# 全仓只有一个 import 点（:16 from langgraph.graph import END, START, StateGraph），
-# 而 PyPI 元数据显示冲突可以绕开：langgraph 1.2.0~1.2.10 把 sdk 钉在 <0.4.0，
-# sdk 0.3.x 完全不带 websockets 依赖。实测在 dh-fay:local 里
-# pip install 'langgraph>=1.2,<1.2.11' 'langgraph-sdk<0.4' 装进 1.2.2 + 0.3.15，
-# websockets 保持 10.4，END/START/StateGraph 三项 import 全通。
+# 不装 langgraph：全仓（chuan918/Fay@f702528 == 上游 v4.8.1 的 Python 源码）grep 不到
+# 一处 langgraph import，上游 requirements.txt:28 那行是摆设。
 langchain-core
 langchain-openai
-langgraph>=1.2,<1.2.11
-langgraph-sdk<0.4
 openai
 httpx
 requests
@@ -45,16 +41,12 @@ urllib3
 tenacity
 
 # --- MCP 客户端/服务端 (faymcp/*) ---
-# 上游 requirements.txt:31 写的是裸 `mcp`，现在解析到 2.2.0，而 2.x 把 `mcp.server.Server`
-# 换成了新的高层 MCPServer —— 低层的 @server.list_tools()/@server.call_tool() 注册装饰器没了。
-# 本仓库有 6 处按 1.x 低层 API 写：faymcp/mcp_server.py:26 加上自带的 4 个 MCP 服务器
-# （mcp_servers/{logseq,schedule_manager,window_capture,yueshen_rag}/server.py）和
-# test/mcp_stdio_example.py。2.x 下这些一律 AttributeError: 'Server' object has no
-# attribute 'list_tools'，其中 stdio_example 是 mcp_servers.json 里 autostart 的
-# 「tools」，于是每次开机都记一条「tools 连接失败」。钉回 1.x（实测解析 1.30.0，
-# 不动 uvicorn/websockets，上面那两条钉法照旧生效）。
-# 另一条佐证：这台机器上开发者自己的 fay/.venv 装的正是 mcp-1.6.0
-# （site-packages/mcp-1.6.0.dist-info）—— 这套代码是在 1.x 下调通的。
+# 上游裸 `mcp` 解析到 2.2.0，而 2.x 的 mcp.server.Server 换成了高层 MCPServer，
+# 没有低层的 @server.list_tools() 注册装饰器。仓库里 6 个文件按 1.x 写
+# （faymcp/mcp_server.py:26、
+# mcp_servers/{logseq,schedule_manager,window_capture,yueshen_rag}/server.py、
+# test/mcp_stdio_example.py），2.x 下全部 AttributeError，开机 autostart 的「tools」
+# 必失败。钉 1.x，实测解析 1.30.0。
 mcp>=1.2,<2
 
 # --- 语音输出：tts_module 取非 ali/gptsovits/volcano 时走 ms_tts_sdk(edge_tts) ---

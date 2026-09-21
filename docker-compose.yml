@@ -284,9 +284,11 @@ services:
         condition: service_started
 
   # ---------------------------------------------------- origin_fay（上游 v4.8.1 参照实例）
-  # 与上面的 fay 是两份不同代码：fay = 本项目 fork（导入点 45b44e9），
-  # origin_fay = 上游 8b6c2b4 v4.8.1，两者 56 个文件不同。同一份 Dockerfile 靠
-  # build args 换源码目录与补丁目录，用来做「fork 相对上游改了什么」的对照实验。
+  # 目录 ../origin_fay 不再是第二份 clone，而是 ../fay 里 `upstream` remote 的 git worktree
+  # （git -C fay worktree add ../origin_fay -b upstream-main upstream/main）。
+  # fork（chuan918/Fay）现在是上游 v4.8.1 的直接后代，两边 Python 源码逐字节相同，
+  # 所以补丁与依赖清单共用 overlay/fay 那一份，这里只换源码目录。这一组对照因此
+  # 量的不再是「fork 改了代码」，而是同一份代码在两份 config.json/system.conf 下的差别。
   origin-fay:
     <<: [*host-gateway, *restart]
     build:
@@ -294,7 +296,6 @@ services:
       dockerfile: containerd/images/fay.Dockerfile
       args:
         FAY_SRC: origin_fay
-        PATCH_DIR: containerd/patches/origin_fay
     image: dh-origin-fay:local
     container_name: dh-origin-fay
     command: ["python", "main.py", "start"]
@@ -462,7 +463,7 @@ services:
   # ollama /api/ps 实测 size_vram=387029401 / size=6149206178 —— 只有 6% 权重进显存，
   # 于是规划器一次要 165~240s，问答质量根本没法在测试里判定。
   # 所以再起一个只在 test profile 下的实例：同一个镜像、同一份 system.conf，
-  # 只靠 containerd/patches/fay/0003-model-engine-env-overridable.patch 放开的
+  # 只靠 containerd/patches/fay/0006-model-engine-env-overridable-CRLF-source.patch 放开的
   # FAY_GPT_MODEL_ENGINE / FAY_BIG_MODEL_ENGINE 换成 qwen2.5:1.5b（986MB，能整权重进显存，
   # 实测规划器 20.0s 冷 / 0.2s 暖，且守 {"action":"finish"...} 的 JSON 协议）。
   # 它只多占一份自己的卷，端口不映射到宿主机 —— 探针在 compose 网络上打它。
