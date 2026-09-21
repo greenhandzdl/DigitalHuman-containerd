@@ -16,8 +16,10 @@
 containerd/
 ├── docker-compose.yml          常驻 6 个服务：mysql / redis / fay / yueshen-rag
 │                               / adapter / backend；另有 profiles:["test"] 的
-│                               fay-lite（测试用轻模型 Fay）+ 8 个一次性测试件
-├── run.sh                      up · build · test · smoke · audit · upstream · logs · ps · down · reset
+│                               fay-lite（测试用轻模型 Fay）+ 8 个一次性测试件，
+│                               和 profiles:["kb"] 的 kb-ingest（外部语料入库，见下）
+├── run.sh                      up · build · test · smoke · audit · upstream · logs
+│                               · kbslice · kb · ps · down · reset
 ├── .env.example                模板；run.sh 首次执行会复制成 .env 并填随机密钥
 ├── images/
 │   ├── fay.Dockerfile          Fay 镜像（唯一一份 Fay 源码 ../fay；原先靠 ARG FAY_SRC
@@ -33,12 +35,16 @@ containerd/
 │   └── {service,yueshen_rag}/requirements-docker.txt  其余两个镜像各自的依赖清单（冲突处理见下）
 ├── patches/                    ★ 补丁层：构建期 patch -p1 盖到镜像里的 /app
 ├── seed/                       ★ 种子层：service 的参考语料不在仓库里，这里给一份能自测的
+│                               ├── kb_corpus/  外部科普语料的切片产物（`tools/slice_kb_corpus.py`
+│                               │               生成，bind-mount 进 yueshen-rag；不进 git，见「外部语料」）
 ├── probes/                     测试件本体：fay_probe.py · adapter_test.py · ue_audit.py
 │                               · ws_timing_test.py（探针自己的收工时机自测）
 │                               · backend_probe.py（后端活体探针：路由/迁移/schema/鉴权/写路径/调度器）
 │                               · yueshen_probe.py（chromadb 那条链路：嵌入出口/清单/入库/检索/stats 一致性）
+│                               · kb_ingest.py（外部语料入库 + 12 问真实问法抽测，`./run.sh kb`）
 ├── tools/                      reset_test_db.py（跑 pytest 前重建测试库）· tts_negative_control.py
 │                               · make_yueshen_corpus.py（构建期造 yueshen 语料，见「yueshen 知识库」）
+│                               · slice_kb_corpus.py（把项目方给的 .docx 按原序摊平成可检索的切片）
 ├── adapter/server.py           新增组件：后端 /api/chat ↔ Fay /api/send+get-msg
 ├── sql/init/00-create-database.sql
 └── _audit/                     ue-audit 的 JSON 报告落这里（README 的数字对着它复核）
@@ -55,6 +61,8 @@ cd /mnt/data/DigitalHuman/containerd
 ./run.sh test fay-probe   # 只跑其中一组（改探针时不用等全套）
 ./run.sh audit     # 核账：三个上游仓库是否仍然零改动、与上游不分叉（非零退出即可当断言）
 ./run.sh upstream  # 跟上上游：fetch xszyou/Fay，报落后几条，并把每份 fay 补丁对 upstream/main 干跑预检
+./run.sh kbslice   # 把 uploads/ 里那包 .docx 切片到 seed/kb_corpus/（换语料时才需要跑）
+./run.sh kb        # 切片入库 + 12 问真实问法抽测（要求每问在 top3 命中自己的出处）
 ./run.sh logs fay  # 单独看某个服务
 ```
 
@@ -389,9 +397,14 @@ RUN for p in /tmp/patches/*.patch; do patch -p1 -d /app --silent < "$p"; done
 活跃），buildkit 会把不常用的层淘汰，于是 `build` 经常把 `pip install` 当冷缓存重跑 ——
 实测 2026-09-20 15:55 那次就纯属淘汰，构建输入一个都没改。所以 `run.sh test` 在起服务
 之前做一次**按输入时间判断**的重建：拿每个可构建服务的镜像 `Created` 时间，去
-`find <Dockerfile> <patches/…> <overlay/…> -newermt`，有更新的文件才建，建失败（补丁贴不
-上去时 `patch` 非零退出）就地停下、绝不退回复用旧镜像。宁可偶尔多建一次（一次 `touch`
-就会触发），也不静默测旧构件。镜像名不写死，由 `compose images -q <svc>` 报出来。
+`find <Dockerfile> <patches/…> <overlay/**/requirements*.txt> -newermt`，有更新的文件才建，
+建失败（补丁贴不上去时 `patch` 非零退出）就地停下、绝不退回复用旧镜像。宁可偶尔多建一次
+（一次 `touch` 就会触发），也不静默测旧构件。镜像名不写死，由 `image_id_of()` 现查 —— 只跟
+`compose images` 拿 `REPOSITORY:TAG`，ID 交给 `docker image inspect` 按 tag 读（**不能**用
+`compose images -q`：那张表第一列是 CONTAINER，旧容器还在跑时它报的是容器用的镜像，
+run #29 因此把一次真实的 ID 变更印成「没变」）。overlay 那半边只点名 requirements 而不是
+整个目录，理由见 run #30 那节：`system.conf`/`config.json`/`mcp_servers.json` 是运行期挂载、
+Fay 自己会回写，算进输入等于每轮必空转重建一次。
 这道闸量的到底是 mtime，而 mtime 会骗人：只改 `images/service.Dockerfile` 的注释也会触发
 重建，可 BuildKit 全量命中缓存、镜像 ID 一字不差，内容其实什么都没变（本机 2026-09-19
 之后 `backend` 每轮都在名单上，就是这么来的）。所以建完还要把镜像 ID 重读一遍，三种结果
@@ -646,7 +659,7 @@ origin 侧 9.4s），lite 侧 `qwen2.5:1.5b 1166/1166MB`、直连 1.1s，于是 
 没有置 `DEGRADED_LLM_HOST` —— 所有耗时类判据这次都是**硬判**：过就是真过，不过就记红。
 下面这一整段连同它的表，都是**换基线之前**那一版 `dh-fay` 的数字（见「2026-09-21 基线变更」）；
 新基线上的第一轮完整九组是 **run #28**，撤掉参照实例之后的第一轮八组是 **run #29**，
-两节都在本节末。
+外部语料进库之后的第一轮是 **run #30**（也是当前最新的一次完整运行），三节都在本节末。
 
 | 组 | run #27 实测 |
 |---|---|
@@ -835,6 +848,8 @@ QA 链的正面证据由 lite 那组给。**这不是换基线换来的回归**�
 挂载、根本没进镜像），BuildKit 全量命中缓存，所以只是空转。**没有**为此改挂载方式：
 把 `faymcp/data/` 换命名卷要动运行期注册表的落盘位置，收益不值那个风险。提交前
 `git checkout -- overlay/<实例>/mcp_servers.json` 即可，纯时间戳漂移。
+（**run #30 之后"下一轮白重建一次"这半句失效了**：那道闸的输入清单改成只点名
+`overlay/**/requirements*.txt`，见 run #30 那节；`git status` 必脏照旧，`checkout --` 仍是正确动作。）
 
 ### run #29：撤掉参照实例之后的第一轮八组（2026-09-21 17:24~17:45）
 
@@ -864,9 +879,62 @@ QA 链的正面证据由 lite 那组给。**这不是换基线换来的回归**�
 所以那组一条降级都没有。
 
 `fay` 镜像这轮被 mtime 判成「构建输入比镜像新」而重建了一次 —— 因为 `images/fay.Dockerfile`
-真被改过（删掉 `FAY_SRC`/`PATCH_DIR` 三个 ARG）。**重建后镜像 ID 一模一样（2738eb20c5bc）**，
-BuildKit 全量命中缓存：那三个 ARG 本来就不进任何一层的内容。这条是 run #28 末段那个
-「mtime 判定会引发一次空转重建」的具体再现，只是这次的 mtime 变化是真改了文件、而不是运行期回写。
+真被改过（`FAY_SRC`/`PATCH_DIR`/`REQS_DIR` 三个 ARG 删掉，而它们正在 `COPY` 的指令文本里）。
+日志当场把这次印成「重建后镜像 ID 没变（2738eb20c5bc）」，**那句话是错的**：`dh-fay:local`
+现在指向 `0db394dea218`、`Created=17:30:35` 正落在这轮里。错因在核对 ID 那一步用
+`docker compose images -q <svc>` 读 ID，而那张表第一列是 CONTAINER —— 旧容器还在跑时它报的是
+「容器用的镜像」而不是 tag 指向的镜像，于是重建完 tag 已经挪走、它还在拿旧 ID 跟旧 ID 比。
+run #30 起改成只跟 compose 拿 `REPOSITORY:TAG`、ID 用 `docker image inspect` 按 tag 现查
+（`run.sh` 的 `image_id_of()`）。**但"内容没变"这个结论本身是对的**，只是它不该由那条日志担保：
+`docker image inspect` 对两个 ID 逐层比 `.RootFS.Layers`，前 7 层（base + apt + pip）摘要一字不差，
+第 8~12 层全换了摘要 —— 而 `COPY` 会把源文件的 mtime 打进 tar 头，`fay/requirements.txt`
+在 17:05 被 touch 过一次（内容与 HEAD 一致，`git -C fay status` 到这一步仍是 0 dirty），
+再加上那三条 `COPY` 的指令文本本身改了 cache key。重新导出的是层，不是代码。
+
+### run #30：外部语料进库之后的第一轮八组（2026-09-21 18:03~18:25，22 分钟）
+
+第一次把 `seed/kb_corpus/`（项目方那 14 份科普文档的切片，见「外部语料」）挂进
+`yueshen-rag` 之后跑完整一轮，八组全绿、退出码 0。
+
+| 组 | run #30 实测 |
+|---|---|
+| `backend-test` | **39 passed（3.64s）** |
+| `backend-probe` | **11 PASS / 0 SKIP / 0 FAIL** |
+| `adapter-test` | **11/11** |
+| `probe-selftest` | **[ws-timing] 10/10** |
+| `probe-fay-lite` | **41/43 通过 · 2 SKIP（都是边界，本轮无降级）** |
+| `ue-audit` | **2 PASS / 0 SKIP / 0 FAIL** |
+| `fay-probe` | **40/45 通过 · 3 条 LLM 证据降级 + 2 条边界 SKIP** |
+| `probe-yueshen` | **6/6 —— 入库 `chunks=576 inserted=576 用时 5.1s`、`vectors=576`** |
+| 收尾一条 | `[test] fay-lite 优雅停止（SIGTERM）退出码 0` |
+
+**知识库那组是这一轮的主角**：向量库从 1 条涨到 576 条之后，六条判据一条没松动，MARKER
+检索仍然排进 top3（回来的还是那 251 字）。唯一的物理变化是嵌入模型换入的成本 ——
+`知识库嵌入出口可用` 这条单独跑时是 0.1s，这一轮 9b 正压着显存，它花了 **58.1s**；
+0002 补丁把这条超时开到 180s 就是为了这种情况。`fay-probe` 侧同一轮里
+`仿生记忆向量真伪` 也是 56.3s 真向量，两条对得上。
+
+`fay-probe` 的分母是 45 而不是 43：多出来的 2 条是「收帧不足就重连一遍」的重试分支
+（日志里 `probe_..._ws100020_r2` / `_ws100021_r2`）。这轮它真的触发了两次 —— 两处
+`WS :10002 收到文字播报` 第 1 发都是正文为空（只回 `log` + `question` 两帧），探针按
+120s 排空重问，第二发分别拿到 45 字、42 字，判据按第二发计。**这条正好是 run #27 给
+「排空重问」写下的用途的第一次实际命中**。本轮环境依旧不给退路：9b 权重只驻留 6%
+（387/6149MB、直连第一发 32.9s），`DEGRADED_LLM_HOST` 置起，被降级的三条是「直连下限」
+那条测量、`OpenAI 兼容层 /v1/chat/completions`（TimeoutError）和 `HTTP /api/send →
+/api/get-msg`（90.1s 内 0 字，按环境判 SKIP 而不是红）；lite 侧 1.5b 满驻留
+（1166/1166MB、直连 3.7s），一条降级都没有。
+
+这一轮仍然出现了一次空转重建（trigger 是 `overlay/fay/mcp_servers.json`），报的
+「重建后镜像 ID 没变（0db394dea218）」这次是对的 —— 全轮结束后 `Created` 还是 17:30:35。
+**这两件事在 run #30 之后都收掉了**，根因比"mtime 会骗人"具体：那道闸把 `overlay/<src>/`
+整个目录当构建输入，而 Dockerfile 从 overlay 拿走的只有 requirements（`grep -n overlay
+images/*.Dockerfile` 一共 4 行），`system.conf` / `config.json` / `mcp_servers.json` 全是
+运行期 bind-mount —— Fay 起来就把 `connection_time` 回写进去，于是每一轮的 mtime 必然比镜像新、
+每轮必空转重建一次。清单改成点名那几份 requirements 之后，复跑 `./run.sh test backend-test`
+已经不再打印「先重建它」（39 passed / 2.93s）。另一个假阴性（run #29 末段那条）也修了：
+核对 ID 改成 `image_id_of()`，只跟 compose 拿 `REPOSITORY:TAG`、ID 用 `docker image inspect`
+按 tag 现查，不再读容器上的旧 ID。
+
 
 ### 「Fay 会调工具」这句话，探针只敢证到中间那一档
 
@@ -1101,6 +1169,45 @@ simulation_engine.gpt_structure import get_text_embedding` 必然失败，
 返回 1 条命中 251 字、里面带构建期造进 docx 的 MARKER → `yueshen_stats vectors=1` 对上 ingest 的
 `inserted=1`（持久化 `/app/persist`，集合 `yueshen_kb`）。容器内的 SSE 握手冒烟输出
 `event: endpoint` + `session_id=…`，验的就是 0001 那份裸 ASGI 端点没把首帧挤掉。
+
+### 外部语料：项目方给的那 14 份 .docx 怎么进库
+
+`uploads/老年康养通用科普.zip`（27 MB，其中 22 MB 是 Word 内嵌字体）是项目方给的科普语料。
+不能整包丢进 `/app/corpus` 收工 —— 上游 `CorpusLoader` 有两处行为决定了必须先切片：
+
+- `_extract_docx` 先 `for p in doc.paragraphs` 再 `for t in doc.tables`，**表格一律追加在全部
+  段落之后**，原文里「这张表在讲什么」的那级标题与表头，在解析出的文本流里已经跟数据行不相邻了；
+- `split_into_chunks` 是定长 600 / overlap 120、不认标题，一组「问 → 答」可能被劈成两块，检索只回得来一半。
+
+`tools/slice_kb_corpus.py` 改成按 `doc.element.body.iterchildren()` **原序**遍历段落与表格，
+表格每行摊平成 `列名：值；列名：值`（重复的合并单元格压掉），沿标题维护一条章节路径，攒够阈值成一个
+片段，然后**每个来源只写一份 .docx**、每行钉一个 `〔文件·章节〕` 前缀 —— 出处跟着内容走，检索回来的
+那块能自己交代它是哪份文件的哪一节。「每来源一份」而不是「每片段一份」是量出来的：python-docx 光空
+模板就 35 KB，516 个片段各一份是 21 MB，14 份是 696 KB。
+
+产物落 `seed/kb_corpus/`，**但和源包一样不进 git**：两个仓库都是 PUBLIC，而这批内容是伙伴方的
+交付物 —— 归属问题不是体积问题。进 git 的是工具（切片器、`kb_ingest.py`、compose 里那条挂载、
+这一节文档），数据在任何机器上一条命令重建：`./run.sh kbslice && ./run.sh kb`。源包留在
+`uploads/`（根 .gitignore，理由见那里）。**少了这两步的后果是明说的而不是隐形的**：知识库只剩
+构建期那 3 段合成语料，`probe-yueshen` 照样 6/6（它只验链路），而 `./run.sh kb` 会报
+`chunks=1` 并在 12 问上判红。进容器用
+bind-mount 挂成 `/app/corpus/kb`，不打进镜像层，有两个原因：27 MB 源数据不该进 git；以及
+`ingest_yueshen(reset:true)` 是**整目录重扫**（`server.py:209` 的 `os.walk`），切片只要不在被扫的那个
+目录里，下一轮 `probe-yueshen` 的 reset 就会把它静默清掉。
+
+**2026-09-21 实测**（`./run.sh kbslice` → `./run.sh kb` → `./run.sh test probe-yueshen`）：
+
+| 步骤 | 结果 |
+|---|---|
+| `kbslice` | 14 份原文 → **516 片段 / 155,532 字** → 14 个 .docx · 696 KB。`.slice-manifest.json` 记每份的 sha256、片段数、字数；重跑幂等（先把所有来源解析完、再删上一轮的切片，中途失败不会把语料目录清空） |
+| 片段→向量 | 容器内直接调 `CorpusLoader._file_to_chunks` 数：14 份切片 = **575 chunk**（516 片段里超 600 字的那些被 yueshen 又切了一刀），加构建期那份合成语料的 1 条 = **576**，与 ingest 报的数一字不差 |
+| `kb` | `chunks=576 inserted=576`、`yueshen_stats vectors=576` 对上；12 问真实问法 **12/12** 在 top3 命中各自出处（清单见 `probes/kb_ingest.py --list`） |
+| `probe-yueshen` | **仍是 6/6** —— 它的 MARKER 检索在库从 1 条涨到 576 条之后照样排进 top3，判据不用改；只是那条现在测的变成「大库里还捞不捞得回合成语料那一段」 |
+
+`inserted == chunks` 这个对账是必须的，不是仪式：`upsert_chunks` 对 embedding 失败是「跳过这条、继续」
+（`server.py:363`），ingest 照样返回 `success:true` —— 0002 补丁治的就是它在 30s 超时下把整批跳光而
+`inserted:0`。所以 `probes/kb_ingest.py` 在入库之外还必须真问一遍；那 12 问的期望词各自只出现在该去的
+那份文件里，它们同时是**切片质量**的验收：合成语料那种「段落里有个标记词」测不出表格摊平得好不好，真实问法测得出。
 
 **BuildKit 的 pip 缓存挂载这次单独量了值，也记了为什么 Fay/service 故意不给**。给
 `yueshen_rag.Dockerfile` 的 `pip install` 层加 `--mount=type=cache,target=/root/.cache/pip`
@@ -1352,10 +1459,12 @@ UE 自己按 BOM 定字符集，读得懂，所以判据必须先认 BOM。实�
   `images/yueshen_rag.Dockerfile` + compose 里的 `yueshen-rag`，chromadb 装在那一边、
   Fay 这半边的 `uvicorn<0.35` + `websockets~=10.4` 一道也不动。要让 Fay 连得过去还差两处，
   都不在上游仓库里：`patches/yueshen_rag/0001` 把只有 stdin 的 stdio transport 开成
-  可按环境变量选的 SSE，`overlay/{fay,fay-lite,origin_fay}/mcp_servers.json` 把 id=4 从
-  stdio 换成 `sse` + `http://yueshen-rag:8766/sse`。语料是构建期生成的
-  （`tools/make_yueshen_corpus.py`，仓库里原本一份 pdf/docx 都没有）。
-  判据在 `probes/yueshen_probe.py`，跑在 `./run.sh test probe-yueshen`。
+  可按环境变量选的 SSE，`overlay/{fay,fay-lite}/mcp_servers.json` 把 id=4 从
+  stdio 换成 `sse` + `http://yueshen-rag:8766/sse`。语料有两份来源：构建期自己造的验证
+  语料（`tools/make_yueshen_corpus.py`，仓库里原本一份 pdf/docx 都没有），和项目方给的
+  14 份科普文档切出来的 `seed/kb_corpus/`（`tools/slice_kb_corpus.py` + bind-mount，
+  见上面「外部语料」）。判据同样两处：链路在 `probes/yueshen_probe.py`
+  （`./run.sh test probe-yueshen`），这批数据本身在 `probes/kb_ingest.py`（`./run.sh kb`）。
 - **UE5**：不进 compose。判据、数字和"零处引用"到底是怎么否证掉裸 `10002` 命中的，
   见上面「UE 仓库的容器侧处置」。
 

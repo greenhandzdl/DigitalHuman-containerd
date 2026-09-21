@@ -146,6 +146,12 @@ services:
       YUESHEN_EMBED_TIMEOUT: ${YUESHEN_EMBED_TIMEOUT:-180}
     volumes:
       - yueshen-persist:/app/persist
+      # 项目方给的科普语料（14 份 .docx 切片后的 14 个文件，进 git）。镜像里那份
+      # containerd/tools/make_yueshen_corpus.py 生成的只有 3 段，够验链路、不够当知识。
+      # 挂成 /app/corpus 的子目录：`ingest_yueshen` 是整目录扫的（server.py:192 用
+      # os.walk），所以这份和合成语料一起入库、一起被探针那组的 reset 重建，不会各活各的。
+      # 重新切片：./run.sh kbslice <zip|目录>，见 tools/slice_kb_corpus.py 的 docstring。
+      - ./seed/kb_corpus:/app/corpus/kb:ro
     healthcheck:
       test: ["CMD", "python", "-c", "import socket;socket.create_connection(('127.0.0.1',8766),3).close()"]
       interval: 10s
@@ -485,6 +491,29 @@ services:
       - ./overlay/fay/system.conf:/app/system.conf:ro
       - ./overlay/fay/config.json:/app/config.json:ro
     command: ["python", "/probe/yueshen_probe.py", "--base", "http://fay:5000", "--timeout", "240"]
+    depends_on:
+      fay:
+        condition: service_healthy
+      yueshen-rag:
+        condition: service_started
+
+  # ------------------------------------------------ 科普语料入库 + 检索抽测（./run.sh kb）
+  # 与 probe-yueshen 的区别在那份脚本的 docstring 里：那组测链路，这组测数据。
+  # 走 profile "kb" 而不是 "test"：它会把向量库整个 reset 重嵌入（几百个片段、几分钟），
+  # 且没有新断言 —— 测试组该是每次都跑的体检，这一步是「语料变了才跑一次」的动作。
+  # 只用标准库，所以不必借 dh-fay 那 1.1GB 镜像。
+  kb-ingest:
+    <<: [*host-gateway]
+    profiles: ["kb"]
+    image: docker.m.daocloud.io/python:3.12-slim
+    container_name: dh-kb-ingest
+    restart: "no"
+    # 嵌入超时的真正落点在被测的 yueshen-rag 那份 env（YUESHEN_EMBED_TIMEOUT=180）；
+    # 这个客户端只按 --timeout 900 等 Fay 把整批重嵌入做完。不挂 Fay 那套
+    # *llm-timeouts 锚点：这里跑的是标准库脚本，没有 Fay 进程去读它。
+    volumes:
+      - ./probes:/probe:ro
+    command: ["python", "/probe/kb_ingest.py", "--base", "http://fay:5000", "--timeout", "900"]
     depends_on:
       fay:
         condition: service_healthy

@@ -11,6 +11,9 @@
 #   ./run.sh audit     核账：fay/service/ue 三个仓库必须零改动、与上游不分叉，并列出 containerd 侧产物
 #   ./run.sh upstream  跟上上游：fetch xszyou/Fay，报 fork 落后/领先几条，
 #                      并把 containerd/patches/fay/*.patch 逐个 dry-run 预检一遍
+#   ./run.sh kbslice [包] 把项目方语料包（默认 ../uploads/老年康养通用科普.zip）切成
+#                      seed/kb_corpus/ 里的语料文件
+#   ./run.sh kb        科普语料入库 + 拿 12 条真实问法抽测检索（切片变了或换库后跑一次）
 #   ./run.sh logs [s]  看日志（s 可为 fay/backend/adapter/mysql/redis）
 #   ./run.sh ps|down|reset
 set -euo pipefail
@@ -22,6 +25,18 @@ ensure_env() {
   if [ -f .env ]; then return; fi
   # 随机 DB 密码与 JWT 密钥的生成逻辑收敛到 tools/gen_keys.py（单一来源）
   python3 tools/gen_keys.py
+}
+
+image_id_of() { # 服务当前 tag 指向的镜像 ID；没建过就返回空
+  # 不能用 `compose images -q`：那张表第一列是 CONTAINER，服务有在跑的容器时它报的是
+  # 「容器用的那个镜像」。重建之后 tag 早挪走了、容器还没换，它就还在报旧 ID —— run #29
+  # 因此把一次真实的变更（2738eb20c5bc → 0db394dea218）印成了「重建后镜像 ID 没变」。
+  # 所以这里只借 compose 拿 REPOSITORY:TAG（那两列来自 compose 文件的 image: 字段），
+  # ID 交给 docker image inspect 按 tag 现查。探测性命令一律吞错，脚本跑在 set -e 下。
+  local tag
+  tag=$($COMPOSE images "$1" 2>/dev/null | awk 'NR>1 && $2 != "" {print $2":"$3; exit}' || true)
+  [ -n "$tag" ] || return 0
+  docker image inspect --format '{{.Id}}' "$tag" 2>/dev/null | sed 's/^sha256://' || true
 }
 
 wait_http() { # wait_http <url> <deadline_sec> <name>
@@ -193,20 +208,24 @@ case "${1:-up}" in
     #    overlay/*requirements 直接跑 test，会静默测上一次构建的镜像 —— 这种绿什么都没测。
     #  - 但也不能无条件 build：这台机器的 BuildKit 缓存已经顶到 GC 上限（45GB / 只有
     #    13 条活跃），`compose build` 会把 pip 层当冷缓存重跑，单个镜像 5~15 分钟。
-    #    实测 2026-09-20 15:55 那次重建就是纯粹被淘汰：输入一个都没变（拿镜像的 Created
+    #    实测 2026-09-20 15:55 那次重建就是纯粹被淘汰：输入一个没变（拿镜像的 Created
     #    去 find -newermt，结果为空）。所以按输入时间判断，需要时才建。
+    # overlay/ 只点名 requirements*.txt 而不是整个目录：Dockerfile 从 overlay 拿走的只有
+    # 那几份清单（`grep -n overlay images/*.Dockerfile` 就 4 行），而 system.conf /
+    # config.json / mcp_servers.json 是运行期 bind-mount，Fay 自己会回写它们 —— 把整个目录
+    # 算进输入等于「每轮都必重建一次」。run #29/#30 连续两轮的 trigger 都是
+    # `overlay/*/mcp_servers.json` 的 connection_time，就是这个。
     # 建失败立刻停在这里，绝不拿旧镜像继续测（补丁贴不上去时 patch 非零退出 -> build 失败）。
     stale=""
     before=""
     for svc in fay backend yueshen-rag; do
       case "$svc" in
-        fay)        src="images/fay.Dockerfile patches/fay overlay/fay" ;;
-        backend)    src="images/service.Dockerfile patches/service overlay/service" ;;
-        yueshen-rag) src="images/yueshen_rag.Dockerfile patches/yueshen_rag overlay/yueshen_rag" ;;
+        fay)        src="images/fay.Dockerfile patches/fay overlay/fay/requirements-docker.txt" ;;
+        backend)    src="images/service.Dockerfile patches/service overlay/service/requirements-docker.txt overlay/service/requirements-test.txt" ;;
+        yueshen-rag) src="images/yueshen_rag.Dockerfile patches/yueshen_rag overlay/yueshen_rag/requirements-docker.txt" ;;
       esac
       # 镜像名不写死，让 compose 自己报；报不出 ID = 本地没有 = 必须建。
-      # 每步都带 || true：这个脚本跑在 set -euo pipefail 下，探测性命令不能把脚本带崩。
-      iid=$($COMPOSE images -q "$svc" 2>/dev/null | head -1 || true)
+      iid=$(image_id_of "$svc")
       created=""
       # 写成 if 而不是 `[ -n "$iid" ] && created=…`：后者在没镜像时整个 AND 列表返回非 0，
       # bash 恰好豁免了（AND-OR 列表里非最后一条命令的失败不触发 set -e），但这层依赖
@@ -240,7 +259,7 @@ case "${1:-up}" in
       # 报成「先重建它」而不说结果，会让人以为测的是新内容（其实什么都没变）。
       for pair in $before; do
         svc=${pair%%=*}; old=${pair#*=}
-        new=$($COMPOSE images -q "$svc" 2>/dev/null | head -1 || true)
+        new=$(image_id_of "$svc")
         if [ "$old" = none ]; then
           echo "[test] $svc 镜像已建出 ${new:0:19}"
         elif [ "$new" != "$old" ]; then
@@ -397,11 +416,36 @@ case "${1:-up}" in
     fi
     exit $rc
     ;;
+  kbslice)
+    # 项目方又投递语料包时跑一次。切片产物落 seed/kb_corpus/（**不进 git**：内容属于伙伴方，
+    # 而两个仓库都是 PUBLIC —— 见 containerd/.gitignore 里那段），原件留在 ../uploads/
+    # （根 .gitignore 挡着，27MB 里 22MB 是 Word 内嵌字体，不该进历史）。
+    # 必须在容器里跑：宿主 python 没有 python-docx，而 yueshen-rag 镜像里已经有了。
+    # --user 是必须的：不带的话产物归 root，下一次 `git checkout` 覆盖它会报权限。
+    shift
+    src=${1:-../uploads/老年康养通用科普.zip}; shift || true
+    [ -e "$src" ] || { echo "[kbslice] 找不到语料包：$src（也可以 ./run.sh kbslice <zip|目录>）" >&2; exit 1; }
+    src=$(readlink -f "$src")
+    mkdir -p seed/kb_corpus
+    docker run --rm --user "$(id -u):$(id -g)" -e HOME=/tmp \
+      -v "$PWD/tools:/tools:ro" -v "$PWD/seed/kb_corpus:/out" -v "$src:/src/in:ro" \
+      dh-yueshen-rag:local python /tools/slice_kb_corpus.py /src/in /out "$@"
+    echo '[kbslice] 切片已更新，接着 ./run.sh kb 才真的进知识库'
+    ;;
+  kb)
+    # 「切片」只是准备，「导进知识库」要有一次真入库 + 真检索为证：上游 upsert_chunks
+    # 对 embedding 失败是静默跳过这一条（server.py:363），只看出料数看不出问题。
+    shift
+    ensure_env
+    # 不需要重建镜像：seed/kb_corpus 是运行期挂载，但挂载本身变了要 recreate 才生效。
+    $COMPOSE up -d yueshen-rag
+    $COMPOSE run --rm kb-ingest "$@"
+    ;;
   build)   ensure_env; $COMPOSE build ;;
   smoke)   shift; smoke ;;
   ps)      shift; $COMPOSE ps ;;
   logs)    shift; $COMPOSE logs -f --tail=120 ${1:-} ;;
   down)    shift; $COMPOSE down ${1:-} ;;
   reset)   shift; echo "[run] 将删除全部卷（DB/记忆/日志），5 秒内 Ctrl-C 取消"; sleep 5; $COMPOSE down -v ${1:-} ;;
-  *)       echo "用法: $0 {up|build|test|smoke|audit|upstream|ps|logs [svc]|down|reset}" >&2; exit 1 ;;
+  *)       echo "用法: $0 {up|build|test|smoke|audit|upstream|kbslice|kb|ps|logs [svc]|down|reset}" >&2; exit 1 ;;
 esac

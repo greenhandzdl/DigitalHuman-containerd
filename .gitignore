@@ -2,3 +2,12 @@
 .env
 **/__pycache__/
 *.pyc
+
+# 项目方给的科普语料的切片产物。**数据不进 git，工具进**（tools/slice_kb_corpus.py、
+# probes/kb_ingest.py、compose 里那条 bind-mount、README 那节都在）。理由不是体积而是
+# 归属：这批 .docx 是伙伴方的交付物，而 DigitalHuman 与 DigitalHuman-containerd 两个
+# 仓库都是 PUBLIC；`./run.sh kbslice` 从原件（../uploads/，根 .gitignore 挡着）一条命令
+# 就能重建，任何机器上跑完再 ./run.sh kb 入库。少了这两步的后果是明确的而不是隐形的：
+# 知识库只剩构建期那份 3 段合成语料，probe-yueshen 照样 6/6，./run.sh kb 会报
+# chunks=1 并在 12 问上判红。
+seed/kb_corpus/
