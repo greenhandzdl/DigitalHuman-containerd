@@ -1,0 +1,26 @@
+diff -ruN a/tests/test_admin_ops.py b/tests/test_admin_ops.py
+--- a/tests/test_admin_ops.py	2026-09-19 19:29:57.252117914 +0800
++++ b/tests/test_admin_ops.py	2026-09-19 19:30:30.801193229 +0800
+@@ -24,12 +24,18 @@
+ 
+ def test_admin_consultation_events(client, admin_token, elder_token):
+     headers = auth_headers(elder_token)
+-    classify = client.post(
+-        f"{API}/elder/consultation/classify",
++    # consultation_event 只由聊天链路写入（chat_service -> log_consultation_event）；
++    # /elder/consultation/classify 是无状态判定接口，不产生留痕。
++    session = client.post(f"{API}/chat/sessions", headers=headers)
++    assert session.status_code == 201, session.text
++
++    message = client.post(
++        f"{API}/chat/sessions/{session.json()['id']}/messages",
+         headers=headers,
+-        json={"content": "随便问问"},
++        json={"content": "随便问问", "content_type": "text"},
+     )
+-    assert classify.status_code == 200
++    assert message.status_code == 201, message.text
++    assert message.json()["tier_classification"]["response_tier"] == "medium"
+ 
+     admin_headers = auth_headers(admin_token)
+     listing = client.get(

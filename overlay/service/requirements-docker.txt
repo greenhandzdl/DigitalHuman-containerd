@@ -1,0 +1,20 @@
+# 与 service/pyproject.toml [project].dependencies 一一对应（版本约束照抄）。
+#
+# 为什么不直接 pip install .：pyproject.toml 没有 [build-system]，且仓库有
+# app/ alembic/ docs/ scripts/ tests/ 五个顶层目录，setuptools 的 flat-layout
+# 自动发现会报 "Multiple top-level packages discovered" 而失败。
+# 又不允许改 service 仓库，所以在这里显式列依赖，运行期靠 WORKDIR=/app 直接
+# 以 `app.main` 包名导入（本来就是这么起的：uvicorn app.main:app）。
+
+alembic>=1.18.5
+apscheduler>=3.11.0
+cryptography>=49.0.0
+fastapi>=0.139.2
+httpx>=0.28.1
+pydantic-settings>=2.14.2
+pyjwt>=2.13.0
+pymysql>=1.2.0
+python-multipart>=0.0.32
+redis>=8.0.1
+sqlalchemy>=2.0.51
+uvicorn[standard]>=0.51.0

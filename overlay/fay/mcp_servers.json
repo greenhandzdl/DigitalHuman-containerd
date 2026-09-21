@@ -1,0 +1,94 @@
+[
+    {
+        "id": 1,
+        "name": "tools",
+        "ip": "",
+        "connection_time": "2026-09-21 12:10:55",
+        "key": "",
+        "transport": "stdio",
+        "command": "python",
+        "args": [
+            "test/mcp_stdio_example.py"
+        ],
+        "cwd": "",
+        "env": {},
+        "autostart": true
+    },
+    {
+        "id": 2,
+        "name": "Fay日程管理",
+        "ip": "",
+        "connection_time": "2026-09-21 02:17:19",
+        "key": "",
+        "transport": "stdio",
+        "command": "python",
+        "args": [
+            "server.py"
+        ],
+        "cwd": "mcp_servers/schedule_manager",
+        "env": {},
+        "autostart": false
+    },
+    {
+        "id": 3,
+        "name": "logseq",
+        "ip": "",
+        "connection_time": "2026-09-21 02:17:19",
+        "key": "",
+        "transport": "stdio",
+        "command": "python",
+        "args": [
+            "server.py"
+        ],
+        "cwd": "mcp_servers/logseq",
+        "env": {
+            "LOGSEQ_GRAPH_DIR": "D:/iCloudDrive/iCloud~com~logseq~logseq/第二大脑"
+        },
+        "autostart": false
+    },
+    {
+        "id": 4,
+        "name": "yueshen rag",
+        "ip": "http://yueshen-rag:8766/sse",
+        "connection_time": "2026-09-21 02:23:09",
+        "key": "",
+        "transport": "sse",
+        "command": "",
+        "args": [],
+        "cwd": "",
+        "env": {},
+        "autostart": false
+    },
+    {
+        "id": 5,
+        "name": "window capture",
+        "ip": "",
+        "connection_time": "2026-09-21 02:17:20",
+        "key": "",
+        "transport": "stdio",
+        "command": "python",
+        "args": [
+            "mcp_servers/window_capture/server.py"
+        ],
+        "cwd": "",
+        "env": {},
+        "autostart": false
+    },
+    {
+        "id": 6,
+        "name": "课程知识库",
+        "ip": "",
+        "connection_time": "2026-09-21 12:10:55",
+        "key": "",
+        "transport": "stdio",
+        "command": "python",
+        "args": [
+            "mcp_servers/fay_player_knowledge/fay_player_knowledge_base_mcp_server.py",
+            "--source",
+            "./fay_player_knowledge"
+        ],
+        "cwd": "",
+        "env": {},
+        "autostart": true
+    }
+]

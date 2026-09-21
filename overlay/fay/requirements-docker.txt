@@ -1,0 +1,82 @@
+# Fay 容器化最小依赖集 —— 不改动 fay 仓库，本文件只存在于 containerd/overlay/。
+#
+# 依据：对 39 个启动链文件的 AST 静态扫描（模块级 import），而非上游那份
+# requirements.txt（它把 ASR/TTS 全供应商、桌面 GUI、知识库索引器都混在一起）。
+# 因此**不装** torch / sentence-transformers / chromadb / opencv / PyQt5 / pygame，
+# 镜像从数 GB 降到约 600MB。代价与边界见 containerd/README.md「未覆盖能力」。
+
+# --- Web / 服务框架 (gui/flask_server.py, core/wsa_server.py) ---
+flask~=3.0.0
+flask-cors
+flask-httpauth
+gevent
+websockets~=10.4
+websocket-client
+# uvicorn 由 mcp 带进来；>=0.35 只支持 websockets>=13 的新 API
+# (uvicorn/protocols/websockets/auto.py 直接 import websockets.server.ServerProtocol)，
+# 与上游 websockets~=10.4 冲突 → MCP SSE(8765) 线程起不来。实测 0.34.3 正常。
+uvicorn<0.35
+
+# --- LLM 大脑 (llm/nlp_cognitive_stream.py, llm/execution_manager.py) ---
+# 只装 langchain-core + langchain-openai，不装 langchain 伞包：
+# 伞包会把 langgraph 解析到最新，而 langgraph>=1.2.11 依赖 langgraph-sdk>=0.4.2，
+# 后者才要求 websockets>=14 —— 与上游 requirements.txt 的 websockets~=10.4 冲突
+# （core/wsa_server.py:7 用 websockets.legacy，
+# core/socket_bridge_service.py:44 用两参数 handler）。
+# 启动链实际只 import langchain_openai / langchain_core.messages；
+# utils/openai_api/langchain_openai_api.py 用到 langchain.chains 但全仓无人 import。
+#
+# langgraph 必须显式钉版本装上来，否则 MCP 工具调用整条路是死的：
+# llm/nlp_cognitive_stream.py:2556 在 _LANGGRAPH_AVAILABLE 为假时把 tool_registry
+# 清空、退回 direct LLM 模式，「课程知识库」连上了也不会被真正调用。
+# 全仓只有一个 import 点（:16 from langgraph.graph import END, START, StateGraph），
+# 而 PyPI 元数据显示冲突可以绕开：langgraph 1.2.0~1.2.10 把 sdk 钉在 <0.4.0，
+# sdk 0.3.x 完全不带 websockets 依赖。实测在 dh-fay:local 里
+# pip install 'langgraph>=1.2,<1.2.11' 'langgraph-sdk<0.4' 装进 1.2.2 + 0.3.15，
+# websockets 保持 10.4，END/START/StateGraph 三项 import 全通。
+langchain-core
+langchain-openai
+langgraph>=1.2,<1.2.11
+langgraph-sdk<0.4
+openai
+httpx
+requests
+urllib3
+tenacity
+
+# --- MCP 客户端/服务端 (faymcp/*) ---
+# 上游 requirements.txt:31 写的是裸 `mcp`，现在解析到 2.2.0，而 2.x 把 `mcp.server.Server`
+# 换成了新的高层 MCPServer —— 低层的 @server.list_tools()/@server.call_tool() 注册装饰器没了。
+# 本仓库有 6 处按 1.x 低层 API 写：faymcp/mcp_server.py:26 加上自带的 4 个 MCP 服务器
+# （mcp_servers/{logseq,schedule_manager,window_capture,yueshen_rag}/server.py）和
+# test/mcp_stdio_example.py。2.x 下这些一律 AttributeError: 'Server' object has no
+# attribute 'list_tools'，其中 stdio_example 是 mcp_servers.json 里 autostart 的
+# 「tools」，于是每次开机都记一条「tools 连接失败」。钉回 1.x（实测解析 1.30.0，
+# 不动 uvicorn/websockets，上面那两条钉法照旧生效）。
+# 另一条佐证：这台机器上开发者自己的 fay/.venv 装的正是 mcp-1.6.0
+# （site-packages/mcp-1.6.0.dist-info）—— 这套代码是在 1.x 下调通的。
+mcp>=1.2,<2
+
+# --- 语音输出：tts_module 取非 ali/gptsovits/volcano 时走 ms_tts_sdk(edge_tts) ---
+# azure SDK 在 tts/ms_tts_sdk.py 是模块级 import，必须能装上；
+# 没有 ms_tts_key 时实际走 edge_tts（免费、需外网到 speech.platform.bing.com）。
+edge-tts
+azure-cognitiveservices-speech
+pydub
+# main.py:86 无条件 from asr import ali_nls → asr/ali_nls.py:9 需要 aliyunsdkcore，
+# 即使不用阿里云 ASR 也必须装（上游 requirements.txt 里就有）。
+aliyun-python-sdk-core
+
+# --- 音频采集：pyaudio 在 fay_booter.py:19 / gui/flask_server.py 是模块级 import，
+#     容器内无声卡也不会打开设备（record.enabled=false），但必须 import 成功 ---
+pyaudio
+numpy
+
+# --- 记忆/画像文档解析 (nlp_cognitive_stream.py:27 模块级 import docx) ---
+python-docx
+python-pptx
+
+# --- 杂项：core/* 与 utils/* 模块级用到 ---
+pytz
+psutil
+schedule

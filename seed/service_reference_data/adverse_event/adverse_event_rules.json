@@ -1,0 +1,137 @@
+{
+  "schema_version": "container-seed-1",
+  "note": "容器自测用的最小异常事件规则，结构与上游 adverse_event/adverse_event_rules.json 一致。tier_responses[].risk_tier 取 green/yellow/red，分级引擎按 red>yellow>green 取最高档。",
+  "symptom_rules": [
+    {
+      "rule_id": "rule_sym_chest_pain",
+      "symptom_name_zh": "胸痛",
+      "symptom_name_en": "chest_pain",
+      "enabled": true,
+      "category": "cardiac",
+      "trigger_keywords_zh": ["胸痛", "胸口疼", "压迫感"],
+      "clinical_event_grade_hint": "III",
+      "detection_sources": ["self_report", "symptom_diary"],
+      "applicable_scenes": ["居家", "社区"],
+      "tier_responses": [
+        {"risk_tier": "red", "action_zh": "立即停止活动，联系家人并前往急诊或拨打 120"},
+        {"risk_tier": "yellow", "action_zh": "当日联系随访护士复评"}
+      ],
+      "sources": [{"name_zh": "容器样例数据", "level": "seed"}]
+    },
+    {
+      "rule_id": "rule_sym_dyspnea",
+      "symptom_name_zh": "呼吸困难",
+      "symptom_name_en": "dyspnea",
+      "enabled": true,
+      "category": "respiratory",
+      "trigger_keywords_zh": ["喘不上气", "呼吸困难", "气促"],
+      "detection_sources": ["self_report", "vital_sign"],
+      "applicable_scenes": ["居家"],
+      "tier_responses": [
+        {"risk_tier": "red", "action_zh": "静息即气促，按急症处理"},
+        {"risk_tier": "yellow", "action_zh": "活动后气促，降低强度并记录"}
+      ],
+      "sources": [{"name_zh": "容器样例数据", "level": "seed"}]
+    },
+    {
+      "rule_id": "rule_sym_neuro_deficit",
+      "symptom_name_zh": "神经功能恶化",
+      "symptom_name_en": "neuro_deficit",
+      "enabled": true,
+      "category": "neuro",
+      "trigger_keywords_zh": ["口角歪斜", "说话不清", "肢体无力加重"],
+      "detection_sources": ["self_report", "caregiver_report"],
+      "applicable_scenes": ["居家", "社区"],
+      "tier_responses": [
+        {"risk_tier": "red", "action_zh": "疑似再发卒中，立即拨打 120"}
+      ],
+      "sources": [{"name_zh": "容器样例数据", "level": "seed"}]
+    },
+    {
+      "rule_id": "rule_sym_suicidal_ideation",
+      "symptom_name_zh": "自杀意念",
+      "symptom_name_en": "suicidal_ideation",
+      "enabled": true,
+      "category": "psychological",
+      "trigger_keywords_zh": ["自杀", "轻生", "不想活"],
+      "detection_sources": ["self_report", "chat"],
+      "applicable_scenes": ["在线咨询"],
+      "tier_responses": [
+        {"risk_tier": "red", "action_zh": "终止在线咨询，推送心理援助热线并转人工"}
+      ],
+      "sources": [{"name_zh": "容器样例数据", "level": "seed"}]
+    },
+    {
+      "rule_id": "rule_sym_dizziness",
+      "symptom_name_zh": "头晕",
+      "symptom_name_en": "dizziness",
+      "enabled": true,
+      "category": "general",
+      "trigger_keywords_zh": ["头晕", "站不稳"],
+      "detection_sources": ["self_report"],
+      "applicable_scenes": ["居家"],
+      "tier_responses": [
+        {"risk_tier": "yellow", "action_zh": "暂停训练，坐位休息并复测血压"},
+        {"risk_tier": "green", "action_zh": "记录发生情境，随访时复核"}
+      ],
+      "sources": [{"name_zh": "容器样例数据", "level": "seed"}]
+    }
+  ],
+  "vital_sign_thresholds": [
+    {
+      "threshold_id": "th_systolic_bp_high",
+      "name_zh": "收缩压过高",
+      "enabled": true,
+      "metric": "systolic_bp",
+      "condition": ">=",
+      "red_if": {"value": 180, "unit": "mmHg"},
+      "yellow_if": {"value": 160, "unit": "mmHg"},
+      "green_if": {"value": 140, "unit": "mmHg"},
+      "tier_responses": [
+        {"risk_tier": "red", "action_zh": "暂停训练，立即联系医生"},
+        {"risk_tier": "yellow", "action_zh": "当日复测并记录用药情况"}
+      ],
+      "note": "样例阈值，非临床推荐值",
+      "sources": [{"name_zh": "容器样例数据", "level": "seed"}]
+    },
+    {
+      "threshold_id": "th_spo2_low",
+      "name_zh": "血氧饱和度偏低",
+      "enabled": true,
+      "metric": "spo2",
+      "condition": "<",
+      "red_if": {"value": 90, "unit": "%"},
+      "yellow_if": {"value": 94, "unit": "%"},
+      "tier_responses": [
+        {"risk_tier": "red", "action_zh": "停止活动，吸氧并按急症处理"}
+      ],
+      "sources": [{"name_zh": "容器样例数据", "level": "seed"}]
+    },
+    {
+      "threshold_id": "th_resting_hr_high",
+      "name_zh": "静息心率过快",
+      "enabled": true,
+      "metric": "heart_rate",
+      "condition": ">",
+      "red_if": {"value": 130, "unit": "bpm"},
+      "yellow_if": {"value": 110, "unit": "bpm"},
+      "tier_responses": [
+        {"risk_tier": "yellow", "action_zh": "复查心率，必要时心电随访"}
+      ],
+      "sources": [{"name_zh": "容器样例数据", "level": "seed"}]
+    },
+    {
+      "threshold_id": "th_weight_gain_3d",
+      "name_zh": "3 天内体重快速增加",
+      "enabled": true,
+      "metric": "weight_kg",
+      "condition": ">=",
+      "red_if": {"delta_kg": 2.0},
+      "yellow_if": {"delta_kg": 1.0},
+      "tier_responses": [
+        {"risk_tier": "yellow", "action_zh": "提示心衰容量负荷风险，联系随访护士"}
+      ],
+      "sources": [{"name_zh": "容器样例数据", "level": "seed"}]
+    }
+  ]
+}

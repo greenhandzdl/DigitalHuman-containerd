@@ -1,0 +1,175 @@
+{
+  "schema_version": "container-seed-1",
+  "note": "容器自测用的最小随访标准，结构与上游 follow_up/follow_up_standards.json 一致。schedule.rehab_type 必须与 home_rehab_plans.json 中模板的 rehab_type 相同，否则生成随访任务时报「未找到病种对应的随访计划模板」。",
+  "self_monitoring_items_common": [
+    {
+      "item_id": "mon_blood_pressure",
+      "name_zh": "居家血压",
+      "category": "vital_sign",
+      "enabled": true,
+      "frequency_zh": "每日晨起与睡前各 1 次",
+      "method_zh": "静坐 5 分钟后测量，记录收缩压/舒张压/心率",
+      "record_fields": ["systolic_bp", "diastolic_bp", "heart_rate", "measured_at"],
+      "alert_hint_zh": "收缩压 ≥ 180 mmHg 或伴胸痛时立即就医",
+      "applicable_rehab_types": ["stroke", "cardiac", "elder"],
+      "linked_adverse_threshold_ids": ["th_systolic_bp_high"],
+      "sources": [{"name_zh": "容器样例数据", "level": "seed"}]
+    },
+    {
+      "item_id": "mon_body_weight",
+      "name_zh": "晨起体重",
+      "category": "vital_sign",
+      "enabled": true,
+      "frequency_zh": "每日 1 次，排尿后同一时间",
+      "method_zh": "固定衣物、同一体重秤",
+      "record_fields": ["weight_kg", "measured_at"],
+      "alert_hint_zh": "3 天内增加 ≥ 2 kg 提示容量负荷",
+      "applicable_rehab_types": ["cardiac"],
+      "linked_adverse_threshold_ids": ["th_weight_gain_3d"],
+      "sources": [{"name_zh": "容器样例数据", "level": "seed"}]
+    },
+    {
+      "item_id": "mon_symptom_diary",
+      "name_zh": "症状日记",
+      "category": "symptom",
+      "enabled": true,
+      "frequency_zh": "每日 1 次",
+      "method_zh": "记录胸痛、气促、头晕等活动相关症状",
+      "record_fields": ["symptom", "severity", "trigger_activity"],
+      "alert_hint_zh": "新发或加重的胸痛、言语不清按急症处理",
+      "applicable_rehab_types": ["stroke", "cardiac", "elder"],
+      "linked_symptom_rule_ids": ["rule_sym_chest_pain", "rule_sym_neuro_deficit"],
+      "sources": [{"name_zh": "容器样例数据", "level": "seed"}]
+    }
+  ],
+  "visit_preparation_common": [
+    {
+      "prep_id": "prep_first_visit",
+      "title_zh": "首次随访准备清单",
+      "category": "visit",
+      "enabled": true,
+      "items_zh": ["携带出院小结与用药清单", "带上居家血压/体重记录", "列出近两周新发症状"],
+      "applicable_rehab_types": ["stroke", "cardiac", "elder"],
+      "sources": [{"name_zh": "容器样例数据", "level": "seed"}]
+    },
+    {
+      "prep_id": "prep_periodic_review",
+      "title_zh": "阶段复评准备清单",
+      "category": "visit",
+      "enabled": true,
+      "items_zh": ["完成本次量表自测", "准备训练完成记录", "记录希望调整的动作"],
+      "applicable_rehab_types": ["stroke", "cardiac", "elder"],
+      "sources": [{"name_zh": "容器样例数据", "level": "seed"}]
+    }
+  ],
+  "follow_up_schedules": [
+    {
+      "schedule_id": "sched_stroke_12m",
+      "schedule_name_zh": "脑卒中随访 12 个月方案",
+      "enabled": true,
+      "rehab_type": "stroke",
+      "linked_home_plan_ids": ["plan_stroke_home_12w"],
+      "notes_zh": "样例随访路径。",
+      "milestones": [
+        {
+          "milestone_id": "ms_stroke_2w",
+          "name_zh": "出院后 2 周门诊复诊",
+          "enabled": true,
+          "visit_type": "outpatient",
+          "reminder_priority": "high",
+          "timing": {"days_after_discharge_min": 10, "days_after_discharge_max": 14},
+          "purpose_zh": "评估早期依从性与并发症",
+          "preparation_prep_ids": ["prep_first_visit"],
+          "monitoring_item_ids": ["mon_blood_pressure", "mon_symptom_diary"],
+          "reminder_content_zh": {"title": "复诊提醒", "body": "距离出院已 2 周，请按时到门诊复查。"},
+          "sources": [{"name_zh": "容器样例数据", "level": "seed"}]
+        },
+        {
+          "milestone_id": "ms_stroke_3m",
+          "name_zh": "出院后 3 个月功能复评",
+          "enabled": true,
+          "visit_type": "outpatient",
+          "reminder_priority": "medium",
+          "timing": {"days_after_discharge_min": 84, "days_after_discharge_max": 90},
+          "purpose_zh": "复评运动与语言功能，调整方案",
+          "preparation_prep_ids": ["prep_periodic_review"],
+          "monitoring_item_ids": ["mon_symptom_diary"],
+          "reminder_content_zh": {"title": "阶段复评提醒", "body": "即将进行 3 个月功能复评，请带上训练记录。"},
+          "sources": [{"name_zh": "容器样例数据", "level": "seed"}]
+        },
+        {
+          "milestone_id": "ms_stroke_12m",
+          "name_zh": "出院后 12 个月年度评估",
+          "enabled": true,
+          "visit_type": "teleconsult",
+          "reminder_priority": "low",
+          "timing": {"days_after_discharge_min": 350, "days_after_discharge_max": 372},
+          "purpose_zh": "年度复发风险与长期用药评估",
+          "preparation_prep_ids": ["prep_periodic_review"],
+          "monitoring_item_ids": ["mon_blood_pressure"],
+          "reminder_content_zh": {"title": "年度评估提醒", "body": "预约线上年度评估。"},
+          "sources": [{"name_zh": "容器样例数据", "level": "seed"}]
+        }
+      ]
+    },
+    {
+      "schedule_id": "sched_cardiac_12m",
+      "schedule_name_zh": "心脏康复随访 12 个月方案",
+      "enabled": true,
+      "rehab_type": "cardiac",
+      "linked_home_plan_ids": ["plan_cardiac_home_8w"],
+      "notes_zh": "样例随访路径。",
+      "milestones": [
+        {
+          "milestone_id": "ms_cardiac_4w",
+          "name_zh": "心脏康复 4 周评估",
+          "enabled": true,
+          "visit_type": "outpatient",
+          "reminder_priority": "high",
+          "timing": {"days_after_discharge_min": 25, "days_after_discharge_max": 30},
+          "purpose_zh": "评估有氧训练强度与症状控制",
+          "preparation_prep_ids": ["prep_first_visit"],
+          "monitoring_item_ids": ["mon_body_weight", "mon_blood_pressure"],
+          "reminder_content_zh": {"title": "心脏康复复诊", "body": "请携带体重与血压记录按时复诊。"},
+          "sources": [{"name_zh": "容器样例数据", "level": "seed"}]
+        },
+        {
+          "milestone_id": "ms_cardiac_12w",
+          "name_zh": "心脏康复 III 期转入评估",
+          "enabled": true,
+          "visit_type": "teleconsult",
+          "reminder_priority": "medium",
+          "timing": {"days_after_discharge_min": 78, "days_after_discharge_max": 90},
+          "purpose_zh": "判断能否转入长期维持期",
+          "preparation_prep_ids": ["prep_periodic_review"],
+          "monitoring_item_ids": ["mon_symptom_diary"],
+          "reminder_content_zh": {"title": "维持期评估", "body": "线上评估训练强度是否上调。"},
+          "sources": [{"name_zh": "容器样例数据", "level": "seed"}]
+        }
+      ]
+    },
+    {
+      "schedule_id": "sched_elder_12m",
+      "schedule_name_zh": "长者跌倒预防随访 12 个月方案",
+      "enabled": true,
+      "rehab_type": "elder",
+      "linked_home_plan_ids": ["plan_elder_fall_prev_12w"],
+      "notes_zh": "样例随访路径。",
+      "milestones": [
+        {
+          "milestone_id": "ms_elder_6w",
+          "name_zh": "跌倒预防 6 周随访",
+          "enabled": true,
+          "visit_type": "home_visit",
+          "reminder_priority": "medium",
+          "timing": {"days_after_discharge_min": 38, "days_after_discharge_max": 45},
+          "purpose_zh": "评估平衡训练执行与家居环境风险",
+          "preparation_prep_ids": ["prep_first_visit"],
+          "monitoring_item_ids": ["mon_blood_pressure"],
+          "reminder_content_zh": {"title": "随访提醒", "body": "社区护士将上门评估平衡功能。"},
+          "sources": [{"name_zh": "容器样例数据", "level": "seed"}]
+        }
+      ]
+    }
+  ]
+}

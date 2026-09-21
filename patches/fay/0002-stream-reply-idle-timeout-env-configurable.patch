@@ -1,0 +1,16 @@
+diff -ruN a/gui/flask_server.py b/gui/flask_server.py
+--- a/gui/flask_server.py	2026-09-20 11:52:22.550310259 +0800
++++ b/gui/flask_server.py	2026-09-20 11:52:22.550450988 +0800
+@@ -48,7 +48,11 @@
+ 
+ # 文字接口读取回复流时的空闲超时（秒）：连续这么久读不到任何数据则判定异常并收尾，
+ # 避免因结束标记(_<isend>)丢失导致 /v1/chat/completions 永久挂起。
+-_STREAM_READ_IDLE_TIMEOUT = 180
++# containerd 补丁：改成环境变量可调，默认值与上游一致（不设变量 = 原行为）。
++# 这个空闲上限必须 >= llm/execution_manager.py 里 LLM 请求的超时，否则「模型正在慢慢
++# 想」会被判定成「Fay 卡住」：实测本机 Ollama 只有 6% 权重驻留显存时，fork 的规划器
++# 链路单次要 180~240s，于是 /v1/chat/completions 每次都返回空 content。
++_STREAM_READ_IDLE_TIMEOUT = float(os.getenv("STREAM_REPLY_IDLE_TIMEOUT", "180"))
+ 
+ # 全局变量，用于跟踪当前的genagents服务器
+ genagents_server = None

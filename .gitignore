@@ -1,0 +1,4 @@
+# containerd 本地实值不入库（含 DB 密码与 JWT 签名密钥）
+.env
+**/__pycache__/
+*.pyc

@@ -1,0 +1,23 @@
+diff -ruN a/fay_booter.py b/fay_booter.py
+--- a/fay_booter.py	2026-09-20 19:52:07.808017335 +0800
++++ b/fay_booter.py	2026-09-20 19:53:17.677314114 +0800
+@@ -133,11 +133,17 @@
+         super().__init__(fei)
+         self.__running = True
+         self.streamCache = None
+-        self.thread = MyThread(target=self.run)
+-        self.thread.start()  #启动远程音频输入设备监听线程
+         self.username = 'User'
+         self.isOutput = True
++        # containerd 补丁：deviceConnector 必须在 thread.start() 之前赋好值。run() 的第一句
++        # 就读 self.deviceConnector，而现在 __init__ 是先 start 后赋值，新线程几乎必然撞上
++        # AttributeError；本文件 151-180 行（上游 xszyou/Fay@74b49ae 引入）把 except 从
++        # `pass`（1 秒后重试，能自愈）改成了「记日志 + __running=False」，于是这个竞态变成
++        # 了「远程音频监听线程一上线就退」+「把刚 accept 的 socket 关掉」，客户端表现为
++        # connect 之后立刻 ConnectionReset。实测证据见 containerd/README「语音输入」。
+         self.deviceConnector = deviceConnector
++        self.thread = MyThread(target=self.run)
++        self.thread.start()  #启动远程音频输入设备监听线程
+ 
+     def run(self):
+         #启动ngork

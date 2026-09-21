@@ -1,0 +1,50 @@
+{
+    "attribute": {
+        "additional": "康养陪伴",
+        "age": "成年",
+        "birth": "DigitalHuman",
+        "constellation": "水瓶座",
+        "contact": "",
+        "gender": "女",
+        "goal": "康养陪护与健康答疑",
+        "hobby": "陪伴",
+        "job": "康养助手",
+        "name": "Fay",
+        "position": "陪伴",
+        "voice": "晓晓(edge)",
+        "zodiac": "蛇"
+    },
+    "interact": {
+        "QnA": "qa.csv",
+        "maxInteractTime": 15,
+        "perception": {
+            "chat": 10,
+            "follow": 10,
+            "gift": 10,
+            "indifferent": 10,
+            "join": 10
+        },
+        "playSound": false,
+        "visualization": false
+    },
+    "items": [],
+    "memory": {
+        "isolate_by_user": true,
+        "use_bionic_memory": false
+    },
+    "source": {
+        "automatic_player_status": false,
+        "automatic_player_url": "http://127.0.0.1:6000",
+        "liveRoom": {
+            "enabled": false,
+            "url": ""
+        },
+        "record": {
+            "device": "",
+            "enabled": false
+        },
+        "wake_word": "你好",
+        "wake_word_enabled": false,
+        "wake_word_type": "front"
+    }
+}

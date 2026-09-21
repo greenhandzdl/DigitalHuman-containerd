@@ -1,0 +1,40 @@
+# yueshen_rag 容器的依赖集 —— 不改动 fay 仓库，本文件只存在于 containerd/overlay/。
+#
+# 为什么不并进 Fay 那份 requirements-docker.txt：chromadb 会把自己的
+# `uvicorn[standard]>=0.18.3`（上界不钉）压到 Fay 那两道钉法上 —— Fay 侧
+# `uvicorn<0.35` + `websockets~=10.4` 是 `:8765/sse` 那条判据的验收条件，
+# 而 uvicorn>=0.35 的 websockets 协议只认 13+（踩坑记录见同目录 overlay/fay/ 那份的注释）。
+# 真装进去要么 resolver 拒绝 websockets 10.4，要么把 Fay 的 :8765 拖回不监听。
+# 为一个知识库服务去动一个已经全绿的镜像的依赖层，风险收益不对等 —— 所以单开一个镜像。
+
+# 与 Fay 镜像同一个理由：`mcp` 裸装会解析到 2.x，而 2.x 把低层
+# `@server.list_tools()` / `@server.call_tool()` 注册装饰器换掉了
+# （yueshen_rag/server.py:45 与 :608/:653 就是按 1.x 低层 API 写的）。
+#
+# 这一台是 MCP **服务端**，连过来的是 Fay 那个客户端，所以两边版本其实是一对：
+# `docker run --rm --entrypoint pip freeze dh-fay:local` 量到的是 mcp 1.30.0 +
+# starlette 1.6.0 + uvicorn 0.34.3 + websockets 10.4，而 0001 那份 SSE 端点的形状
+# 正是照 fay/faymcp/mcp_server.py:538（上面那套版本下已被容器验过）抄的。
+# 这里故意不把它钉成 ==1.30.0：将来重建若解析到更新的 1.x 而与服务端不兼容，
+# 该由探针「Fay 连上 yueshen (MCP/SSE)」那条判红来暴露，而不是被一个悄悄钉住的旧版本藏住。
+mcp>=1.2,<2
+
+# 知识库本体。server.py 在模块级 import 它（:53），所以这是这台服务器起不来的第一道坎。
+# 它会把 onnxruntime / tokenizers / kubernetes / opentelemetry / grpcio 一并拖进来
+# （PyPI 元数据里 chromadb 1.5.9 的 onnxruntime>=1.14.1 是硬依赖，不是 extra，
+# 压不掉），但 chromadb 自带的那个默认嵌入器在本容器里一次都不会被调用：
+# ChromaStore 每次 upsert/query 都显式带 embeddings / query_embeddings
+# （server.py:340 与 :366，向量由 EmbeddingBackend.encode → POST <base>/embeddings 换来）。
+# 所以这层依赖是「装了但用不上」的重量，不是「可以省」。
+chromadb
+
+# 文档解析：CorpusLoader 只认 .pdf/.docx（server.py:195）。
+pdfplumber
+python-docx
+
+requests
+
+# SSE transport（containerd/patches/yueshen_rag/0001）要用 uvicorn + starlette 把
+# 那个 MCP Server 挂成 http://<host>:8766/sse。starlette 由 mcp 带进来，不单独钉；
+# 这里没有 websockets~=10.4 那道约束，所以 uvicorn 不必像 Fay 那样压到 <0.35。
+uvicorn

@@ -1,0 +1,106 @@
+{
+  "schema_version": "container-seed-1",
+  "note": "容器自测用的最小分级响应规则，结构与上游 tier_response/consultation_tier_rules.json 一致。引擎按子串匹配 trigger_keywords_zh，取命中规则中档位最高者；无命中时默认 medium 并转人工。",
+  "online_consultation_termination_rules": [
+    {
+      "rule_id": "term_high_risk_stop_consult",
+      "name_zh": "高危场景终止在线咨询",
+      "enabled": true,
+      "trigger_description_zh": "判定为 high 档时立即终止自动问答，引导联系家人/急诊/120",
+      "response_tier": "high",
+      "engine_actions": ["terminate_online_consultation", "recommend_crisis_hotline", "notify_human_agent"],
+      "voice_script_zh": "您描述的情况较紧急，我先停止自动回复。请立刻联系家人，前往急诊或拨打 120。",
+      "sources": [{"name_zh": "容器样例数据", "level": "seed"}]
+    },
+    {
+      "rule_id": "term_abusive_language",
+      "name_zh": "非医疗诉求终止会话",
+      "enabled": true,
+      "trigger_description_zh": "与康养无关或恶意诉求，转人工处理",
+      "response_tier": "medium",
+      "engine_actions": ["terminate_online_consultation", "transfer_human_agent"],
+      "voice_script_zh": "这个问题我暂时无法回答，已为您转接人工。",
+      "sources": [{"name_zh": "容器样例数据", "level": "seed"}]
+    }
+  ],
+  "classification_rules": [
+    {
+      "rule_id": "cls_psychological_crisis",
+      "rule_name_zh": "心理危机（自杀意念）",
+      "enabled": true,
+      "question_category": "psychological_crisis",
+      "default_tier": "high",
+      "trigger_patterns_zh": ["自杀", "轻生", "不想活"],
+      "trigger_keywords_zh": ["自杀", "轻生", "不想活"],
+      "escalation_to_medium_if": {"mention_without_plan_zh": "仅表达情绪低落但未提及具体计划"},
+      "escalation_to_high_if": {"mention_plan_zh": "提及具体时间、方式或已准备工具"},
+      "engine_actions": ["terminate_online_consultation", "recommend_crisis_hotline", "notify_human_agent"],
+      "voice_script_zh": "我听到了您现在很不好受。这种情况需要专业人员立即帮助，请拨打 12356 心理援助热线，并马上联系身边的家人。",
+      "linked_adverse_symptom_rule_ids": ["rule_sym_suicidal_ideation"],
+      "linked_adverse_threshold_ids": [],
+      "linked_termination_rule_ids": ["term_high_risk_stop_consult"],
+      "linked_emergency_protocol_ids": ["protocol_120"],
+      "sources": [{"name_zh": "容器样例数据", "level": "seed"}]
+    },
+    {
+      "rule_id": "cls_acute_cardiac_event",
+      "rule_name_zh": "急性心血管事件",
+      "enabled": true,
+      "question_category": "acute_symptom",
+      "default_tier": "high",
+      "trigger_keywords_zh": ["胸痛", "胸口疼", "喘不上气", "口角歪斜", "说话不清"],
+      "engine_actions": ["terminate_online_consultation", "recommend_crisis_hotline", "link_adverse_event_protocol"],
+      "voice_script_zh": "这些症状可能是急症，请立即联系家人前往急诊或拨打 120。",
+      "linked_adverse_symptom_rule_ids": ["rule_sym_chest_pain", "rule_sym_neuro_deficit"],
+      "linked_termination_rule_ids": ["term_high_risk_stop_consult"],
+      "sources": [{"name_zh": "容器样例数据", "level": "seed"}]
+    },
+    {
+      "rule_id": "cls_training_adverse_signal",
+      "rule_name_zh": "训练中出现异常信号",
+      "enabled": true,
+      "question_category": "training_adverse",
+      "default_tier": "medium",
+      "trigger_keywords_zh": ["头晕", "站不稳", "心悸", "关节锐痛"],
+      "engine_actions": ["transfer_human_agent", "reply_with_disclaimer", "pause_current_session"],
+      "voice_script_zh": "请先暂停训练、坐位休息。我需要让专业人员进一步评估您的情况。",
+      "linked_adverse_symptom_rule_ids": ["rule_sym_dizziness"],
+      "linked_adverse_threshold_ids": ["th_resting_hr_high", "th_systolic_bp_high"],
+      "sources": [{"name_zh": "容器样例数据", "level": "seed"}]
+    },
+    {
+      "rule_id": "cls_medication_schedule",
+      "rule_name_zh": "用药与漏服咨询",
+      "enabled": true,
+      "question_category": "medication",
+      "default_tier": "medium",
+      "trigger_keywords_zh": ["漏服", "忘记吃药", "药量"],
+      "engine_actions": ["transfer_human_agent", "reply_with_disclaimer"],
+      "auto_reply_hint_zh": "只说明一般补服原则，不调整剂量，提示以医嘱为准。",
+      "sources": [{"name_zh": "容器样例数据", "level": "seed"}]
+    },
+    {
+      "rule_id": "cls_action_instruction",
+      "rule_name_zh": "动作要领与流程咨询",
+      "enabled": true,
+      "question_category": "health_education",
+      "default_tier": "normal",
+      "trigger_keywords_zh": ["怎么做", "动作要领", "做几组", "多久一次"],
+      "engine_actions": ["reply_with_disclaimer"],
+      "auto_reply_hint_zh": "引用动作库 steps 与 parameters，末尾附免责声明。",
+      "voice_script_zh": "这个动作分三步，我带您慢慢做一遍。",
+      "sources": [{"name_zh": "容器样例数据", "level": "seed"}]
+    },
+    {
+      "rule_id": "cls_appointment_logistics",
+      "rule_name_zh": "随访与复诊安排",
+      "enabled": true,
+      "question_category": "logistics",
+      "default_tier": "normal",
+      "trigger_keywords_zh": ["复诊", "随访时间", "带什么材料"],
+      "engine_actions": ["reply_with_disclaimer", "link_follow_up_prep"],
+      "linked_adverse_symptom_rule_ids": [],
+      "sources": [{"name_zh": "容器样例数据", "level": "seed"}]
+    }
+  ]
+}

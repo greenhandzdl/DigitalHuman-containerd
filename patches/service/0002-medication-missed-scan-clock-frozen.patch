@@ -1,0 +1,30 @@
+diff -ruN a/tests/test_medication_reminder.py b/tests/test_medication_reminder.py
+--- a/tests/test_medication_reminder.py	2026-09-21 01:57:49.464561834 +0800
++++ b/tests/test_medication_reminder.py	2026-09-21 01:58:23.723233855 +0800
+@@ -1,4 +1,5 @@
+ from datetime import datetime, timedelta
++from zoneinfo import ZoneInfo
+ 
+ from tests.conftest import API, auth_headers
+ 
+@@ -164,7 +165,19 @@
+ 
+ def test_medication_missed_scan(client, elder_token, monkeypatch):
+     headers = auth_headers(elder_token)
+-    past_slot = (datetime.now() - timedelta(hours=2)).strftime("%H:%M")
++    # 漏服判定把 "HH:MM" 落回**当天**（notification_service.slot_local_datetime 用的是
++    # local_now.replace(hour=..., minute=...)），所以 "now - 2h" 这个取法只在同一天内成立：
++    # 00:00~01:59 跑套件时它变成昨天的 23:xx，相对"今天 23:xx"还在未来，
++    # run_medication_missed_scan 按 `local_now < slot_dt + grace` 跳过 → 一条不发 → 恒红。
++    # 把扫描用的"现在"钉到当天正午，用例就不再取决于套件几点跑。
++    ref = datetime.now(ZoneInfo("Asia/Shanghai")).replace(
++        hour=12, minute=0, second=0, microsecond=0
++    )
++    past_slot = (ref - timedelta(hours=2)).strftime("%H:%M")
++    monkeypatch.setattr(
++        "app.services.reminder_scheduler_service._local_now",
++        lambda tz_name: ref.astimezone(ZoneInfo(tz_name)),
++    )
+ 
+     client.post(
+         f"{API}/elder/medication-reminders",

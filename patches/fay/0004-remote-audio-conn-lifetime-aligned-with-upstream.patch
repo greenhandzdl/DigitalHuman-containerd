@@ -1,0 +1,72 @@
+diff -ruN a/fay_booter.py b/fay_booter.py
+--- a/fay_booter.py	2026-09-20 19:44:32.244075215 +0800
++++ b/fay_booter.py	2026-09-20 19:52:07.807379962 +0800
+@@ -133,11 +133,14 @@
+         super().__init__(fei)
+         self.__running = True
+         self.streamCache = None
+-        self.thread = MyThread(target=self.run)
+-        self.thread.start()  #启动远程音频输入设备监听线程
+         self.username = 'User'
+         self.isOutput = True
++        # containerd 补丁：deviceConnector 必须在 thread.start() 之前赋好。run() 的第一句
++        # 就读 self.deviceConnector，原来的顺序让新线程几乎必然撞上 AttributeError；
++        # 以前 except 里是 pass，1 秒后重试就自愈了，所以没人注意。
+         self.deviceConnector = deviceConnector
++        self.thread = MyThread(target=self.run)
++        self.thread.start()  #启动远程音频输入设备监听线程
+ 
+     def run(self):
+         #启动ngork
+@@ -147,8 +150,15 @@
+             try:
+                 
+                 data = b""
+-                while self.deviceConnector:
++                while self.deviceConnector and self.__running:
+                     data = self.deviceConnector.recv(2048)
++                    if not data:
++                        # containerd 补丁（对齐上游 xszyou/Fay@74b49ae）：对端优雅关闭
++                        # （FIN）时 recv 返回 b"" 而不抛异常。原写法会在这条死连接上以
++                        # 200 次/秒空转，且 stop() 置了 __running 也退不出内层循环。
++                        util.log(1, f"远程音频设备 {self.username} 连接已关闭，停止监听线程")
++                        self.__running = False
++                        break
+                     if b"<username>" in data:
+                         data_str = data.decode("utf-8")
+                         match = re.search(r"<username>(.*?)</username>", data_str)
+@@ -169,9 +179,19 @@
+                 self.streamCache.clear()
+          
+             except Exception as err:
+-                pass
++                # 连接被重置 / 网络异常同样视为连接已死：退出线程，而不是无限重试。
++                util.log(1, f"远程音频设备 {self.username} 监听异常，停止监听线程: {err}")
++                self.__running = False
+             time.sleep(1)
+ 
++        # 线程即将退出：一定把 socket 关掉，否则每条远程音频连接泄漏一个 fd。
++        try:
++            if self.deviceConnector:
++                self.deviceConnector.close()
++        except Exception:
++            pass
++        self.deviceConnector = None
++
+     def on_speaking(self, text):
+         global feiFei
+         if len(text) > 1:
+@@ -189,6 +209,13 @@
+     def stop(self):
+         super().stop()
+         self.__running = False
++        # run() 可能正阻塞在 recv() 上等数据（僵尸连接：对端没发 FIN/RST）。
++        # 只置 __running 退不出来，close() 才能让 recv 立刻抛异常。
++        try:
++            if self.deviceConnector:
++                self.deviceConnector.close()
++        except Exception:
++            pass
+ 
+     def is_remote(self):
+         return True

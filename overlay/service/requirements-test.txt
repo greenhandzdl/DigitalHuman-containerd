@@ -1,0 +1,4 @@
+# 后端测试镜像的额外依赖：service/pyproject.toml 的 [project.optional-dependencies].dev
+# 只有这两项（pytest>=8.3.0 / pytest-asyncio>=0.25.0），照抄，不额外加东西。
+pytest>=8.3.0
+pytest-asyncio>=0.25.0

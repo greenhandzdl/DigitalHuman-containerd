@@ -1,0 +1,18 @@
+diff -ruN a/utils/config_util.py b/utils/config_util.py
+--- a/utils/config_util.py	2026-09-20 11:54:03.704392179 +0800
++++ b/utils/config_util.py	2026-09-20 11:54:03.704481171 +0800
+@@ -542,6 +542,14 @@
+     volcano_tts_cluster = system_config.get('key', 'volcano_tts_cluster', fallback=None)
+     volcano_tts_voice_type = system_config.get('key', 'volcano_tts_voice_type', fallback=None)
+ 
++    # containerd 补丁：允许用环境变量换模型，不设变量时与上游完全一致（读文件里的值）。
++    # 容器化部署里这是标准做法（同一份镜像、不同实例配不同模型），这里只放开模型名，
++    # 因为它是唯一需要按「本机还剩多少显存」来定的参数：qwen3.5:9b 在 6.1GB 权重里
++    # 只有 6% 能驻留显存时，一句规划要 165~240s；换 qwen2.5:1.5b（986MB）暖态 0.2s。
++    # 于是可以给测试专门起一个轻模型实例，而不必改动挂载进去的 system.conf。
++    gpt_model_engine = os.environ.get('FAY_GPT_MODEL_ENGINE') or gpt_model_engine
++    big_model_engine = os.environ.get('FAY_BIG_MODEL_ENGINE') or big_model_engine
++
+     # 读取 Embedding API 配置（base_url 可单独配置，未配置则复用 LLM）
+     embedding_api_model = system_config.get('key', 'embedding_api_model', fallback='BAAI/bge-large-zh-v1.5')
+     _embedding_base_url_cfg = system_config.get('key', 'embedding_base_url', fallback='')

@@ -1,0 +1,161 @@
+{
+  "root": "/ue",
+  "total_files": 17383,
+  "total_gib": 10.06,
+  "top_extensions": [
+    [
+      ".c",
+      4243
+    ],
+    [
+      ".f",
+      3774
+    ],
+    [
+      ".h",
+      3165
+    ],
+    [
+      "",
+      1832
+    ],
+    [
+      ".uasset",
+      1641
+    ],
+    [
+      ".s",
+      1057
+    ],
+    [
+      ".cpp",
+      523
+    ],
+    [
+      ".jpg",
+      236
+    ],
+    [
+      ".txt",
+      108
+    ],
+    [
+      ".in",
+      96
+    ],
+    [
+      ".png",
+      88
+    ],
+    [
+      ".cmake",
+      66
+    ]
+  ],
+  "modules_with_source": [
+    "AzSpeech",
+    "MetaHuman",
+    "plugins/AzSpeech",
+    "plugins/MetaHuman",
+    "plugins/MetaShoot_Fixed",
+    "plugins/RLLiveLink",
+    "plugins/RLPlugin",
+    "plugins/SwitchLanguage",
+    "plugins/VaRestPlugin",
+    "plugins/XunFei",
+    "plugins/XunFeiTTS-main"
+  ],
+  "plugins": [
+    "Marketplace/AzSpeech",
+    "Marketplace/MetaHuman",
+    "Marketplace/SwitchLanguage",
+    "Marketplace/VaRestPlugin",
+    "MetaShoot_Fixed/Content",
+    "MetaShoot_Fixed/Resources",
+    "MetaShoot_Fixed/Source",
+    "RLLiveLink/Content",
+    "RLLiveLink/Resources",
+    "RLLiveLink/Source",
+    "RLPlugin/Content",
+    "RLPlugin/Resources",
+    "RLPlugin/Source",
+    "XunFei/Resources",
+    "XunFei/Source",
+    "XunFeiTTS-main/ReadMeImg",
+    "XunFeiTTS-main/Resources",
+    "XunFeiTTS-main/Source"
+  ],
+  "windows_binaries": 0,
+  "unix_binaries": 0,
+  "text_files_scanned": 4011,
+  "protocol_pattern_hits": {
+    "10002": 32,
+    "WebSocket": 39
+  },
+  "protocol_pattern_evidence": {
+    "10002": [
+      "Config/Marketplace/AzSpeech/Source/ThirdParty/AzureWrapper/include/c_api/speechapi_c_property_bag.h: Conversation_Initial_Silence_Timeout = 10002,",
+      "Config/Marketplace/AzSpeech/Source/ThirdParty/AzureWrapper/include/cxx_api/speechapi_cxx_enums.h: Conversation_Initial_Silence_Timeout = 10002,",
+      "Config/Marketplace/MetaHuman/Content/MeshFitting/Template/fitting_masks.json: {\"body_flow_mask\":[[0,1],[1,1],[2,1],[3,1],[4,1],[5,1],[6,1],[7,1],[8,1],[9,1],[10,1],[11,1],[12,1],[13,1],[14,1],[15,1],[16,1],[17,1],[18,1],[19,1],[20,1],[21,",
+      "Config/Marketplace/MetaHuman/Content/MeshFitting/Template/fitting_masks.json: {\"body_flow_mask\":[[0,1],[1,1],[2,1],[3,1],[4,1],[5,1],[6,1],[7,1],[8,1],[9,1],[10,1],[11,1],[12,1],[13,1],[14,1],[15,1],[16,1],[17,1],[18,1],[19,1],[20,1],[21,",
+      "Config/Marketplace/MetaHuman/Content/MeshFitting/Template/fitting_masks.json: {\"body_flow_mask\":[[0,1],[1,1],[2,1],[3,1],[4,1],[5,1],[6,1],[7,1],[8,1],[9,1],[10,1],[11,1],[12,1],[13,1],[14,1],[15,1],[16,1],[17,1],[18,1],[19,1],[20,1],[21,",
+      "Config/Marketplace/MetaHuman/Content/MeshFitting/Template/fitting_masks.json: {\"body_flow_mask\":[[0,1],[1,1],[2,1],[3,1],[4,1],[5,1],[6,1],[7,1],[8,1],[9,1],[10,1],[11,1],[12,1],[13,1],[14,1],[15,1],[16,1],[17,1],[18,1],[19,1],[20,1],[21,"
+    ],
+    "WebSocket": [
+      "Config/Marketplace/AzSpeech/Source/ThirdParty/AzureWrapper/include/cxx_api/speechapi_cxx_enums.h: /// This measures the latency between when the synthesis is started to be processed, and the moment the HTTP/WebSocket connection is established.",
+      "plugins/Marketplace/AzSpeech/Source/ThirdParty/AzureWrapper/include/cxx_api/speechapi_cxx_enums.h: /// This measures the latency between when the synthesis is started to be processed, and the moment the HTTP/WebSocket connection is established.",
+      "plugins/XunFeiTTS-main/Source/XunFeiTTS/Private/WebSocket.cpp: #include \"WebSocket.h\"",
+      "plugins/XunFeiTTS-main/Source/XunFeiTTS/Private/WebSocket.cpp: WebSocket = WebSocketModule.CreateWebSocket(Url);",
+      "plugins/XunFeiTTS-main/Source/XunFeiTTS/Private/WebSocket.cpp: if (WebSocket)",
+      "plugins/XunFeiTTS-main/Source/XunFeiTTS/Private/WebSocket.cpp: WebSocket->OnConnectionError().AddUObject(this, &UWebSocket::OnWebsocketConnectError);"
+    ]
+  },
+  "verdicts": [
+    {
+      "kind": "PASS",
+      "name": "工程描述符可解析",
+      "detail": "12 个全可解析（其中 2 个是 UTF-16 带 BOM，必须按 BOM 才读得出来：['plugins/XunFei/XunFei.uplugin', 'plugins/XunFeiTTS-main/XunFeiTTS.uplugin']）"
+    },
+    {
+      "kind": "PASS",
+      "name": "插件模块的 Source 目录都在",
+      "detail": "9 个自带插件、22 个模块全部有对应的 Source/ 目录（Config/Marketplace 下的授权副本不参与构建，不判）"
+    }
+  ],
+  "engine_present": false,
+  "has_buildable_source": true,
+  "fay_protocol_referenced": {},
+  "engine_association": "5.1",
+  "declared_plugins": [
+    "ModelingToolsEditorMode",
+    "LiveLinkControlRig",
+    "AppleARKitFaceSupport",
+    "HairStrands",
+    "RLPlugin",
+    "MetaShoot",
+    "RLLiveLink",
+    "MetaHuman",
+    "AzSpeech",
+    "VaRest",
+    "SwitchLanguage"
+  ],
+  "plugins_resolved_in_repo": {
+    "RLPlugin": "plugins/RLPlugin/RLPlugin.uplugin",
+    "MetaShoot": "plugins/MetaShoot_Fixed/MetaShoot.uplugin",
+    "RLLiveLink": "plugins/RLLiveLink/RLLiveLink.uplugin",
+    "MetaHuman": "plugins/Marketplace/MetaHuman/MetaHuman.uplugin",
+    "AzSpeech": "plugins/Marketplace/AzSpeech/AzSpeech.uplugin",
+    "VaRest": "plugins/Marketplace/VaRestPlugin/VaRest.uplugin",
+    "SwitchLanguage": "plugins/Marketplace/SwitchLanguage/SwitchLanguage.uplugin"
+  },
+  "plugins_not_resolved_in_repo": [
+    "ModelingToolsEditorMode",
+    "LiveLinkControlRig",
+    "AppleARKitFaceSupport",
+    "HairStrands"
+  ],
+  "plugins_on_disk_not_declared": [
+    "XunFei",
+    "XunFeiTTS"
+  ]
+}

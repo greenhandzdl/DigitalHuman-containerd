@@ -1,0 +1,68 @@
+--- a/mcp_servers/yueshen_rag/server.py	2026-09-21 00:06:09.143359388 +0800
++++ b/mcp_servers/yueshen_rag/server.py	2026-09-21 00:07:01.587078612 +0800
+@@ -82,6 +82,16 @@
+ AUTO_INGEST_INTERVAL = int(os.getenv("YUESHEN_AUTO_INTERVAL", "300"))
+ AUTO_RESET_ON_START = os.getenv("YUESHEN_AUTO_RESET_ON_START", "0") != "0"
+ 
++# containerd 补丁：transport 开关。上游只有 stdio —— 消息从 stdin 喂进来，而容器里
++# 没有人在那头写 stdin，所以这个服务在容器里永远连不上。加一条 SSE 分支，让 Fay 能用
++# mcp_servers.json 里的 ip 字段直连 http://<容器名>:<port>/sse。默认值仍是 stdio，
++# 不设这个变量的部署行为一字不变。
++TRANSPORT = os.getenv("YUESHEN_TRANSPORT", "stdio").strip().lower()
++SSE_HOST = os.getenv("YUESHEN_SSE_HOST", "0.0.0.0")
++SSE_PORT = int(os.getenv("YUESHEN_SSE_PORT", "8766"))
++SSE_PATH = os.getenv("YUESHEN_SSE_PATH", "/sse")
++SSE_MSG_PATH = os.getenv("YUESHEN_SSE_MSG_PATH", "/messages/")
++
+ 
+ # -------------------- Text chunking -------------------- #
+ def _len_with_newlines(parts: List[str]) -> int:
+@@ -735,7 +745,46 @@
+         await server.run(read_stream, write_stream, init_opts)
+ 
+ 
++class _SseEndpoint:
++    """ASGI endpoint —— 形状照 fay/faymcp/mcp_server.py:538 那份已被容器验过的实现。
++
++    connect_sse() 自己往 ASGI 的 send 通道写响应，所以这里必须是一个吃
++    (scope, receive, send) 三参数的裸 ASGI 可调用对象；写成收 `Request` 的视图函数会
++    让 Starlette 再补一个 Response，把 SSE 的 `event: endpoint` 首帧挤掉。
++    """
++
++    def __init__(self, transport):
++        self._transport = transport
++
++    async def __call__(self, scope, receive, send):
++        async with self._transport.connect_sse(scope, receive, send) as streams:
++            read_stream, write_stream = streams
++            await server.run(read_stream, write_stream, server.create_initialization_options())
++
++
++def _run_sse() -> None:
++    from mcp.server.sse import SseServerTransport
++    from starlette.applications import Starlette
++    from starlette.routing import Mount, Route
++
++    import uvicorn
++
++    transport = SseServerTransport(SSE_MSG_PATH)
++    app = Starlette(routes=[
++        Route(SSE_PATH, _SseEndpoint(transport), methods=["GET"]),
++        Mount(SSE_MSG_PATH, app=transport.handle_post_message),
++    ])
++    AutoIngestor(manager).start()
++    logger.info("SSE transport listening on http://%s:%s%s (messages: %s)",
++                SSE_HOST, SSE_PORT, SSE_PATH, SSE_MSG_PATH)
++    # uvicorn.run() 自己建事件循环，所以这条分支挂在 __main__ 上、不套进 asyncio.run(main())
++    uvicorn.run(app, host=SSE_HOST, port=SSE_PORT, log_level="info")
++
++
+ if __name__ == "__main__":
+-    import asyncio
++    if TRANSPORT == "sse":
++        _run_sse()
++    else:
++        import asyncio
+ 
+-    asyncio.run(main())
++        asyncio.run(main())

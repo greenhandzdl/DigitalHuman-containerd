@@ -1,0 +1,616 @@
+name: digitalhuman
+
+# ---------------------------------------------------------------------------
+# DigitalHuman 容器集成：Fay + 康养后端 + MySQL + Redis + 对话协议适配器。
+#
+# 设计约束（对应上游分析里的四条断裂接缝）：
+#   * 不改 fay / service / ue 任何一行代码。环境差异全部由 overlay 挂载解决：
+#       containerd/overlay/fay/system.conf -> /app/system.conf   (仓库里不存在，必须提供)
+#       containerd/overlay/fay/config.json -> /app/config.json   (关掉麦克风与本地播放)
+#   * 后端与 Fay 的契约不同形（后端 POST /api/chat，Fay 只有异步 /api/send + /api/get-msg
+#     轮询），由 adapter 服务在中间转换，两边源码保持原样。
+#   * 所有 AI 能力走宿主机 Ollama：extra_hosts 用 host-gateway 拿到 host.docker.internal。
+#   * UE5 不进 compose —— 实测该仓库 10.06GB / 17383 文件，EngineAssociation 5.1 但
+#     不含引擎本体，11 个启用插件里 5 个要 Epic  Marketplace 授权，11 个模块带 Source/
+#     却全树零个预编译二进制，且端点级引用 10002 协议为 0 处。数字见 containerd/README.md
+#     「UE 仓库的容器侧处置」，由 ./run.sh test 里的 ue-audit 容器现场产出。
+# ---------------------------------------------------------------------------
+
+x-host-gateway: &host-gateway
+  extra_hosts:
+    - "host.docker.internal:host-gateway"
+
+x-restart: &restart
+  restart: unless-stopped
+
+# LLM / embedding 请求的超时与重试。这两个数字上游是写死的
+# （llm/execution_manager.py 小模型 60s/1 次重试、utils/api_embedding_service.py
+# 60s/2 次重试），containerd/patches/ 把它们开成环境变量后才可调。
+#
+# 为什么要调：本机 16GB 显存被其他常驻服务占到 15.2GB，ollama 只能在
+# qwen3.5:9b 与 qwen3-embedding:0.6b 之间反复换入换出，实测一次 embedding
+# 请求就要 >60s → 必然超时 → 整条请求重发 3 遍 = 180s，把问答链路的预算吃光
+# （一句话回答反而等不到）。所以：LLM 给足时间且不再重试，embedding 快速失败，
+# 让它落到 gpt_structure.py:294 上游自带的「本地模拟向量」兜底路子上。
+# 显存腾开以后把 EMBEDDING_TIMEOUT 调大（如 180）就恢复真向量记忆。
+#
+# STREAM_REPLY_IDLE_TIMEOUT 是第三处写死的时限：gui/flask_server.py:51 读回复流的
+# 空闲上限 180s。它必须 >= 上面的 LLM_REQUEST_TIMEOUT，否则「模型正在慢慢想」会被
+# 判成「Fay 卡住」：run #2 实测 fork 的规划器链路单次 180~240s，于是
+# /v1/chat/completions 每次都正好在 180.0s 返回空 content，而同机同模型的
+# origin-fay（上游直出，无规划器）172.1s 拿到了「好」。
+x-llm-timeouts: &llm-timeouts
+  LLM_REQUEST_TIMEOUT: "420"
+  LLM_REQUEST_MAX_RETRIES: "0"
+  # 这两个值原本抄的是上游默认（60s / 2 次）再往下压成 20s / 0 次，理由是「容器里
+  # 不要死等」。run #7 把这条决定否证了：整机 ollama 换入模型实测要 72.9s，20s/0 次
+  # 必然超时 → 记忆检索静默退化成模拟向量（日志：调用 API embedding 失败，使用模拟
+  # 向量代替），而自检线程被这串重试拖住，:8765 到第 61 秒才 bind。
+  # 现在按实测最坏值给：90s 单次 + 1 次重试，换入完成后一次 embedding 实测 0.06s。
+  EMBEDDING_TIMEOUT: "90"
+  EMBEDDING_MAX_RETRIES: "1"
+  STREAM_REPLY_IDLE_TIMEOUT: "480"
+
+# Fay 三实例（fay / origin-fay / fay-lite）共用同一份镜像、同一套对外端口，
+# 也就共用同一条就绪判据。只看 :5000 会过早放行：实测开机 :5000/:5010/:10002/
+# :10003 第 6 秒全 bind，而 :8765（MCP SSE）要等到第 24~61 秒 —— 它排在开机自检
+# 那串 embedding 重试之后。compose --wait 提前判 healthy，探针就会打进一个只起了
+# 一半的实例（run #7 里 MCP SSE / OpenAI 兼容层 / /api/send 三条 FAIL 全这么来的）。
+#
+# 探测方式按"只问内核、不拨号"来写：健康检查是**周期性**的（容器活着就一直跑），
+# 早先用 socket.create_connection 逐个拨号，每 10s 一轮就往 :10002/:10003 那两个
+# websockets 服务各塞进一条半开的空连接，对端按 HTTP 解析必然 400，于是
+# `websockets/legacy/server.py:230` 每轮印两对 `connection failed (400 Bad Request)`
+# + `connection closed` —— 一台空闲容器每小时 720 对，全是本栈自己造的。
+# 换成读 /proc/net/tcp{,6} 的 LISTEN 表：判据仍然是那五个端口 bind 没有（run #7
+# 要的就是这个），但一个字节都不发到业务端口，容器日志恢复成只有被测对象在说话。
+# 真握手那部分不在这里，探针各自都会打（MCP SSE 走 event: endpoint、:10002 走完整会话）。
+x-fay-healthcheck: &fay-healthcheck
+  test: ["CMD", "python", "-c", "import pathlib,sys; want={5000,5010,8765,10002,10003}; have={int(r.split()[1].rsplit(':',1)[1],16) for f in ('/proc/net/tcp','/proc/net/tcp6') for r in pathlib.Path(f).read_text().splitlines()[1:] if r.split()[3]=='0A'}; sys.exit(1 if want-have else 0)"]
+  interval: 10s
+  timeout: 8s
+  retries: 30
+  start_period: 90s
+
+# Fay 的 MCP 服务器清单（faymcp/mcp_service.py:29 就是这个路径）。三份 overlay 与
+# 仓库里的只差 id=4 一项：transport stdio → sse、ip 填本栈的容器地址。为什么必须换
+# 掉而不是留着 —— 上游那份是 stdio，容器里没人在 stdin 那头写，这条服务永远连不上；
+# 详见 patches/yueshen_rag/0001。三份而不是共用一份，因为 mcp_service.py:132 在每次
+# 连接/断开后整份重写这个文件（更新 connection_time），两个容器写同一个宿主文件会互相盖。
+# 所以这条挂载刻意不带 :ro。三个实例各挂自己那份，见 overlay/{fay,fay-lite,origin_fay}/。
+
+services:
+  mysql:
+    <<: *restart
+    image: mysql:8.0
+    container_name: dh-mysql
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD}
+      TZ: Asia/Shanghai
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_unicode_ci
+    volumes:
+      - mysql-data:/var/lib/mysql
+      - ./sql/init:/docker-entrypoint-initdb.d:ro
+    ports:
+      - "${BIND_ADDR:-127.0.0.1}:${MYSQL_HOST_PORT:-13306}:3306"
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -uroot -p\"$$MYSQL_ROOT_PASSWORD\" --silent"]
+      interval: 5s
+      timeout: 5s
+      retries: 40
+      start_period: 45s
+
+  redis:
+    <<: *restart
+    image: redis:7-alpine
+    container_name: dh-redis
+    command: ["redis-server", "--requirepass", "${REDIS_PASSWORD}", "--appendonly", "yes"]
+    volumes:
+      - redis-data:/data
+    ports:
+      - "${BIND_ADDR:-127.0.0.1}:${REDIS_HOST_PORT:-16379}:6379"
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -a \"$$REDIS_PASSWORD\" ping | grep -q PONG"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD}
+
+  # ---------------------------------------------------------- yueshen 知识库（chromadb）
+  # fay/mcp_servers/yueshen_rag 是仓库里唯一带重依赖（chromadb）的 MCP 服务器，也是
+  # 此前探针那条「按边界 SKIP」的成因。这里把它单独容器化：不把 chromadb 装进 Fay 镜像
+  # （那份镜像里 uvicorn<0.35 + websockets~=10.4 的组合正是 :8765 MCP SSE 判据能绿的
+  # 前提，chromadb 会把它俩都拽起来），而是让 Fay 通过 MCP 的 SSE transport 连过来。
+  # 上游只有 stdio 一条路，所以这条路是 patches/yueshen_rag/0001 开出来的环境变量开关。
+  #
+  # 端口不发布到宿主 —— Fay 在 compose 网络里按容器名打 http://yueshen-rag:8766/sse。
+  yueshen-rag:
+    <<: [*host-gateway, *restart]
+    build:
+      context: ..
+      dockerfile: containerd/images/yueshen_rag.Dockerfile
+    image: dh-yueshen-rag:local
+    container_name: dh-yueshen-rag
+    environment:
+      TZ: Asia/Shanghai
+      # 嵌入模型走宿主 Ollama 的 OpenAI 兼容口，与 system.conf 里 embedding_* 同一套。
+      # 模型名必须显式给：server.py 的默认值是 "embedding"，那是 Fay 自己 :5000 转发口
+      # 上的别名，直连 ollama 时它认不出这个名字。
+      YUESHEN_EMBED_BASE_URL: http://host.docker.internal:11434/v1
+      YUESHEN_EMBED_MODEL: ${YUESHEN_EMBED_MODEL:-qwen3-embedding:0.6b}
+      # 上游写死 30s（patches/0002 才可调）。本机换入 embedding 模型实测要 70s 以上，
+      # 30s 撞上的表现是 ingest 返回 inserted:0 而不是报错，所以给到 3 倍余量。
+      YUESHEN_EMBED_TIMEOUT: ${YUESHEN_EMBED_TIMEOUT:-180}
+    volumes:
+      - yueshen-persist:/app/persist
+    healthcheck:
+      test: ["CMD", "python", "-c", "import socket;socket.create_connection(('127.0.0.1',8766),3).close()"]
+      interval: 10s
+      timeout: 8s
+      retries: 20
+      start_period: 30s
+
+  # ------------------------------------------------------------------ Fay 认知中台
+  fay:
+    <<: [*host-gateway, *restart]
+    build:
+      context: ..
+      dockerfile: containerd/images/fay.Dockerfile
+    image: dh-fay:local
+    container_name: dh-fay
+    # 刻意不传 -config_center：那会强制走远程配置中心（现已不可达），
+    # 去掉后 config_util 才回落到下面两个 overlay 文件。
+    command: ["python", "main.py", "start"]
+    environment:
+      TZ: Asia/Shanghai
+      <<: *llm-timeouts
+    volumes:
+      - ./overlay/fay/system.conf:/app/system.conf:ro
+      - ./overlay/fay/config.json:/app/config.json
+      - ./overlay/fay/mcp_servers.json:/app/faymcp/data/mcp_servers.json
+      - fay-memory:/app/memory
+      - fay-cache:/app/cache_data
+      - fay-logs:/app/logs
+      - fay-samples:/app/samples
+    ports:
+      - "${BIND_ADDR:-127.0.0.1}:${FAY_HTTP_PORT:-5000}:5000"      # Flask：Web UI + OpenAI 兼容口
+      - "${BIND_ADDR:-127.0.0.1}:${FAY_HUMAN_WS_PORT:-10002}:10002" # 数字人 WS（未来给 UE/前端）
+      - "${BIND_ADDR:-127.0.0.1}:${FAY_WEB_WS_PORT:-10003}:10003"   # 浏览器面板 WS
+    healthcheck: *fay-healthcheck
+    depends_on:
+      redis:
+        condition: service_started
+      yueshen-rag:
+        condition: service_started
+
+  # ------------------------------------------------ 后端 ↔ Fay 的 /api/chat 协议适配
+  adapter:
+    <<: [*host-gateway, *restart]
+    image: docker.m.daocloud.io/python:3.12-slim
+    container_name: dh-adapter
+    command: ["python", "/adapter/server.py"]
+    environment:
+      TZ: Asia/Shanghai
+      FAY_BASE_URL: http://fay:5000
+      ADAPTER_PORT: "8010"
+      ADAPTER_MAX_WAIT_SECONDS: ${ADAPTER_MAX_WAIT_SECONDS:-500}   # 必须 > Fay 的 STREAM_REPLY_IDLE_TIMEOUT(480)、< 后端 FAY_FORWARD_TIMEOUT_SECONDS
+      ADAPTER_SETTLE_SECONDS: ${ADAPTER_SETTLE_SECONDS:-2}
+      ADAPTER_USERNAME_PREFIX: ${ADAPTER_USERNAME_PREFIX:-elder_}
+    volumes:
+      - ./adapter:/adapter:ro
+    ports:
+      - "${BIND_ADDR:-127.0.0.1}:${ADAPTER_PORT:-8010}:8010"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request as u;u.urlopen('http://127.0.0.1:8010/healthz',timeout=3)"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+    depends_on:
+      fay:
+        condition: service_started
+
+  # ------------------------------------------------------------------- 康养后端服务
+  backend:
+    <<: [*host-gateway, *restart]
+    build:
+      context: ..
+      dockerfile: containerd/images/service.Dockerfile
+      # 不指定 target 会构到最后一个阶段（test），生产镜像就带上 pytest 了。
+      target: runtime
+    image: dh-service:local
+    container_name: dh-backend
+    environment:
+      TZ: Asia/Shanghai
+      APP_NAME: ${APP_NAME:-康养数字人后端}
+      DEBUG: ${DEBUG:-false}
+      API_V1_PREFIX: /api/v1
+      # --- 数据库（容器内直连，绕开宿主 3306 上已有的 mysql 容器）---
+      MYSQL_HOST: mysql
+      MYSQL_PORT: "3306"
+      MYSQL_USER: root
+      MYSQL_PASSWORD: ${MYSQL_ROOT_PASSWORD}
+      MYSQL_DB: ${MYSQL_DB:-care_echo_rehab}
+      REDIS_URL: redis://:${REDIS_PASSWORD}@redis:6379/0
+      # --- 鉴权 ---
+      JWT_SECRET_KEY: ${JWT_SECRET_KEY}
+      JWT_ALGORITHM: ${JWT_ALGORITHM:-HS256}
+      JWT_EXPIRE_MINUTES: ${JWT_EXPIRE_MINUTES:-720}
+      # --- Fay：后端只认 /api/chat，交给 adapter 翻译 ---
+      FAY_HTTP_URL: http://adapter:8010
+      FAY_CHAT_PATH: /api/chat
+      # 超时链自下而上必须单调变长，否则下层还在等、上层先放弃，
+      # 用户看到的就是「后端说超时」而不是 Fay 真正给出的回复：
+      #   LLM 420 < Fay 回复空闲上限 480 ≤ adapter 500 < backend 520
+      # 依据是实测：本机 9b 只有 6% 权重驻留显存，origin-fay 一句话要 172~301s，
+      # 上游默认值（adapter 60 / backend 30，见 service/app/core/config.py:43）
+      # 在这台机器上必然抢跑。显存腾开后按注释把这几个数字调小即可。
+      FAY_FORWARD_TIMEOUT_SECONDS: ${FAY_FORWARD_TIMEOUT_SECONDS:-520}
+      FAY_WS_URL: ws://fay:10002
+      # 上游 config.py 的 json_data_dir 默认值是开发者本机 Windows 路径，
+      # 参考语料（动作库/计划模板/异常规则/随访标准/分级规则）不在仓库里。
+      # 容器用一份只读的最小样例语料顶上，保证导入链路和自测可跑。
+      JSON_DATA_DIR: ${JSON_DATA_DIR:-/app/reference_data}
+    volumes:
+      - backend-data:/app/data
+      - ./seed/service_reference_data:/app/reference_data:ro
+    # 迁移 -> 导入参考语料 -> 危机热线种子 -> 起服务。
+    # 播种用 ';' 与 exec 串联：语料缺失时只记日志，不阻塞服务启动。
+    command:
+      - sh
+      - -c
+      - >
+        python -m alembic upgrade head &&
+        python -m scripts.import_reference_json --category all &&
+        python -m scripts.seed_crisis_hotlines;
+        exec uvicorn app.main:app --host 0.0.0.0 --port 8000
+    ports:
+      - "${BIND_ADDR:-127.0.0.1}:${BACKEND_PORT:-8000}:8000"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8000/api/v1/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 20
+      start_period: 40s
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      adapter:
+        condition: service_started
+
+  # ---------------------------------------------------- origin_fay（上游 v4.8.1 参照实例）
+  # 与上面的 fay 是两份不同代码：fay = 本项目 fork（导入点 45b44e9），
+  # origin_fay = 上游 8b6c2b4 v4.8.1，两者 56 个文件不同。同一份 Dockerfile 靠
+  # build args 换源码目录与补丁目录，用来做「fork 相对上游改了什么」的对照实验。
+  origin-fay:
+    <<: [*host-gateway, *restart]
+    build:
+      context: ..
+      dockerfile: containerd/images/fay.Dockerfile
+      args:
+        FAY_SRC: origin_fay
+        PATCH_DIR: containerd/patches/origin_fay
+    image: dh-origin-fay:local
+    container_name: dh-origin-fay
+    command: ["python", "main.py", "start"]
+    environment:
+      TZ: Asia/Shanghai
+      <<: *llm-timeouts
+    volumes:
+      - ./overlay/origin_fay/system.conf:/app/system.conf:ro
+      - ./overlay/origin_fay/config.json:/app/config.json
+      - ./overlay/origin_fay/mcp_servers.json:/app/faymcp/data/mcp_servers.json
+      - origin-fay-memory:/app/memory
+      - origin-fay-cache:/app/cache_data
+      - origin-fay-logs:/app/logs
+      - origin-fay-samples:/app/samples
+    ports:
+      - "${BIND_ADDR:-127.0.0.1}:${ORIGIN_FAY_HTTP_PORT:-5100}:5000"
+      - "${BIND_ADDR:-127.0.0.1}:${ORIGIN_FAY_HUMAN_WS_PORT:-10012}:10002"
+      - "${BIND_ADDR:-127.0.0.1}:${ORIGIN_FAY_WEB_WS_PORT:-10013}:10003"
+    healthcheck: *fay-healthcheck
+    depends_on:
+      redis:
+        condition: service_started
+      yueshen-rag:
+        condition: service_started
+
+  # ------------------------------------------------------- 测试件（compose --profile test）
+  # 跑 service 仓库自带的 pytest（12 个文件）。测试代码以 :ro 挂进容器，
+  # 不 COPY 进镜像（.dockerignore 排除），也不写回仓库。
+  # 用的是独立库 care_echo_rehab_test（见 sql/init/01-create-test-database.sql），
+  # 免得测试往业务数据里塞脏行。
+  backend-test:
+    <<: [*host-gateway]
+    profiles: ["test"]
+    build:
+      context: ..
+      dockerfile: containerd/images/service.Dockerfile
+      target: test
+    image: dh-backend-test:local
+    container_name: dh-backend-test
+    restart: "no"
+    environment:
+      TZ: Asia/Shanghai
+      DEBUG: "true"
+      REMINDER_SCHEDULER_ENABLED: "false"
+      API_V1_PREFIX: /api/v1
+      MYSQL_HOST: mysql
+      MYSQL_PORT: "3306"
+      MYSQL_USER: root
+      MYSQL_PASSWORD: ${MYSQL_ROOT_PASSWORD}
+      MYSQL_DB: ${MYSQL_TEST_DB:-care_echo_rehab_test}
+      REDIS_URL: redis://:${REDIS_PASSWORD}@redis:6379/1
+      JWT_SECRET_KEY: ${JWT_SECRET_KEY}
+      JWT_ALGORITHM: ${JWT_ALGORITHM:-HS256}
+      FAY_HTTP_URL: http://adapter:8010
+      FAY_CHAT_PATH: /api/chat
+      JSON_DATA_DIR: ${JSON_DATA_DIR:-/app/reference_data}
+    volumes:
+      # 不再把宿主 ../service/tests 挂进来：镜像里的 tests 已经过
+      # containerd/patches/service/*.patch 修补，挂载会盖掉补丁。
+      - ./seed/service_reference_data:/app/reference_data:ro
+      # 测试库重置脚本（containerd 自己的工具，不进镜像，改了立刻生效）。
+      - ./tools:/tools:ro
+    # 顺序有讲究：重置测试库 → 迁移 → 灌参考语料，这三步任何一步失败都不该跑 pytest
+    # （跑在状态未知的库上，绿了也没意义），所以用 && 串起来；只有 seed_crisis_hotlines
+    # 允许失败后继续（它幂等、且热线数据缺失只影响那一条用例），因此放在 {} 里当弱步骤，
+    # 整组的退出码由 pytest 决定。
+    command:
+      - sh
+      - -c
+      - >
+        python /tools/reset_test_db.py &&
+        python -m alembic upgrade head &&
+        python -m scripts.import_reference_json --category all &&
+        { python -m scripts.seed_crisis_hotlines;
+        python -m pytest -q --color=no -rA; }
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  # 后端活体探针：量的必须是「这个正在应答 HTTP 的进程」。backend-test 那组用
+  # TestClient 在 pytest 自己进程内起 app、连的又是 care_echo_rehab_test，于是
+  # 「业务库有没有跟到 head」「路由少挂了一个 module」「这个镜像起的服务会不会 500」
+  # 它全看不见。这里复用 backend 那份镜像（同一批补丁），只把 probes/ 只读挂进去。
+  # MYSQL_DB 指业务库而不是测试库：这条判据要的就是业务库的真实状态；详情里会印出
+  # 库名和表数，改了一边忘了另一边时肉眼也对得上。
+  backend-probe:
+    <<: [*host-gateway]
+    profiles: ["test"]
+    image: dh-service:local
+    container_name: dh-backend-probe
+    restart: "no"
+    working_dir: /app
+    environment:
+      TZ: Asia/Shanghai
+      DEBUG: ${DEBUG:-false}
+      API_V1_PREFIX: /api/v1
+      BACKEND_URL: http://backend:8000
+      MYSQL_HOST: mysql
+      MYSQL_PORT: "3306"
+      MYSQL_USER: root
+      MYSQL_PASSWORD: ${MYSQL_ROOT_PASSWORD}
+      MYSQL_DB: ${MYSQL_DB:-care_echo_rehab}
+      REDIS_URL: redis://:${REDIS_PASSWORD}@redis:6379/0
+      JWT_SECRET_KEY: ${JWT_SECRET_KEY}
+      JWT_ALGORITHM: ${JWT_ALGORITHM:-HS256}
+      JSON_DATA_DIR: ${JSON_DATA_DIR:-/app/reference_data}
+    volumes:
+      - ./probes:/probe:ro
+      - ./seed/service_reference_data:/app/reference_data:ro
+    command: ["python", "/probe/backend_probe.py"]
+    depends_on:
+      backend:
+        condition: service_healthy
+
+  # Fay 对外契约探针：HTTP 问答 + 10003/10002 WebSocket + edge_tts 合成。
+  # 探针跑在 dh-fay 同款镜像里（websockets 版本、依赖、/app 源码都在），
+  # 脚本本身只读挂载，不属于任何上游仓库。
+  fay-probe:
+    <<: [*host-gateway]
+    profiles: ["test"]
+    image: dh-fay:local
+    container_name: dh-fay-probe
+    restart: "no"
+    working_dir: /app
+    environment:
+      # 探针进程自己也要 import 被测容器那份 api_embedding_service（判仿生记忆的向量
+      # 真伪），不给这三个变量它就退回上游默认 60s×3 次 —— 实测那条判据因此花了
+      # 183.2s 才落回伪向量，既白烧三倍墙钟，量的又不是容器真正在用的预算。
+      <<: *llm-timeouts
+    volumes:
+      - ./probes:/probe:ro
+      # 探针里 check_tts 会 import utils.config_util 走真实 TTS 分支，
+      # 而 load_config() 在找不到本地 system.conf 时会去连已下线的远程配置中心
+      # （1.12.69.110:5500，光超时就要 150s）。把被实测容器同一份 overlay 挂进来。
+      - ./overlay/fay/system.conf:/app/system.conf:ro
+      - ./overlay/fay/config.json:/app/config.json:ro
+    command: ["python", "/probe/fay_probe.py", "--base", "http://fay:5000", "--timeout", "90"]
+    depends_on:
+      fay:
+        condition: service_healthy
+
+  probe-origin-fay:
+    <<: [*host-gateway]
+    profiles: ["test"]
+    image: dh-origin-fay:local
+    container_name: dh-origin-fay-probe
+    restart: "no"
+    working_dir: /app
+    environment:
+      <<: *llm-timeouts
+    volumes:
+      - ./probes:/probe:ro
+      - ./overlay/origin_fay/system.conf:/app/system.conf:ro
+      - ./overlay/origin_fay/config.json:/app/config.json:ro
+    command: ["python", "/probe/fay_probe.py", "--base", "http://origin-fay:5000", "--timeout", "90"]
+    depends_on:
+      origin-fay:
+        condition: service_healthy
+
+  # ------------------------------------------------ 轻模型实例：把问答链路真正跑通一次
+  # fay / origin-fay 用的是 system.conf 里配好的 qwen3.5:9b，这是用户的真实配置，
+  # 不该为了跑测试去改。但这台机器 16GB 显存被其他常驻服务占掉 15.2GB，
+  # ollama /api/ps 实测 size_vram=387029401 / size=6149206178 —— 只有 6% 权重进显存，
+  # 于是规划器一次要 165~240s，问答质量根本没法在测试里判定。
+  # 所以再起一个只在 test profile 下的实例：同一个镜像、同一份 system.conf，
+  # 只靠 containerd/patches/fay/0003-model-engine-env-overridable.patch 放开的
+  # FAY_GPT_MODEL_ENGINE / FAY_BIG_MODEL_ENGINE 换成 qwen2.5:1.5b（986MB，能整权重进显存，
+  # 实测规划器 20.0s 冷 / 0.2s 暖，且守 {"action":"finish"...} 的 JSON 协议）。
+  # 它只多占一份自己的卷，端口不映射到宿主机 —— 探针在 compose 网络上打它。
+  fay-lite:
+    <<: [*host-gateway]
+    profiles: ["test"]
+    image: dh-fay:local
+    container_name: dh-fay-lite
+    restart: "no"
+    command: ["python", "main.py", "start"]
+    environment:
+      TZ: Asia/Shanghai
+      <<: *llm-timeouts
+      FAY_GPT_MODEL_ENGINE: ${FAY_LITE_MODEL_ENGINE:-qwen2.5:1.5b}
+      FAY_BIG_MODEL_ENGINE: ${FAY_LITE_MODEL_ENGINE:-qwen2.5:1.5b}
+    volumes:
+      # config.json 是「可写」的（数字人设定在控制台保存时会回写），不能和 dh-fay
+      # 共用宿主机上同一个文件，所以 lite 有一份自己的副本。system.conf 是只读的，共用。
+      - ./overlay/fay/system.conf:/app/system.conf:ro
+      - ./overlay/fay-lite/config.json:/app/config.json
+      - ./overlay/fay-lite/mcp_servers.json:/app/faymcp/data/mcp_servers.json
+      - fay-lite-memory:/app/memory
+      - fay-lite-cache:/app/cache_data
+      - fay-lite-logs:/app/logs
+      - fay-lite-samples:/app/samples
+    healthcheck: *fay-healthcheck
+    depends_on:
+      redis:
+        condition: service_started
+      yueshen-rag:
+        condition: service_started
+
+  probe-fay-lite:
+    <<: [*host-gateway]
+    profiles: ["test"]
+    image: dh-fay:local
+    container_name: dh-fay-lite-probe
+    restart: "no"
+    working_dir: /app
+    environment:
+      # 探针的 check_llm_host 要直连「被测实例真正在用的那个模型」量下限耗时；
+      # system.conf 里写的是 9b，lite 实例靠补丁换成 1.5b，所以这个开关两边都得给。
+      FAY_GPT_MODEL_ENGINE: ${FAY_LITE_MODEL_ENGINE:-qwen2.5:1.5b}
+      # 与被测实例同一份超时预算，否则 check_embedding 量的不是容器真正会走的那条路
+      <<: *llm-timeouts
+    volumes:
+      - ./probes:/probe:ro
+      - ./overlay/fay/system.conf:/app/system.conf:ro
+      - ./overlay/fay-lite/config.json:/app/config.json:ro
+    # 预算按轻模型给：轻模型答一句是秒级，这里的上限同时是「显存不足时不要死等」的止损。
+    command: ["python", "/probe/fay_probe.py", "--base", "http://fay-lite:5000",
+              "--timeout", "45", "--max-timeout", "180"]
+    depends_on:
+      fay-lite:
+        condition: service_healthy
+
+  # yueshen 知识库那条链（Fay 管理面 → MCP/SSE → chromadb → 宿主 ollama 嵌入）的端到端
+  # 判据。打的是 fork 实例 :5010 —— 三台实例的「连不连得上」已经由各组探针里的
+  # `MCP 现场连接离线服务器 yueshen rag` 判掉了，这里要证的「真灌进去、真查得回来」
+  # 与实例无关，只需要一条真链路，所以只跑一次。
+  # 排在全套最后：它要打宿主 ollama 的嵌入模型，而这台机器显存只够放一个模型。
+  # 理由与判据细节见 probes/yueshen_probe.py 的 docstring 和 README「yueshen 知识库」。
+  probe-yueshen:
+    <<: [*host-gateway]
+    profiles: ["test"]
+    image: dh-fay:local
+    container_name: dh-probe-yueshen
+    restart: "no"
+    working_dir: /app
+    environment:
+      <<: *llm-timeouts
+    volumes:
+      - ./probes:/probe:ro
+      # 预检要读被测实例那份 system.conf 拿嵌入出口地址与模型名（check_embedding_source
+      # 的取法：量的必须是容器真正在用的那个出口，不是探针另猜一个）
+      - ./overlay/fay/system.conf:/app/system.conf:ro
+      - ./overlay/fay/config.json:/app/config.json:ro
+    command: ["python", "/probe/yueshen_probe.py", "--base", "http://fay:5000", "--timeout", "240"]
+    depends_on:
+      fay:
+        condition: service_healthy
+      yueshen-rag:
+        condition: service_started
+
+  # ue/ 是 11GB 的 UE 工程：没有引擎本体、依赖 Marketplace 授权插件，无法在 Linux
+  # 容器里"跑起来"。但它并非与容器无关 —— 这个只读挂载的体检容器给出可复核的事实
+  # （有无 Source 模块、插件平台分布、是否引用 10002 数字人协议），
+  # 把"为什么不能容器化"从印象变成输出。详见 README「UE 仓库的容器侧处置」。
+  ue-audit:
+    profiles: ["test"]
+    image: docker.m.daocloud.io/python:3.12-slim
+    container_name: dh-ue-audit
+    restart: "no"
+    volumes:
+      - ../ue:/ue:ro
+      - ./probes:/probe:ro
+      # 报告落到宿主机，README 引用的数字必须能对着文件复核
+      - ./_audit:/out
+    command: ["python", "/probe/ue_audit.py", "/ue", "--json", "/out/ue-audit.json"]
+
+  # adapter 是本栈唯一新增的一跳（backend ↔ Fay 的协议翻译），它此前只有 `./run.sh smoke`
+  # 一条端到端证据，而那条要过 9b —— 显存被占满时一发 172~301s，跑不跑得动取决于这台
+  # 机器此刻忙不忙。这份契约测试把假 Fay 起在同一容器里、按真实启动方式跑 adapter 子进程，
+  # 11 条判据与 LLM 无关，任何机器上都是秒级：不碰 ollama，也就不碰显存这条瓶颈。
+  adapter-test:
+    profiles: ["test"]
+    image: docker.m.daocloud.io/python:3.12-slim
+    container_name: dh-adapter-test
+    restart: "no"
+    volumes:
+      - ./adapter:/adapter:ro
+      - ./probes:/probe:ro
+    command: ["python", "/probe/adapter_test.py"]
+
+  # 探针自己的收工时机自测。为什么要单开一组：check_ws() 里「这个会话可以收工了」
+  # 的判据本身就会写错 —— run #10 的 audio 帧被误判成 FAIL，而同一份代码在 run #9 是
+  # PASS。这类「因为被测对象的节奏而变红」的判据，如果只靠再跑 20 分钟全套去发现，
+  # 下次改动就只能猜。这里用假 Fay 的 WS 服务端把五种时机各量一次，其中一条把窗口
+  # 退回旧的 6s 并断言"必须收不到"（防止自测退化成摆设）。
+  # 和被测的探针共用 dh-fay:local：它 import 的就是那份 fay_probe，也要跑在上游钉住的
+  # websockets 10.4 上（宿主机那份是 16.x，两版 API 都得过）。不打 LLM、不出网。
+  probe-selftest:
+    profiles: ["test"]
+    image: dh-fay:local
+    container_name: dh-probe-selftest
+    restart: "no"
+    working_dir: /app
+    volumes:
+      - ./probes:/probe:ro
+    command: ["python", "/probe/ws_timing_test.py"]
+
+volumes:
+  mysql-data:
+  redis-data:
+  fay-memory:
+  fay-cache:
+  fay-logs:
+  fay-samples:
+  origin-fay-memory:
+  origin-fay-cache:
+  origin-fay-logs:
+  origin-fay-samples:
+  fay-lite-memory:
+  fay-lite-cache:
+  fay-lite-logs:
+  fay-lite-samples:
+  backend-data:
+  # chromadb 的向量库。不挂 volume 也能跑（数据落在容器可写层），但那样每次重建实例
+  # 都要重新 ingest 一遍语料 —— 而对本机来说一次 ingest 的代价主要是宿主 ollama 换入
+  # 嵌入模型，不是写库。挂上之后这条判据不再依赖「上一轮灌过没有」。
+  yueshen-persist:

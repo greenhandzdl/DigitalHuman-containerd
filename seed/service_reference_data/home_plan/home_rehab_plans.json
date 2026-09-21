@@ -1,0 +1,129 @@
+{
+  "schema_version": "container-seed-1",
+  "note": "容器自测用的最小居家计划模板，结构与上游 home_plan/home_rehab_plans.json 一致；recommended_action_ids 必须能在 action.json 中找到，否则导入报告会列为 missing_action_refs。",
+  "plan_templates": [
+    {
+      "plan_id": "plan_stroke_home_12w",
+      "rehab_type": "stroke",
+      "plan_name_zh": "脑卒中居家康复 12 周方案",
+      "enabled": true,
+      "target_population": ["脑卒中后病情稳定、社区/居家康复期患者"],
+      "discharge_prerequisites_zh": ["生命体征平稳", "可在监护下坐位平衡 30 秒"],
+      "notes_zh": "样例模板，用于容器内链路自测。",
+      "phases": [
+        {
+          "phase_id": "stroke_phase_1",
+          "phase_name_zh": "第 1-2 周 卧床与坐位适应",
+          "weeks": 2,
+          "training_modules": [
+            {
+              "module_id": "stroke_m1",
+              "module_name_zh": "循环与关节活动",
+              "frequency_zh": "每日 3 次",
+              "recommended_action_ids": ["act_stroke_ankle_pump", "act_cardiac_breath_relax"]
+            }
+          ]
+        },
+        {
+          "phase_id": "stroke_phase_2",
+          "phase_name_zh": "第 3-12 周 躯干与手功能",
+          "weeks": 10,
+          "training_modules": [
+            {
+              "module_id": "stroke_m2",
+              "module_name_zh": "躯干控制",
+              "frequency_zh": "每日 2 次",
+              "recommended_action_ids": ["act_stroke_bridge"]
+            },
+            {
+              "module_id": "stroke_m3",
+              "module_name_zh": "手功能",
+              "frequency_zh": "每日 2 次",
+              "recommended_action_ids": ["act_stroke_hand_tapping"]
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "plan_id": "plan_cardiac_home_8w",
+      "rehab_type": "cardiac",
+      "plan_name_zh": "心脏康复居家 8 周方案",
+      "enabled": true,
+      "target_population": ["冠心病术后病情稳定的心脏康复 II 期患者"],
+      "discharge_prerequisites_zh": ["静息血压达标", "无静息胸痛"],
+      "notes_zh": "样例模板，用于容器内链路自测。",
+      "phases": [
+        {
+          "phase_id": "cardiac_phase_1",
+          "phase_name_zh": "第 1-2 周 呼吸与低强度活动",
+          "weeks": 2,
+          "training_modules": [
+            {
+              "module_id": "cardiac_m1",
+              "module_name_zh": "呼吸训练",
+              "frequency_zh": "每日 3 次",
+              "recommended_action_ids": ["act_cardiac_breath_relax"]
+            }
+          ]
+        },
+        {
+          "phase_id": "cardiac_phase_2",
+          "phase_name_zh": "第 3-8 周 有氧与轻抗阻",
+          "weeks": 6,
+          "training_modules": [
+            {
+              "module_id": "cardiac_m2",
+              "module_name_zh": "有氧",
+              "frequency_zh": "每周 5 次",
+              "recommended_action_ids": ["act_cardiac_indoor_walk"]
+            },
+            {
+              "module_id": "cardiac_m3",
+              "module_name_zh": "轻抗阻",
+              "frequency_zh": "每周 2 次",
+              "recommended_action_ids": ["act_cardiac_resistance_band"]
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "plan_id": "plan_elder_fall_prev_12w",
+      "rehab_type": "elder",
+      "plan_name_zh": "长者跌倒预防 12 周方案",
+      "enabled": true,
+      "target_population": ["近 1 年有跌倒史或步态不稳的社区长者"],
+      "discharge_prerequisites_zh": ["无严重体位性低血压"],
+      "notes_zh": "样例模板，用于容器内链路自测。",
+      "phases": [
+        {
+          "phase_id": "elder_phase_1",
+          "phase_name_zh": "第 1-4 周 柔韧与适应",
+          "weeks": 4,
+          "training_modules": [
+            {
+              "module_id": "elder_m1",
+              "module_name_zh": "柔韧",
+              "frequency_zh": "每日 1 次",
+              "recommended_action_ids": ["act_elder_flexibility"]
+            }
+          ]
+        },
+        {
+          "phase_id": "elder_phase_2",
+          "phase_name_zh": "第 5-12 周 平衡训练",
+          "weeks": 8,
+          "training_modules": [
+            {
+              "module_id": "elder_m2",
+              "module_name_zh": "平衡",
+              "frequency_zh": "每日 1 次",
+              "recommended_action_ids": ["act_elder_standing_balance", "act_elder_flexibility"]
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}
