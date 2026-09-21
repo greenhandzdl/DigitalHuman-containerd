@@ -594,7 +594,7 @@ SKIP 记，理由写"dev 路由没挂载"，不去猜。
 
 `./run.sh test` 九组测试件（run #12 时是七组，`backend-probe` 在那之后加的，它自己的
 数字见下表与「后端活体探针」一节；`probe-yueshen` 是这一轮新加的第九组，见
-「yueshen 知识库」一节）。最近一次完整运行是 **run #27**（2026-09-21 02:13 起，
+「yueshen 知识库」一节）。旧基线上最近一次完整运行是 **run #27**（2026-09-21 02:13 起，
 `[test] 全部通过`）。它是第一次把 `probe-yueshen` 组、以及 0002 补丁（服药漏扫时钟冻结）
 和探针的 120s 排空重问一起放进完整一轮 —— 前两件各治一个 run #25 暴露的红，这一轮两者
 都没再红，重试分支本轮也没触发（`重问` 全轮 0 次，见问答表下面那段）。
@@ -602,6 +602,8 @@ SKIP 记，理由写"dev 路由没挂载"，不去猜。
 两个 9b 实例的权重都是 100% 驻留显存（`qwen3.5:9b 5490/5490MB`，直连 fay 侧 6.3s /
 origin 侧 9.4s），lite 侧 `qwen2.5:1.5b 1166/1166MB`、直连 1.1s，于是 `check_llm_host()`
 没有置 `DEGRADED_LLM_HOST` —— 所有耗时类判据这次都是**硬判**：过就是真过，不过就记红。
+下面这一整段连同它的表，都是**换基线之前**那一版 `dh-fay` 的数字（见「2026-09-21 基线变更」）；
+新基线上的第一轮完整九组是 **run #28**，在本节末「run #28」。
 
 | 组 | run #27 实测 |
 |---|---|
@@ -742,6 +744,53 @@ id  role       content                                    len
 4   assistant  作为您的康养伙伴，我会提供持续的陪伴和康…   53
 3   user       你好，用一句话说说你能为康复期的老人做什…   22
 ```
+
+### run #28：换基线之后的第一轮完整九组（2026-09-21 下午）
+
+`fay/` 换成 `chuan918/Fay@f702528`、补丁与依赖整套重落之后跑的。九组全绿、退出码 0，
+但**不是一口气一轮跑完的**：换基线后先单跑 `probe-fay-lite`（13:4x），两组 9b 随后
+14:13~14:58，其余六组 15:02~15:20（其中四组为把每组数字逐条抄全又重跑了一遍，
+`39 passed` 那次就是这次记的）。
+
+| 组 | run #28 实测 |
+|---|---|
+| `backend-test` | **39 passed（3.34s）** |
+| `backend-probe` | **11 PASS / 0 SKIP / 0 FAIL** |
+| `adapter-test` | **11/11** |
+| `probe-selftest` | **[ws-timing] 10/10** |
+| `probe-fay-lite` | **41/43 通过 · 2 SKIP** —— 与 run #27 同一档：问答、MCP（含 yueshen rag 3 工具）、prestart、TTS、远程 PCM 跨 VAD、决策面谈全部正面通过 |
+| `ue-audit` | **2 PASS / 0 SKIP / 0 FAIL** |
+| `fay-probe` | **35/45 通过 · 8 SKIP（LLM 证据降级）+ 2 SKIP（边界）** |
+| `probe-origin-fay` | **38/46 通过 · 6 SKIP（降级）+ 2 SKIP（边界）** |
+| `probe-yueshen` | **6/6** |
+| 收尾一条 | `[test] fay-lite 优雅停止（SIGTERM）退出码 0` |
+
+与 run #27 最要紧的差别是**这一轮 `check_llm_host()` 置了 `DEGRADED_LLM_HOST`**：
+`qwen3.5:9b` 不再 100% 驻留（同机还有别的进程占着显存），直连第一发 fay 侧 73.6s、
+origin 侧 34.5s，都是"要先换入"的量级。于是探针按设计把问答耗时类判据降成 SKIP 而不是
+记红 —— 两组合计 14 条降级 SKIP 全是这个成因，逐条理由印在探针输出里，没有一条是 FAIL。
+能在 9b 上正面过的仍然是那批不依赖首字延迟的：MCP 清单/真调用/SSE 握手、prestart 三档、
+TTS 出网、`:10003`/`:10002` WS 契约、决策面谈三条、`远程 PCM 跨过 VAD`（12s 内 `['聆听中...']`）。
+QA 链的正面证据由 lite 那组给。**这不是换基线换来的回归**：run #27 之所以能全是硬判，
+是因为当时显存刚好腾得下两份 9b。
+
+两组各多出的那 2 条底数（45/46 vs run #27 的 43/44）同理 —— `fay_probe.py` 这轮只改了
+一处路径字符串（`patches/origin_fay/0004` → `patches/fay/0004`），断言集没变，
+是「收帧不足就重连一遍」的重试分支这轮真触发了，日志里能看到
+`probe_..._ws100020_r2` 这样的二次注册判据。run #27 特意记过「`重问` 全轮 0 次」，
+这次反过来证明了那条分支是可达的。
+
+另有两条与本轮 LLM 无关的老 SKIP，两个 9b 实例都是它们：`window capture`（无头容器连不上
+的桌面服务器，「未覆盖能力」记的边界）与 `远程音频的 ASR 认出了文字`（VAD 已过、
+本机没起 FunASR）。容器集成部分没有回归。
+
+`overlay/*/mcp_servers.json` 会被运行期回写这件事，本轮也留下了具体后果：跑完测试
+`git status` 必脏（探针现场 `connect`/`disconnect` 与 Fay 自己写 `connection_time` 都落在这
+三份 bind-mount 的可写文件上），而 `run.sh test` 的「构建输入是否比镜像新」又是按 mtime
+判的，所以下一轮一上来就白重建一次 fay 与 origin-fay —— 镜像 ID 没变（这三份是运行时
+挂载、根本没进镜像），BuildKit 全量命中缓存，所以只是空转。**没有**为此改挂载方式：
+把 `faymcp/data/` 换命名卷要动运行期注册表的落盘位置，收益不值那个风险。提交前
+`git checkout -- overlay/<实例>/mcp_servers.json` 即可，纯时间戳漂移。
 
 ### 「Fay 会调工具」这句话，探针只敢证到中间那一档
 
@@ -1177,7 +1226,9 @@ UE 自己按 BOM 定字符集，读得懂，所以判据必须先认 BOM。实�
   id=4 `yueshen rag` 从这个名单里摘掉了：它有了自己的服务，连不上就是真故障（见上一条）。
   探针现场 `connect` / `disconnect` 只回写挂载进来的那份 `faymcp/data/mcp_servers.json`
   （compose 里挂的是 `overlay/<实例>/`，不是 `fay/`），宿主机上的 `fay/` 仓库不会被改动
-  （`./run.sh audit` 盯的就是这条）。
+  （`./run.sh audit` 盯的就是这条）。代价是**脏的是 containerd 自己**：那三份是 git 跟踪的
+  bind-mount 可写文件，每跑一轮测试 `connection_time` 就变一次，提交前要 `git checkout --`
+  掉，别把运行期漂移混进基线提交（成因与为什么不换挂载方式，见「run #28」末段）。
 - **语音输入的麦克风那一半**：容器无声卡，`record.enabled=false`，`RecorderListener`
   这条路不会被触发。准确地说它停在哪一步：`fay_booter.py:416-417` 无条件起了这个线程，
   但 `RecorderListener.get_stream()` 第一件事是每 0.1s 轮询 `record.enabled`，
