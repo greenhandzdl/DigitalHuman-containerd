@@ -1885,7 +1885,9 @@ sequenceDiagram
 `funasr==1.3.14` `modelscope==1.38.1` `numpy==2.2.6` `torch==2.13.0+cpu`
 `torchaudio==2.11.0+cpu` `websockets==16.1`；三个模型（paraformer-zh / fsmn-vad / ct-punc-c）
 连 `REVISION=v2.0.4` 一起钉。`websockets` 14+ 的 handler 从 `(ws, path)` 变成 `(ws)`，
-所以 `handle(websocket, path=None)` 两头都吃。镜像 1.57 GB（build 阶段把
+所以 `handle(websocket, path=None)` 两头都吃。镜像 **1.57 GiB**
+（`docker image inspect dh-funasr:local --format '{{.Size}}'` → `1687881681`；注意 `docker images`
+那一列是按十进制标的，同一个镜像显示成 `1.69GB` —— 别以为文档与本机对不上）。build 阶段把
 `torch`/`torchaudio` 的 `--index-url` 单独分了一层，改代码不会击穿阿里云那层 pip 缓存）。
 
 ### 就绪判据：那个 ready 文件必须写在 bind **之后**
