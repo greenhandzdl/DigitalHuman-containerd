@@ -1145,8 +1145,10 @@ def check_remote_audio_input(host: str) -> None:
       1. VAD 收到事件（:10002 上出现 Data.Key=log 且 Value 含「聆听中」）—— 这条与
          显存、与 ASR 后端都无关，只要容器化没把 10001 弄坏就必然成立，不过就是 FAIL。
       2. 识别出文字（ASR 把 finalResults 当 log 帧推回来）—— 本栈的 ASR 是
-         `ASR_mode=funasr` + `local_asr_ip=host.docker.internal:10197`，也就是一个
-         需要另外起的 FunASR 服务；它不在线时这条判不了，按 SKIP 记并写明缺什么。
+         `ASR_mode=funasr` + `local_asr_ip=host.docker.internal:10197`。10197 上那是
+         Fay 自己的另一套方言（裸文本回复 + `{"vad_need":…}`），与本栈为 H5 麦克风起的
+         dh-funasr（容器内 :10095，`{"text","is_final"}`）不是同一个协议；那半条链未接
+         是明确划出的边界，所以这一条按 SKIP 记并写明缺什么。
 
     实测（2026-09-20，两个 9b 实例 + 一个 lite 实例）：打上
     patches/fay/0004-remote-audio-*.patch 之后 1 是 PASS、2 是 SKIP；
@@ -1184,9 +1186,9 @@ def check_remote_audio_input(host: str) -> None:
         record(None, "远程音频的 ASR 认出了文字", "VAD 都没过，识别无从谈起")
     else:
         record(None, "远程音频的 ASR 认出了文字",
-               "VAD 已过、识别结果为空：这条链路的 ASR 后端是 ws://host.docker.internal:10197"
-               "（overlay/fay/system.conf 的 ASR_mode=funasr），本机没有起 FunASR 服务，"
-               "与容器化无关")
+               "VAD 已过、识别结果为空：ASR_mode=funasr 指向 ws://host.docker.internal:10197，"
+               "那是 Fay 自己的方言（裸文本 + vad_need）；本栈为 H5 起的 dh-funasr 说的是 "
+               "{\"text\",\"is_final\"}，两者未接是划出的边界（README「未覆盖能力」），与容器化无关")
 
 
 GENAGENTS_PORT = 5001

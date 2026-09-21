@@ -16,9 +16,18 @@ name: digitalhuman
 #     「UE 仓库的容器侧处置」，由 ./run.sh test 里的 ue-audit 容器现场产出。
 # ---------------------------------------------------------------------------
 
+# 两条到宿主机/局域网的名字映射，全栈统一：
+#   host.docker.internal —— 宿主 Ollama（LLM/嵌入）从这里进。
+#   dh-host / ue-host    —— 本栈那台机器的局域网地址、与跑 UE5.1 编辑器的那台 Windows。
+#                            UE 实际在另一台电脑上（实测：它只往 :10002 拨进来，Fay 从不外拨），
+#                            所以这两个名字目前只是给「将来要外拨 UE」的地方留的稳定入口，
+#                            不是任何判据的前提。留 127.0.0.1 为默认值：不配就退回本机，
+#                            不会因为解析不到名字而把整个服务拖崩。
 x-host-gateway: &host-gateway
   extra_hosts:
     - "host.docker.internal:host-gateway"
+    - "dh-host:${DH_LAN_IP:-127.0.0.1}"
+    - "ue-host:${UE_LAN_IP:-127.0.0.1}"
 
 x-restart: &restart
   restart: unless-stopped
@@ -94,7 +103,11 @@ services:
       - mysql-data:/var/lib/mysql
       - ./sql/init:/docker-entrypoint-initdb.d:ro
     ports:
-      - "${BIND_ADDR:-127.0.0.1}:${MYSQL_HOST_PORT:-13306}:3306"
+      # 这一条**故意不跟 BIND_ADDR**（其它应用面端口都跟）。dev 档位会把 BIND_ADDR
+      # 导成局域网地址，而 compose 的 ports 是按 host_ip+target 合并的 —— 覆盖不掉，
+      # 只会在 LAN 那条旁边再加一条。写死才是"只靠口令的数据库不进局域网"这条边界的
+      # 落地处：后端与 Fay 都在 compose 网络上按容器名连它，没有任何外部消费者。
+      - "127.0.0.1:${MYSQL_HOST_PORT:-13306}:3306"
     healthcheck:
       test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -uroot -p\"$$MYSQL_ROOT_PASSWORD\" --silent"]
       interval: 5s
@@ -110,7 +123,9 @@ services:
     volumes:
       - redis-data:/data
     ports:
-      - "${BIND_ADDR:-127.0.0.1}:${REDIS_HOST_PORT:-16379}:6379"
+      # 同 mysql：不跟 BIND_ADDR，恒 loopback。Redis 这边连"库"的概念都没有，
+      # 一个 requirepass 就是全部，放到局域网等于把可写 KV 交给同网段的每台机器。
+      - "127.0.0.1:${REDIS_HOST_PORT:-16379}:6379"
     healthcheck:
       test: ["CMD-SHELL", "redis-cli -a \"$$REDIS_PASSWORD\" ping | grep -q PONG"]
       interval: 5s
@@ -146,10 +161,12 @@ services:
       YUESHEN_EMBED_TIMEOUT: ${YUESHEN_EMBED_TIMEOUT:-180}
     volumes:
       - yueshen-persist:/app/persist
-      # 项目方给的科普语料（14 份 .docx 切片后的 14 个文件，进 git）。镜像里那份
+      # 项目方给的科普语料（14 份 .docx 切片后的 14 个文件）。镜像里那份
       # containerd/tools/make_yueshen_corpus.py 生成的只有 3 段，够验链路、不够当知识。
       # 挂成 /app/corpus 的子目录：`ingest_yueshen` 是整目录扫的（server.py:192 用
       # os.walk），所以这份和合成语料一起入库、一起被探针那组的 reset 重建，不会各活各的。
+      # 切片产物本身不进 git（数据属于伙伴方、两个仓库都是 PUBLIC），新克隆先
+      # ./run.sh kbslice 把它建出来，否则这里挂到的是空目录、`./run.sh kb` 会报 chunks=1。
       # 重新切片：./run.sh kbslice <zip|目录>，见 tools/slice_kb_corpus.py 的 docstring。
       - ./seed/kb_corpus:/app/corpus/kb:ro
     healthcheck:
@@ -172,6 +189,10 @@ services:
     command: ["python", "main.py", "start"]
     environment:
       TZ: Asia/Shanghai
+      # Fay 回给数字人的音频文件地址（UE 拿它去 :5000 取 wav）。不设 = 上游原行为
+      # （读 system.conf，为空则自动探测本机 IP）。UE 在另一台电脑上时必须设成那台机器
+      # 够得着的地址，见 patches/fay/0007 与 README「跨机流量」。
+      FAY_URL: ${FAY_URL:-}
       <<: *llm-timeouts
     volumes:
       - ./overlay/fay/system.conf:/app/system.conf:ro
@@ -288,6 +309,104 @@ services:
         condition: service_healthy
       adapter:
         condition: service_started
+
+  # ------------------------------------------------------------- CareEcho H5 前端
+  # 伙伴方的仓库（gitee xie-zha-zha/carecho_final，submodule 在 ../frontend），只读构建：
+  # 镜像里是他们 `npm run build` 的原样产物 + 我们这个同源外壳（containerd/frontend/
+  # carecho_web.py）。外壳做三件事：发静态文件、把它唯一真会调的 `POST /api/chat/send`
+  # 翻译成后端那三步（dev-login → 建会话 → 发消息）、以及把麦克风那条
+  # `ws:///funasr-ws` 同源转发进 funasr（Vite 的 dev proxy 在生产产物里不存在）。
+  # 前端不登录、不带 token，身份只能由这一侧按 cookie 发；细节见那份文件的 docstring。
+  #
+  # 端口默认 5173 是故意的：那是他们 README 与 xmov.js 里唯一写死的开发地址，宿主端口
+  # 对齐之后「http://127.0.0.1:5173 打开」这句话对容器同样成立。
+  frontend:
+    <<: *restart
+    build:
+      context: ..
+      dockerfile: containerd/images/frontend.Dockerfile
+    image: dh-frontend:local
+    container_name: dh-frontend
+    environment:
+      TZ: Asia/Shanghai
+      CARECHO_BACKEND: http://backend:8000
+      # 这一侧的等待上限。浏览器那端 axios 的 30s 是前端写死的常量（src/api/request.js:6），
+      # 我们改不了也不该改：本机 9b 冷启动一句话 172~301s，前端会先于后端放弃 —— 那是它的
+      # 已知边界（README「前端」一节），不是这里偷偷调小的理由。
+      CARECHO_UPSTREAM_TIMEOUT: ${CARECHO_UPSTREAM_TIMEOUT:-90}
+      # 同源 WebSocket 转发的常量表：`路径=上游` 逗号分隔，精确匹配、上游取自这张表、
+      # query 一律丢掉 —— 客户端给的 path 永远不进 getaddrinfo，所以这不是开放代理。
+      # 麦克风那条（/funasr-ws → funasr:10095）必须在这里，因为我们发的是 `npm run build`
+      # 的产物，伙伴方 vite.config.js 里那条 dev proxy 在生产构建里根本不存在。
+      # /fay-ws 故意留在表外：前端那份 fay.js 里的 FayClient 是一个没人调用的死导入。
+      CARECHO_WS_RELAY: ${CARECHO_WS_RELAY:-/funasr-ws=funasr:10095/}
+      CARECHO_WS_RELAY_IDLE: ${CARECHO_WS_RELAY_IDLE:-180}
+    ports:
+      - "${BIND_ADDR:-127.0.0.1}:${FRONTEND_PORT:-5173}:8080"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8080/api/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+    depends_on:
+      backend:
+        condition: service_healthy
+      # service_started 而不是 service_healthy：funasr 首次启动要下 1.3GB 模型，
+      # 挂在这个条件上会把整个前端连带等十几分钟。转发是逐连接拨号的，上游没起来
+      # 只会让「按下麦克风」那一刻失败，不该让页面本身打不开。
+      funasr:
+        condition: service_started
+
+  # ------------------------------------------------------------ FunASR 语音识别
+  # H5 麦克风那一跳的真后端：浏览器 ScriptProcessor 把无头 PCM（int16/16k/单声道）
+  # 一帧帧推到页面同源的 ws://<host>/funasr-ws，外壳按上面那张常量表转发进来，
+  # 回去的是 {"text","is_final"}。协议逐字段照前端来，伙伴方代码一个字不改。
+  #
+  # 这是本栈第二个不走宿主 Ollama 的 AI 依赖（第一个是魔珐 Xmov 的云 TTS，在我们代码之外）：
+  # ollama 的 /api/chat 只收 text + images，没有音频输入口，模型清单里也没有 paraformer。
+  # 值得记下来的是它与 Fay 自己那条 ASR 链不是一回事：overlay/fay/system.conf 里
+  # local_asr_ip/local_asr_port 指的是 host.docker.internal:10197，那套方言是
+  # 「裸文本回复 + {"vad_need":…}」，与前端要的 {"text","is_final"} 不兼容
+  # —— 所以本服务只服务 H5，Fay 侧保持原样（见 README「未覆盖能力」）。
+  #
+  # 基础文件里**不发布任何宿主端口**：生产这条链只经 5173 同源转发进出，多开一个 10095
+  # 只是多一个无鉴权入口。dev 档位才直发（见 docker-compose.dev.yml）。
+  funasr:
+    <<: [*host-gateway, *restart]
+    build:
+      context: ..
+      dockerfile: containerd/images/funasr.Dockerfile
+    image: dh-funasr:local
+    container_name: dh-funasr
+    environment:
+      TZ: Asia/Shanghai
+      # 三个模型名与版本一起钉死（paraformer-large 990MB + fsmn-vad + ct-punc 292MB ≈ 1.3GB）。
+      # 不钉 revision 的话，modelscope 每次启动都做一次「有没有新版」的网络探测，
+      # 而那次探测被一个裸 except 包着 —— 断网时表现不是报错，是慢。
+      FUNASR_MODEL: ${FUNASR_MODEL:-paraformer-zh}
+      FUNASR_VAD_MODEL: ${FUNASR_VAD_MODEL:-fsmn-vad}
+      FUNASR_PUNC_MODEL: ${FUNASR_PUNC_MODEL:-ct-punc-c}
+      FUNASR_REVISION: ${FUNASR_REVISION:-v2.0.4}
+      # 单会话上限与并发推理数：这两个是内存与「按着麦克风不放」的边界，值本身在
+      # asr/server.py 里读，这里透出来是为了不改镜像就能调。
+      FUNASR_MAX_SECONDS: ${FUNASR_MAX_SECONDS:-60}
+      FUNASR_MAX_INFLIGHT: ${FUNASR_MAX_INFLIGHT:-2}
+      # torch 不设这个就会吃满 16 核，而本机 CPU 还要给 ollama 那些不驻留显存的权重用。
+      FUNASR_TORCH_THREADS: ${FUNASR_TORCH_THREADS:-4}
+    volumes:
+      # 挂在 MODELSCOPE_CACHE 上（镜像里 = /models）。这一卷决定「首次要不要下 1.3GB」：
+      # ./run.sh asr-seed 可以从本机伙伴方已有的那个缓存卷拷过来，新克隆则正常下载。
+      - funasr-cache:/models
+    healthcheck:
+      # 判据是 server.py 在 **bind 之后**写的那个文件：既不是"进程起了"（模型还在下，
+      # 端口没人听），也不是"端口通了"（模型还没加载完，第一问必然超时）。
+      # asr-test / asr-probe 都拿这条当"可以打了"的凭据，所以顺序写反过一次就修在源头。
+      test: ["CMD", "python", "-c", "import os,sys;sys.exit(0 if os.path.exists('/tmp/asr.ready') else 1)"]
+      interval: 10s
+      timeout: 5s
+      retries: 60
+      start_period: 300s
 
   # ------------------------------------------------------- 测试件（compose --profile test）
   # 跑 service 仓库自带的 pytest（12 个文件）。测试代码以 :ro 挂进容器，
@@ -567,6 +686,92 @@ services:
       - ./probes:/probe:ro
     command: ["python", "/probe/ws_timing_test.py"]
 
+  # CareEcho 外壳的契约测试。跑在 dh-frontend:local 里，被测的就是镜像里那份
+  # /app/carecho_web.py 和那份 npm run build 的产物，假后端起在同一容器（脚本内线程），
+  # 所以这组不碰 backend、不碰 ollama —— 17 条判据在任何机器上都是秒级。
+  # 最后一格是负面自检：把外壳的 Set-Cookie 改坏再跑，判据必须撑不住；撑得住就说明
+  # 这套判据是摆设（probes/adapter_test.py 的同一条理由）。
+  frontend-test:
+    profiles: ["test"]
+    image: dh-frontend:local
+    container_name: dh-frontend-test
+    restart: "no"
+    entrypoint: ["python", "/probe/frontend_test.py"]
+    volumes:
+      - ./probes:/probe:ro
+
+  # 外壳那段 stdlib WS 转发的契约测试。假上游与真客户端都起在同一容器里（脚本内线程），
+  # 所以这组不碰 funasr、不碰网络：判的是「转发是不是中性的」—— 掩码帧原样过、首批 PCM
+  # 不被 rfile 吞、表外路径不拨号、一侧关闭另一侧收尾。最后一格是负面自检，
+  # 它必须能把上面某条判据弄红，否则那几条码是摆设（理由同 frontend-test 第 17 格）。
+  ws-relay-test:
+    profiles: ["test"]
+    image: dh-frontend:local
+    container_name: dh-ws-relay-test
+    restart: "no"
+    entrypoint: ["python", "/probe/ws_relay_test.py"]
+    volumes:
+      - ./probes:/probe:ro
+
+  # 真栈冒烟：拿前端实际会发的那个请求形状，从外壳打进去穿完整条链
+  # （外壳 → backend → adapter → Fay → 宿主 ollama）。一条判据的开销全在最后那一问，
+  # 本机 9b 冷启动实测 172~301s，所以它排在全套最后，理由与 probe-yueshen 相同。
+  frontend-probe:
+    <<: [*host-gateway]
+    profiles: ["test"]
+    image: docker.m.daocloud.io/python:3.12-slim
+    container_name: dh-frontend-probe
+    restart: "no"
+    volumes:
+      - ./probes:/probe:ro
+    command: ["python", "/probe/frontend_probe.py", "--base", "http://frontend:8080", "--timeout", "600"]
+    depends_on:
+      frontend:
+        condition: service_healthy
+      backend:
+        condition: service_healthy
+
+  # ASR 协议判据：脚本自己用 ASR_FAKE_MODEL=1 起一份 server.py 子进程（不加载 torch），
+  # 所以这组在任何机器上都是秒级、且不需要真服务在跑。它判的四件事 —— 32000B 对齐切块、
+  # 累计前缀、final 有且只有一个、并发两路不串线 —— 全部与模型无关，用假模型判最干净。
+  asr-test:
+    profiles: ["test"]
+    image: dh-funasr:local
+    container_name: dh-asr-test
+    restart: "no"
+    working_dir: /app
+    entrypoint: ["python", "/probe/asr_test.py"]
+    volumes:
+      - ./probes:/probe:ro
+
+  # 真模型 + 真语音那条（无麦）：把真人语音按浏览器节奏推给 dh-funasr，判它出不出字。
+  # 跑在 dh-fay:local 而不是 dh-funasr:local —— 「已知原文」那条判据要现场合成，而 ASR
+  # 镜像里故意不带 edge_tts（细节与判据见 probes/asr_probe.py 头部）。
+  # 与 fay-probe 同样挂两份 overlay 配置：load_config() 找不到本地 system.conf 时会去连
+  # 已下线的远程配置中心，光超时就要 150s。
+  # 排在全套最后：它要 CPU 推理，而 torch 的线程数被压在 FUNASR_TORCH_THREADS=4，
+  # 前面几组抢完 CPU 才轮到它，慢与降级都不等于坏。
+  asr-probe:
+    <<: [*host-gateway]
+    profiles: ["test"]
+    image: dh-fay:local
+    container_name: dh-asr-probe
+    restart: "no"
+    working_dir: /app
+    volumes:
+      - ./probes:/probe:ro
+      - ./overlay/fay/system.conf:/app/system.conf:ro
+      - ./overlay/fay/config.json:/app/config.json:ro
+      # 上游仓库自带的那段真人语音（15.26s / 16kHz 单声道，ASR 的原生格式）。
+      # 只读挂，不写上游一个字。**故意不挂运行期的 fay-samples 卷**：fay/main.py:181
+      # 的 __clear_samples() 每次启动都把 ./samples 清空，用它当输入 = 每轮必空。
+      - ../fay/samples:/samples:ro
+    command: ["python", "/probe/asr_probe.py", "--host", "funasr", "--port", "10095",
+              "--samples", "/samples", "--timeout", "180"]
+    depends_on:
+      funasr:
+        condition: service_healthy
+
 volumes:
   mysql-data:
   redis-data:
@@ -583,3 +788,7 @@ volumes:
   # 都要重新 ingest 一遍语料 —— 而对本机来说一次 ingest 的代价主要是宿主 ollama 换入
   # 嵌入模型，不是写库。挂上之后这条判据不再依赖「上一轮灌过没有」。
   yueshen-persist:
+  # FunASR 的模型缓存（约 1.3GB：paraformer-large 990MB + ct-punc 292MB + fsmn-vad）。
+  # 这卷里全是公网可下的权重、不含任何数据，所以删掉重下是安全的；
+  # 本机想免重下就 ./run.sh asr-seed 从伙伴方那个同名缓存卷拷一份过来。
+  funasr-cache:

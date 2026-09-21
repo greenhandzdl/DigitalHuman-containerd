@@ -1,0 +1,16 @@
+--- a/utils/config_util.py	2026-09-21 20:33:34.480834770 +0800
++++ b/utils/config_util.py	2026-09-21 20:33:34.480915254 +0800
+@@ -561,6 +561,13 @@
+ 
+     start_mode = system_config.get('key', 'start_mode', fallback=None)
+     fay_url = system_config.get('key', 'fay_url', fallback=None)
++
++    # containerd 补丁：fay_url 允许用环境变量覆盖，不设时与上游一字不差。
++    # 这一项是给 UE 在另一台电脑上用的：Fay 回给数字人的音频文件地址就取自这里，
++    # 下游 :10002 的 UE 按这个 URL 到 :5000 去取 wav。system.conf 里钉死
++    # http://127.0.0.1:5000 时换台机器就取不到音频，而下面那段「自动探测本机 IP」
++    # 在容器里探到的是容器自己的地址，同样不对。见 README「跨机流量」。
++    fay_url = os.environ.get('FAY_URL') or fay_url
+     # 如果fay_url为空或None，则动态获取本机IP地址
+     if not fay_url:
+         from utils.util import get_local_ip

@@ -28,7 +28,9 @@
 预检（量嵌入出口）不是为了多一条判据，是为了把「这台机器的显存不够」和
 「这条链路坏了」分开：三台 Fay 实例的问答判据已经跑完，这里若因为 ollama 换入
 超时判红，红的是环境不是容器。判据自己不给后面的步骤找借口 —— 只有真量到
-嵌入出口不通，才把 2~5 步记成 SKIP（第 1 步不碰模型，照判），否则一律硬判。
+嵌入出口不通，才把它记成「按环境降级」的 SKIP 并就地收工（第 1 步不碰模型，照判），
+否则一律硬判。收工一定要留一行 tally：实测 2026-09-21 run #32，宿主显存被栈外进程占走、
+9b 落到 CPU，这一组打了两条就退出，退出码 0 —— 看日志的人只会以为它跑完了六条。
 
 用法：python yueshen_probe.py [--base http://fay:5000] [--timeout 240]
 退出码 = 失败的检查项数（0 表示全绿）。
@@ -151,6 +153,9 @@ def main() -> int:
     kb = check_overlay(host, args.timeout)
 
     if not check_embedding_source(args.timeout):
+        print(f"\n[probe] {len(fp.RESULTS)} 条已判（其中按环境降级 1 条），"
+              "后面 4 条（工具清单/入库/检索/stats）没有嵌入出口就测不了，本组就地收工",
+              flush=True)
         return fail_count()
 
     if kb is None:

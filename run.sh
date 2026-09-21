@@ -1,25 +1,66 @@
 #!/usr/bin/env bash
 # DigitalHuman 容器集成入口。所有命令都在 containerd/ 下执行（脚本自动切换）。
-#   ./run.sh up        生成 .env（若缺）→ 构建 → 起全栈
+#   ./run.sh up        生成 .env（若缺）→ 构建 → 起全栈（档位看 .env 的 DH_ENV，缺省 prod）
+#   ./run.sh dev       同一套东西，但以 DH_ENV=dev 起：应用面端口全开、绑定局域网 IP，
+#                      方便从另一台机器（手机 / 跑 UE 的那台 Windows）连过来测
 #   ./run.sh test      跑全套功能测试：service pytest + 后端活体探针 + adapter 契约测试
-#                      + 探针时机自测 + 两个 Fay 实例的契约探针 + ue 体检
+#                      + 探针时机自测 + 外壳与 WS 转发 + 两个 Fay 实例的契约探针
+#                      + ue 体检 + 前端两组 + ASR 两组
 #   ./run.sh test <组>  只跑指定测试件（backend-test / backend-probe / adapter-test /
-#                      probe-selftest / probe-fay-lite / fay-probe / ue-audit /
-#                      probe-yueshen），改探针时不用等全套十几分钟
+#                      probe-selftest / frontend-test / ws-relay-test / asr-test /
+#                      probe-fay-lite / ue-audit / fay-probe / probe-yueshen /
+#                      frontend-probe / asr-probe），改探针时不用等全套十几分钟
 #   ./run.sh build     只构建镜像
 #   ./run.sh smoke     打通链路冒烟测试：后端 → adapter → Fay → Ollama → 回库
-#   ./run.sh audit     核账：fay/service/ue 三个仓库必须零改动、与上游不分叉，并列出 containerd 侧产物
+#   ./run.sh asr-seed  本机若已有伙伴方那个 FunASR 模型缓存卷，直接拷过来（省 1.3GB 下载）
+#   ./run.sh audit     核账：fay/service/ue/frontend 四个仓库必须零改动、与上游不分叉，并列出 containerd 侧产物
 #   ./run.sh upstream  跟上上游：fetch xszyou/Fay，报 fork 落后/领先几条，
 #                      并把 containerd/patches/fay/*.patch 逐个 dry-run 预检一遍
 #   ./run.sh kbslice [包] 把项目方语料包（默认 ../uploads/老年康养通用科普.zip）切成
 #                      seed/kb_corpus/ 里的语料文件
 #   ./run.sh kb        科普语料入库 + 拿 12 条真实问法抽测检索（切片变了或换库后跑一次）
-#   ./run.sh logs [s]  看日志（s 可为 fay/backend/adapter/mysql/redis）
+#   ./run.sh logs [s]  看日志（s 可为 fay/backend/adapter/frontend/funasr/mysql/redis）
 #   ./run.sh ps|down|reset
 set -euo pipefail
 cd "$(dirname "$(readlink -f "$0")")"
 
+# $COMPOSE 是全局的字符串，所有子命令都用它。它带哪几个 compose 文件由 DH_ENV 决定，
+# 见 use_profile —— 所以下面这些命令分支必须在 ensure_env 之后调一次 use_profile。
 COMPOSE="docker compose --env-file .env -f docker-compose.yml"
+
+envval() { # envval KEY —— 命令行环境优先，其次 .env；都没有就空
+  local v=${!1:-}
+  [ -n "$v" ] && { printf '%s' "$v"; return; }
+  [ -f .env ] || return 0
+  awk -F= -v k="$1" 'index($0, k "=") == 1 {sub(/^[^=]*=/, ""); gsub(/\r/, ""); print; exit}' .env
+}
+
+detect_lan_ip() { # 本机在局域网里的那个地址（默认路由的源地址），拿不到就空
+  ip route get 1.1.1.1 2>/dev/null |
+    awk '{for (i = 1; i <= NF; i++) if ($i == "src") {print $(i + 1); exit}}'
+}
+
+use_profile() {
+  # 档位只改两件事：用不用 docker-compose.dev.yml，以及 dev 下 BIND_ADDR 落到哪里。
+  # 缺省 prod —— 「严谨关闭映射」是默认姿态，放开端口得是显式决定。
+  DH_ENV=${DH_ENV:-$(envval DH_ENV)}
+  DH_ENV=${DH_ENV:-prod}
+  case "$DH_ENV" in
+    prod) COMPOSE="docker compose --env-file .env -f docker-compose.yml" ;;
+    dev)  COMPOSE="docker compose --env-file .env -f docker-compose.yml -f docker-compose.dev.yml" ;;
+    *) echo "[run] DH_ENV 只认 prod|dev，当前是 '$DH_ENV'" >&2; exit 2 ;;
+  esac
+  local bind=${BIND_ADDR:-$(envval BIND_ADDR)}
+  if [ "$DH_ENV" = prod ] && [ -n "$bind" ] \
+     && [ "$bind" != "127.0.0.1" ] && [ "$bind" != "localhost" ]; then
+    # prod 的整套端口都靠 ${BIND_ADDR:-127.0.0.1} 收在 loopback 上；把它改成 0.0.0.0
+    # 或某个局域网地址，等于把 Fay 的管理台和无鉴权的 OpenAI 兼容 façade 一起放出去。
+    # 这一步不做「提醒后继续」而直接拒：这类泄漏的常见成因就是有人临时改过一次 .env。
+    echo "[run] DH_ENV=prod 不接受 BIND_ADDR=$bind —— 那会把管理台与无鉴权接口发布到外部。" >&2
+    echo "      要给别的机器连就用 ./run.sh dev（它绑到探测出的局域网 IP，不是 0.0.0.0）。" >&2
+    exit 1
+  fi
+}
 
 ensure_env() {
   if [ -f .env ]; then return; fi
@@ -27,14 +68,28 @@ ensure_env() {
   python3 tools/gen_keys.py
 }
 
+_COMPOSE_CONFIG=""
+compose_config_once() { # 渲染一次 compose 文件给下面的探测复用（每次 config 都要半秒左右）
+  [ -n "$_COMPOSE_CONFIG" ] || _COMPOSE_CONFIG=$($COMPOSE config 2>/dev/null || true)
+  printf '%s\n' "$_COMPOSE_CONFIG"
+}
+
+image_tag_of() { # 服务在 compose 文件里配的那个 image:，不是「容器此刻在跑哪个镜像」
+  compose_config_once | awk -v want="$1" '
+    $0 == "  " want":" {insvc = 1; next}
+    /^  [A-Za-z0-9_-]+:$/ {insvc = 0}
+    insvc && $0 ~ /^    image: / {print $2; exit}'
+}
+
 image_id_of() { # 服务当前 tag 指向的镜像 ID；没建过就返回空
-  # 不能用 `compose images -q`：那张表第一列是 CONTAINER，服务有在跑的容器时它报的是
-  # 「容器用的那个镜像」。重建之后 tag 早挪走了、容器还没换，它就还在报旧 ID —— run #29
-  # 因此把一次真实的变更（2738eb20c5bc → 0db394dea218）印成了「重建后镜像 ID 没变」。
-  # 所以这里只借 compose 拿 REPOSITORY:TAG（那两列来自 compose 文件的 image: 字段），
-  # ID 交给 docker image inspect 按 tag 现查。探测性命令一律吞错，脚本跑在 set -e 下。
+  # 不能用 `compose images`：它列的是「已创建容器在用的镜像」。重建之后 tag 挪到了新镜像，
+  # 而旧容器还没换，那一行就成了 <none>:<none> —— 探测结果于是取决于「这台机器上有没有一个
+  # 还没重启的旧容器」。run #32 里 frontend 每轮被报成「本地没有镜像」（白建一次），
+  # funasr 重建后 ID 印成空，两个都是这么来的。
+  # run #29 的教训是反方向的同一件事：拿容器在跑的镜像 ID 比，会把一次真变更印成「没变」。
+  # ID 一律按 tag 现查（tag 从 compose 文件的 image: 字段拿），两头就都只取决于镜像本身。
   local tag
-  tag=$($COMPOSE images "$1" 2>/dev/null | awk 'NR>1 && $2 != "" {print $2":"$3; exit}' || true)
+  tag=$(image_tag_of "$1")
   [ -n "$tag" ] || return 0
   docker image inspect --format '{{.Id}}' "$tag" 2>/dev/null | sed 's/^sha256://' || true
 }
@@ -46,6 +101,42 @@ wait_http() { # wait_http <url> <deadline_sec> <name>
     sleep 2
   done
   echo "[run] 就绪：$name"
+}
+
+probe_host() { # 探针该打哪个地址：以「栈现在真把端口发布在哪」为准，而不是照配置猜档位。
+  # dev 档位绑的是局域网 IP，这时 127.0.0.1 上根本没人听 —— 本轮 ./run.sh dev 的
+  # 「backend 未就绪」就是这么红的（compose 那边报的却是 Healthy）。容器没起或没发布
+  # 端口时退回 loopback，那正是 prod 档位的实际地址。
+  local ip
+  for c in dh-backend dh-frontend; do
+    ip=$(docker inspect -f '{{range $k, $v := .NetworkSettings.Ports}}{{if $v}}{{(index $v 0).HostIp}}{{println}}{{end}}{{end}}' \
+          "$c" 2>/dev/null | head -1)
+    [ -n "$ip" ] && break
+  done
+  case "$ip" in
+    ""|0.0.0.0|::|\[::\]) printf '127.0.0.1' ;;
+    *:*) printf '[%s]' "$ip" ;;          # IPv6 不加方括号进不了 URL
+    *) printf '%s' "$ip" ;;
+  esac
+}
+
+wait_fay_agent() { # wait_fay_agent <cid> <deadline_sec> —— 等 Fay 的「代理实例」真建好，而不是等 :5000 应答。
+  # 这两件事差着一整个启动过程：flask 先起来就能答 /api/get-system-status，而 main.py 还要
+  # 预热 embedding、才 创建代理实例。中间那段窗口里 /api/send 会 0.01s 抛 500 —— 实测
+  # 2026-09-21 22:18 那次 restart 后 :5000 立刻可问，紧接着那一问就 502；到第 10s 才接得住。
+  # 判据取 fay_booter.py:478（start() 最后一行那句「服务启动完成!」）。上游若改了这句文案，
+  # 这里会红并点名，不会退化成"默默等满 deadline"。--since 用容器本次启动时刻，
+  # 免得把上一次生命周期的同一句读成"已经好了"。
+  local cid=$1 deadline=$((SECONDS + $2)) started t0=$SECONDS
+  started=$(docker inspect -f '{{.State.StartedAt}}' "$cid" 2>/dev/null) || return 1
+  until docker logs --since "$started" "$cid" 2>&1 | grep -q "服务启动完成!"; do
+    if (( SECONDS > deadline )); then
+      echo "[run] 超时：$cid 本次启动没打出「服务启动完成!」（容器没起来 / 上游改了这句文案）" >&2
+      return 1
+    fi
+    sleep 2
+  done
+  echo "[run] 就绪：fay 代理实例（等待 $((SECONDS - t0))s）"
 }
 
 llm_residency() { # 宿主机 Ollama 上每个模型的显存驻留比例（问答耗时的唯一解释变量）
@@ -79,7 +170,7 @@ for m in models:
 smoke() {
   set -u
   source .env
-  local base="http://127.0.0.1:${BACKEND_PORT:-8000}"
+  local base="http://$(probe_host):${BACKEND_PORT:-8000}"
   # 先把 LLM 宿主的真实状态打出来：这条链路的耗时几乎全在宿主机 Ollama 上，
   # 权重有没有驻留显存决定这一发是 3 秒还是 300 秒。少了这句，第 5 步慢下来
   # 会被读成「后端或 Fay 坏了」——本机实测 15.2GB 显存被别的常驻服务占走，
@@ -89,7 +180,7 @@ smoke() {
   echo "[smoke] 1/6 后端健康检查"
   curl -fsS "$base/api/v1/health" && echo
   echo "[smoke] 2/6 Fay Web API（经 adapter 的上游）"
-  wait_http "http://127.0.0.1:${ADAPTER_PORT:-8010}/healthz" 60 "adapter"
+  wait_http "http://$(probe_host):${ADAPTER_PORT:-8010}/healthz" 60 "adapter"
   echo "[smoke] 3/6 dev-login 取 token"
   # DevLoginRequest 只有 openid 字段；不传则服务端自动生成
   local token
@@ -150,11 +241,10 @@ raise SystemExit("restart 之后读不到那一行：/app/memory 没有真正持
 '
   printf '%s' "$persist_py" | docker exec -i "$cid" python - write "$marker" \
     || { echo "[smoke] 持久化：写入侧失败" >&2; return 1; }
-  echo "[smoke]     restart fay（宿主被压满时 :8765 可能要两分钟才回来，这里只等 :5000）"
+  echo "[smoke]     restart fay（宿主被压满时 :8765 可能要两分钟才回来）"
   $COMPOSE restart fay >/dev/null \
     || { echo "[smoke] restart fay 失败" >&2; return 1; }
-  wait_http "http://127.0.0.1:${FAY_HTTP_PORT:-5000}/api/get-system-status" 240 "fay 重启后" \
-    || return 1
+  wait_fay_agent "$cid" 240 || return 1
   printf '%s' "$persist_py" | docker exec -i "$cid" python - verify "$marker" \
     || { echo "[smoke] 持久化：重启后读不回来，卷没挂对" >&2; return 1; }
 
@@ -186,22 +276,55 @@ sys.exit(0 if d.get("fay_forwarded") and (am.get("content") or "").strip() else 
 }
 
 case "${1:-up}" in
-  up)
+  up|dev)
+    [ "${1:-up}" = dev ] && DH_ENV=dev   # 子命令就是档位的显式写法，不必去改 .env
     ensure_env
+    if [ "${DH_ENV:-}" = dev ]; then
+      # dev 的 BIND_ADDR 取探测出的局域网地址，而不是 0.0.0.0：绑 0.0.0.0 会把
+      # 端口同时挂到所有网卡（含公网口、docker0 之外的桥），而这里要的只是"局域网能连"。
+      : "${DH_LAN_IP:=$(detect_lan_ip)}"
+      : "${BIND_ADDR:=$DH_LAN_IP}"
+      export DH_LAN_IP BIND_ADDR
+    fi
+    use_profile
+    echo "[run] 档位 DH_ENV=$DH_ENV，BIND_ADDR=${BIND_ADDR:-（compose 默认）}"
     $COMPOSE build
     $COMPOSE up -d
     shift 2>/dev/null || true
-    source .env
-    wait_http "http://127.0.0.1:${BACKEND_PORT:-8000}/api/v1/health" 180 "backend"
-    wait_http "http://127.0.0.1:${ADAPTER_PORT:-8010}/healthz" 180 "adapter"
+    # 不 source .env：那会把上面为 dev 导出的 DH_ENV / BIND_ADDR 按文件里的值盖回去
+    # （首次 up 之后 .env 里就是 DH_ENV=prod），档位于是只影响到 compose 文件的选择、
+    # 却不影响真正绑地址的那一步。逐个取端口时 envval 认「命令行优先」，两边都对。
+    for k in FRONTEND_PORT BACKEND_PORT ADAPTER_PORT FAY_HTTP_PORT FAY_HUMAN_WS_PORT; do
+      v=$(envval "$k"); [ -n "$v" ] && export "$k=$v"
+    done
+    wait_http "http://$(probe_host):${BACKEND_PORT:-8000}/api/v1/health" 180 "backend"
+    wait_http "http://$(probe_host):${ADAPTER_PORT:-8010}/healthz" 180 "adapter"
+    wait_http "http://$(probe_host):${FRONTEND_PORT:-5173}/api/health" 120 "frontend"
+    # FunASR 不等：首次起要下 1.3GB 模型（健康检查给了 300s 起步 + 60×10s），
+    # 把 up 卡在那儿十分钟不值。只报当前状态，等它就去看 ./run.sh logs funasr。
+    echo "[run] funasr 就绪状态：$(docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}' dh-funasr 2>/dev/null || echo 未起)"
     echo
-    echo "Fay Web 管理台    : http://127.0.0.1:${FAY_HTTP_PORT:-5000}/"
-    echo "后端接口文档      : http://127.0.0.1:${BACKEND_PORT:-8000}/docs"
-    echo "数字人 WS         : ws://127.0.0.1:${FAY_HUMAN_WS_PORT:-10002}"
+    echo "CareEcho H5       : http://${BIND_ADDR:-127.0.0.1}:${FRONTEND_PORT:-5173}/"
+    echo "Fay Web 管理台    : http://${BIND_ADDR:-127.0.0.1}:${FAY_HTTP_PORT:-5000}/"
+    echo "后端接口文档      : http://${BIND_ADDR:-127.0.0.1}:${BACKEND_PORT:-8000}/docs"
+    echo "数字人 WS         : ws://${BIND_ADDR:-127.0.0.1}:${FAY_HUMAN_WS_PORT:-10002}"
+    if [ "${DH_ENV}" = dev ]; then
+      # 跨机三行：UE 在另一台电脑上时，那台机器需要的就只是这三件事。
+      echo
+      echo "[dev] 另一台电脑（UE / 手机）要连过来："
+      echo "  1. Windows 的 C:\\Windows\\System32\\drivers\\etc\\hosts 加一行：  ${BIND_ADDR}  dh-host"
+      echo "  2. UE 里填 ws://dh-host:${FAY_HUMAN_WS_PORT:-10002}（或直接写 ${BIND_ADDR}，跳过 hosts 那步）"
+      echo "  3. 复核 UE 拿到的音频地址不是 127.0.0.1： docker exec dh-fay python -c \"from utils import config_util as c;c.load_config();print(c.fay_url)\""
+      echo "     （那行由 FAY_URL 控制，dev 档位已设成 http://${BIND_ADDR}:5000；见 patches/fay/0007 与 README「跨机流量」）"
+      echo "  麦克风：H5 的 ws://<页面同源>/funasr-ws 由外壳转发进 funasr，不需要单独开端口。"
+      echo "  注意 getUserMedia 只在 https 或 localhost 是安全上下文 —— 用 http://${BIND_ADDR}:5173 打开时，"
+      echo "        非 localhost 的页面上麦克风按钮必然失败，那是浏览器策略不是本栈故障（README「未覆盖能力」）。"
+    fi
     echo "跑 ./run.sh smoke 做端到端验证；./run.sh test 跑全套功能测试"
     ;;
   test)
     ensure_env
+    use_profile
     shift 2>/dev/null || true
     # 只在「构建输入比镜像新」时重建对应服务。两个方向都咬过人：
     #  - `up -d` 只认镜像存不存在，不认镜像是不是比补丁新。改完 patches/ 或
@@ -218,11 +341,16 @@ case "${1:-up}" in
     # 建失败立刻停在这里，绝不拿旧镜像继续测（补丁贴不上去时 patch 非零退出 -> build 失败）。
     stale=""
     before=""
-    for svc in fay backend yueshen-rag; do
+    for svc in fay backend yueshen-rag frontend funasr; do
       case "$svc" in
         fay)        src="images/fay.Dockerfile patches/fay overlay/fay/requirements-docker.txt" ;;
         backend)    src="images/service.Dockerfile patches/service overlay/service/requirements-docker.txt overlay/service/requirements-test.txt" ;;
         yueshen-rag) src="images/yueshen_rag.Dockerfile patches/yueshen_rag overlay/yueshen_rag/requirements-docker.txt" ;;
+        # 前端只点名 vite 真会读的输入，不写整个 ../frontend：那会把 .git/ 算进来，而且
+        # 谁在宿主上 npm install 过一次，node_modules 的 mtime 就每轮都比镜像新 —— 每轮白建一次。
+        frontend)   src="images/frontend.Dockerfile frontend/carecho_web.py ../frontend/careecho-h5/src ../frontend/careecho-h5/index.html ../frontend/careecho-h5/package.json ../frontend/careecho-h5/package-lock.json ../frontend/careecho-h5/vite.config.js" ;;
+        # ASR 那份是 torch 镜像：漏点名一份 = 改了不重建，测的还是旧镜像里那版 server.py。
+        funasr)     src="images/funasr.Dockerfile asr/server.py overlay/funasr/requirements-docker.txt overlay/funasr/requirements-torch.txt" ;;
       esac
       # 镜像名不写死，让 compose 自己报；报不出 ID = 本地没有 = 必须建。
       iid=$(image_id_of "$svc")
@@ -276,7 +404,7 @@ case "${1:-up}" in
     # fay-lite 是 test profile 里的轻模型实例（qwen2.5:1.5b），只有它能在被其他
     # 服务占满显存的机器上秒级答完，用来判定「问答链路是否真的通」。
     $COMPOSE --profile test up -d --wait fay-lite 2>&1 | tail -3
-    ALL_GROUPS="backend-test backend-probe adapter-test probe-selftest fay-probe probe-fay-lite ue-audit probe-yueshen"
+    ALL_GROUPS="backend-test backend-probe adapter-test probe-selftest frontend-test ws-relay-test asr-test probe-fay-lite ue-audit fay-probe probe-yueshen frontend-probe asr-probe"
     # 允许 ./run.sh test fay-probe 只跑一组：改探针时不必再等 20 分钟全套。
     # 变量名不能叫 GROUPS —— bash 的内置只读数组（当前用户的 gid），赋值会被吞掉。
     # 默认顺序把 probe-fay-lite 排在两个 9b 实例之前：ollama 是单条队列，
@@ -296,7 +424,16 @@ case "${1:-up}" in
     # 放在三组问答之前，等于我们自己制造一次模型换出、把问答判据挤成超时（那红的是
     # 排队，不是被测对象）。它自己第一发就是奔着「量嵌入出口 + 顺手把模型预热进显存」
     # 去的，所以这条链路的耗时证据仍然取得到。
-    DEFAULT_GROUPS="backend-test backend-probe adapter-test probe-selftest probe-fay-lite ue-audit fay-probe probe-yueshen"
+    # frontend-test 挨着 probe-selftest：同一个位置逻辑 —— 它量的是本目录自己写的外壳
+    # （containerd/frontend/carecho_web.py）与构建产物，假后端起在同容器里，不碰 ollama，
+    # 17 条判据秒级。frontend-probe 排在后面：它那一问要穿完整条链（本机 9b 实测
+    # 172~301s），是唯一还会新增一次问答开销的一组，排在谁后面都不影响谁的判据。
+    # ws-relay-test / asr-test 紧跟 frontend-test：同一条理由的 ASR 版 —— 前者量的是外壳
+    # 里那段 WS 转发（假上游起在同容器里，stdlib 手搓帧），后者用 ASR_FAKE_MODEL=1 量
+    # 识别服务的线上协议与累计文本那条性质，都不加载 torch、不碰 ollama，两组都是秒级。
+    # asr-probe 排在全套最末：它是唯一真的跑一次 CPU 推理的一组（paraformer-large 会
+    # 从 ollama 那些 CPU 驻留权重嘴里抢核），所以它既不能排在问答组之前，也不该被它们排队。
+    DEFAULT_GROUPS="backend-test backend-probe adapter-test probe-selftest frontend-test ws-relay-test asr-test probe-fay-lite ue-audit fay-probe probe-yueshen frontend-probe asr-probe"
     TEST_GROUPS="$*"
     [ -n "$TEST_GROUPS" ] || TEST_GROUPS="$DEFAULT_GROUPS"
     for g in $TEST_GROUPS; do
@@ -305,6 +442,17 @@ case "${1:-up}" in
         *) echo "[test] 没有这组测试件：$g（可选：$ALL_GROUPS）" >&2; exit 2 ;;
       esac
     done
+    # frontend-probe 要的是一个正在应答的 frontend 容器，asr-probe 要的是一个**模型已经
+    # 加载完**的 funasr 容器（它的健康判据就是 server.py 写的 /tmp/asr.ready），其余组都用
+    # 不到这两个，就不为它们多起一份（下面那行 run 带 --no-deps，不会替我们把依赖拉起来）。
+    case " $TEST_GROUPS " in
+      *frontend-probe*) $COMPOSE up -d --wait frontend 2>&1 | tail -2 ;;
+    esac
+    case " $TEST_GROUPS " in
+      *asr-probe*)
+        echo "[test] asr-probe 前先等 dh-funasr 健康（首次启动要下约 1.3GB 模型，健康检查给到 300s 起）"
+        $COMPOSE up -d --wait funasr 2>&1 | tail -2 ;;
+    esac
     rc=0
     for svc in $TEST_GROUPS; do
       echo
@@ -346,7 +494,7 @@ case "${1:-up}" in
     rc=0
     # 表头用 ASCII：printf %-Ns 数的是字节，中文列头会把对齐整个搞坏
     printf '%-11s %-14s %-22s %-11s %s\n' REPO BRANCH UPSTREAM AHEAD/BEHIND WORKTREE
-    for r in fay service ue; do
+    for r in fay service ue frontend; do
       d="../$r"
       # -e 而不是 -d：../fay 作为 submodule，它的 .git 是一个指回
       # ../.git/modules/fay 的文件而不是目录；写成 -d 会把它误判成"不是仓库"。
@@ -369,7 +517,11 @@ case "${1:-up}" in
     # tools/ 也是"不改上游、全在 containerd 侧"的一部分（跑 pytest 前重建测试库那个脚本），
     # 漏在这一行外面就等于 audit 少报一样东西。目录不存在时find 会报错，所以带 2>/dev/null。
     echo "  tools/    $(find tools -type f 2>/dev/null | wc -l) 个 containerd 自带工具：$(find tools -type f -printf '%P ' 2>/dev/null || echo 无)"
-    [ $rc -eq 0 ] && echo "[audit] 上游三个仓库干净" || echo "[audit] 有仓库不干净或与上游分叉" >&2
+    # 本栈自己写的三份运行时代码也在这个口径里：adapter 是 backend↔Fay 那一跳的翻译，
+    # frontend/ 是 CareEcho H5 的同源外壳，asr/ 是麦克风那条 FunASR 服务。它们不改上游，
+    # 但 audit 不列就等于"改动藏在哪儿"少答了三处。
+    echo "  自研服务  $(find adapter frontend asr -type f -name '*.py' 2>/dev/null | wc -l) 个 python 源文件：$(find adapter frontend asr -type f -name '*.py' -printf '%P ' 2>/dev/null || echo 无)"
+    [ $rc -eq 0 ] && echo "[audit] 上游四个仓库干净" || echo "[audit] 有仓库不干净或与上游分叉" >&2
     exit $rc
     ;;
   upstream)
@@ -437,15 +589,57 @@ case "${1:-up}" in
     # 对 embedding 失败是静默跳过这一条（server.py:363），只看出料数看不出问题。
     shift
     ensure_env
+    use_profile
     # 不需要重建镜像：seed/kb_corpus 是运行期挂载，但挂载本身变了要 recreate 才生效。
     $COMPOSE up -d yueshen-rag
     $COMPOSE run --rm kb-ingest "$@"
     ;;
-  build)   ensure_env; $COMPOSE build ;;
-  smoke)   shift; smoke ;;
-  ps)      shift; $COMPOSE ps ;;
-  logs)    shift; $COMPOSE logs -f --tail=120 ${1:-} ;;
-  down)    shift; $COMPOSE down ${1:-} ;;
-  reset)   shift; echo "[run] 将删除全部卷（DB/记忆/日志），5 秒内 Ctrl-C 取消"; sleep 5; $COMPOSE down -v ${1:-} ;;
+  asr-seed)
+    # 纯粹省一次下载：本机若跑过伙伴方那台 FunASR，它那个卷里已经下好了约 1.3GB 模型
+    # （布局就是 MODELSCOPE_CACHE 期待的 models/<组>--<名>/snapshots/<revision>/）。
+    # 拷过来 dh-funasr 首次启动就是本地命中（日志里那句 ASR MODEL src=local）。
+    # 这一步**不是前提**：没有那个卷的新克隆，正常启动自己下载即可（健康检查给了 300s+）。
+    shift
+    ensure_env
+    use_profile
+    from=${1:-careecho-funasr-cache}
+    docker volume inspect "$from" >/dev/null 2>&1 \
+      || { echo "[asr-seed] 宿主没有卷 $from：这一步只是省下载，跳过即可（首次启动会自己下约 1.3GB）" >&2; exit 1; }
+    # 卷名不写死第二份：compose 的卷名是 `<top-level name>_<短名>`，前半从 docker-compose.yml 取。
+    proj="$(awk -F': *' '$1=="name"{gsub(/[ "]/,"",$2); print $2; exit}' docker-compose.yml)"
+    to="${proj}_funasr-cache"
+    # 那两个 label 不是可选的：compose 认卷只认 label（`project` + `volume`），不带它们建出来的卷，
+    # 之后**每一条 up** 都要警告一句 "already exists but was not created by Docker Compose"
+    # （实测 2026-09-21：asr-seed 建过卷之后 test/up 全带这行噪音，ps 不带）。
+    # 但 label 只能在**建卷那一刻**给，`docker volume create` 对已存在的卷是静默 no-op
+    # （同一天实测：本修复之前建的卷，重跑 asr-seed 之后 Labels 仍是 null、警告照旧），
+    # 所以已存在又没 label 时只能把清理步骤如实说出来，绝不代删（那 1.3GB 可能是别人下好的）。
+    have=$(docker volume inspect "$to" --format '{{json .Labels}}' 2>/dev/null || echo '')
+    case "$have" in
+      *com.docker.compose.project*)
+        echo "[asr-seed] 卷 $to 已存在且带 compose label，直接往里拷" ;;
+      '')
+        docker volume create --label "com.docker.compose.project=$proj" \
+          --label com.docker.compose.volume=funasr-cache "$to" >/dev/null
+        echo "[asr-seed] 新建卷 $to（带 compose 那两个 label）" ;;
+      *)
+        echo "[asr-seed] 警告：卷 $to 已存在但**没有** compose label，那条 up 的警告这轮消不掉。" >&2
+        echo "[asr-seed]       label 事后加不了，要消掉就得删卷重建。删的是这个卷里的缓存，" >&2
+        echo "[asr-seed]       而本命令下一条会立刻从源卷拷满回去（源卷不在时才需要重下 1.3GB），" >&2
+        echo "[asr-seed]       所以这一步留给你自己按下面这行执行，不代删：" >&2
+        echo "[asr-seed]       $COMPOSE rm -sf funasr && docker volume rm $to && ./run.sh asr-seed" >&2 ;;
+    esac
+    echo "[asr-seed] $from → $to"
+    # 用我们自己的镜像做拷贝：不为此多拉一个 busybox/alpine，而它本身就是 debian slim。
+    docker run --rm --entrypoint sh -v "$from:/from:ro" -v "$to:/to" dh-funasr:local \
+      -c 'cp -a /from/. /to/ && printf "  文件 %s 个 / %s\n" "$(find /to -type f | wc -l)" "$(du -sh /to | cut -f1)"'
+    echo '[asr-seed] 已拷入；下次起 funasr 就是本地命中（docker logs dh-funasr 里看 ASR MODEL src=local）'
+    ;;
+  build)   ensure_env; use_profile; $COMPOSE build ;;
+  smoke)   shift; ensure_env; use_profile; smoke ;;
+  ps)      shift; use_profile; $COMPOSE ps ;;
+  logs)    shift; use_profile; $COMPOSE logs -f --tail=120 ${1:-} ;;
+  down)    shift; use_profile; $COMPOSE down ${1:-} ;;
+  reset)   shift; use_profile; echo "[run] 将删除全部卷（DB/记忆/日志），5 秒内 Ctrl-C 取消"; sleep 5; $COMPOSE down -v ${1:-} ;;
   *)       echo "用法: $0 {up|build|test|smoke|audit|upstream|kbslice|kb|ps|logs [svc]|down|reset}" >&2; exit 1 ;;
 esac

@@ -1,0 +1,5 @@
+# torch 层的清单，单独一份是因为它走的 index 与其余依赖不同：
+# +cpu 后缀的 wheel 只在 PyTorch 自己的 index 上有（PyPI 上同名包是带 CUDA 运行库的）。
+# 版本号取自本机那台已跑通的镜像里 `pip list` 的实测结果，见同目录 requirements-docker.txt 的说明。
+torch==2.13.0+cpu
+torchaudio==2.11.0+cpu

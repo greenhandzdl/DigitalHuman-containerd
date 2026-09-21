@@ -1,0 +1,78 @@
+name: digitalhuman
+
+# ---------------------------------------------------------------------------
+# dev 档位：./run.sh dev 会在 docker-compose.yml 之后追加这一份。
+#
+# 它只做一件事 —— 把「应用面」的端口从 loopback 上放开到局域网地址，方便手机、
+# 另一台 Windows（跑 UE5.1 编辑器）直接连过来测。prod 档位里没有这些口，
+# 因为每一条都是一次暴露面的扩大（README「dev / prod 档位」有逐条理由）。
+#
+# 两个刻意的例外：
+#   * mysql / redis 恒 127.0.0.1，**不跟 BIND_ADDR**。基础文件里这两条已经写死了，
+#     这里不再出现：实测 ports 的合并键含 host_ip，两份文件给同一 target 配不同
+#     host_ip 时是**追加**而不是覆盖（13306 会同时绑到 LAN 和 loopback 两次），
+#     所以想收紧只能在源头写死，dev 覆盖文件没有"关掉别人那条"的能力。
+#     理由：它们没有任何外部消费者（后端与 Fay 都在 compose 网络上按容器名连），
+#     而「口令是唯一防线的数据库监听在局域网」正是这类栈最常见的泄漏面 ——
+#     "dev 端口全打开"到这里为止。
+#   * BIND_ADDR 是探测出的局域网地址而不是 0.0.0.0：绑 0.0.0.0 会把公网口与别的
+#     网桥一起收进来，而需求只是"局域网能连"。
+#
+# 写法纪律：compose 对 ports 这类带标识符的序列按 host_ip+published+target 合并，
+# 对 command/entrypoint 是整体替换。这里不赌具体语义 —— 每个被碰的服务都重写
+# **完整**的 ports 清单，于是"追加"与"替换"两种解释下结果一样。
+# 改完这个文件请复核一次：
+#   docker compose --env-file .env -f docker-compose.yml -f docker-compose.dev.yml config \
+#     | grep -nE 'host_ip|published'
+# 期望：13306 / 16379 那两条的 host_ip 是 127.0.0.1，其余全是 BIND_ADDR。
+# ---------------------------------------------------------------------------
+
+services:
+  # Fay：把内网口也放出来。:5000 一离开 loopback 就同时暴露了管理台与**无鉴权**的
+  # OpenAI 兼容 façade（/v1/chat/completions 谁都能打），这是 dev 档位最大的代价，
+  # 所以这一份只在你真要跨机联调时起，用完 ./run.sh down。
+  #   5010 MCP 管理面 / 8765 MCP SSE / 10001 设备 socket（fay_booter.py:250）
+  #   10199→9001 是 socket_bridge_service.py 的 WS↔TCP 桥（宿主 9001 已被本机别的常驻服务占了）
+  fay:
+    ports:
+      - "${BIND_ADDR:-127.0.0.1}:${FAY_HTTP_PORT:-5000}:5000"
+      - "${BIND_ADDR:-127.0.0.1}:${FAY_HUMAN_WS_PORT:-10002}:10002"
+      - "${BIND_ADDR:-127.0.0.1}:${FAY_WEB_WS_PORT:-10003}:10003"
+      - "${BIND_ADDR:-127.0.0.1}:5010:5010"
+      - "${BIND_ADDR:-127.0.0.1}:8765:8765"
+      - "${BIND_ADDR:-127.0.0.1}:10001:10001"
+      - "${BIND_ADDR:-127.0.0.1}:${FAY_BRIDGE_PORT:-10199}:9001"
+    environment:
+      # UE 拿这个地址去 :5000 取音频 wav（patches/fay/0007 放开的覆盖口）。
+      # 不设的话 system.conf 里钉死的 http://127.0.0.1:5000 会把远端引向它自己。
+      FAY_URL: http://${DH_LAN_IP:-127.0.0.1}:${FAY_HTTP_PORT:-5000}
+
+  backend:
+    ports:
+      - "${BIND_ADDR:-127.0.0.1}:${BACKEND_PORT:-8000}:8000"
+    environment:
+      # dev 显式写出来，不留给「档位的隐含含义」：/api/v1/auth/dev-login 只在 debug 下挂载，
+      # 而 H5 完全不带 token —— DEBUG=false 时外壳替设备 mint 身份那一步 404，
+      # 用户看到的就只是「每一发问答都 502」。frontend_test.py 有一条断言盯这句 msg。
+      DEBUG: "true"
+
+  adapter:
+    ports:
+      - "${BIND_ADDR:-127.0.0.1}:${ADAPTER_PORT:-8010}:8010"
+
+  frontend:
+    ports:
+      - "${BIND_ADDR:-127.0.0.1}:${FRONTEND_PORT:-5173}:8080"
+
+  # yueshen 知识库的 MCP 口：放出来是为了手工 curl /sse 看它到底连没连上。
+  # 它不在任何对外契约里，prod 只在 compose 内网。
+  yueshen-rag:
+    ports:
+      - "${BIND_ADDR:-127.0.0.1}:${YUESHEN_RAG_PORT:-8766}:8766"
+
+  # FunASR 直发一份，给「绕开外壳直接验识别」用。生产不发布 —— 那条链走外壳的
+  # /funasr-ws 同源转发（CARECHO_WS_RELAY），多开一个无鉴权口没有收益。
+  # 基础文件里这个服务**没有** ports，所以这里无论按"追加"还是"替换"合并都是这一条。
+  funasr:
+    ports:
+      - "${BIND_ADDR:-127.0.0.1}:${FUNASR_PORT:-10095}:10095"

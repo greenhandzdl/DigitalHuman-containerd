@@ -1,8 +1,9 @@
 # containerd —— DigitalHuman 容器集成层
 
-这一层把散在三个仓库里的东西拢到一个 `docker compose` 里跑起来，**不改动 `fay` /
-`service` / `ue` 任何一个仓库的代码**：三个目录的 `git status` 始终干净、`main`
-始终 == `origin/main`（`./run.sh audit` 会把这件事打成输出，而不是留成一句承诺）。
+这一层把散在几个仓库里的东西拢到一个 `docker compose` 里跑起来，**不改动 `fay` /
+`service` / `ue` / `frontend` 任何一个仓库的代码**：四个目录的 `git status` 始终干净、
+`main`（前端是 `master`）始终 == `origin/main`（`./run.sh audit` 会把这件事打成输出，
+而不是留成一句承诺）。
 
 > **2026-09-21 撤掉了 `origin_fay` 参照实例。** 它曾经是「上游直出的第二个 Fay」，用来回答
 > 「fork 相对上游改了什么」。fork 换成 `chuan918/Fay` 之后它成了上游的**直接后代**、Python
@@ -14,25 +15,30 @@
 
 ```
 containerd/
-├── docker-compose.yml          常驻 6 个服务：mysql / redis / fay / yueshen-rag
-│                               / adapter / backend；另有 profiles:["test"] 的
-│                               fay-lite（测试用轻模型 Fay）+ 8 个一次性测试件，
+├── docker-compose.yml          常驻 8 个服务：mysql / redis / fay / yueshen-rag
+│                               / adapter / backend / frontend / funasr；另有 profiles:["test"]
+│                               的 fay-lite（测试用轻模型 Fay）+ 13 个一次性测试件，
 │                               和 profiles:["kb"] 的 kb-ingest（外部语料入库，见下）
-├── run.sh                      up · build · test · smoke · audit · upstream · logs
-│                               · kbslice · kb · ps · down · reset
-├── .env.example                模板；run.sh 首次执行会复制成 .env 并填随机密钥
+├── docker-compose.dev.yml      ★ dev 档位叠加层：放开应用面端口 + DEBUG=true + FAY_URL
+│                               （只在 ./run.sh dev 时被叠上，见「dev / prod 档位」）
+├── run.sh                      up · dev · build · test · smoke · audit · upstream · logs
+│                               · kbslice · kb · asr-seed · ps · down · reset
+├── .env.example                模板；run.sh 首次执行会复制成 .env 并填随机密钥（DH_ENV 也在里面）
 ├── images/
 │   ├── fay.Dockerfile          Fay 镜像（唯一一份 Fay 源码 ../fay；原先靠 ARG FAY_SRC
 │   │                           多构建一个上游参照镜像，那三个 ARG 随实例一起删了）
 │   ├── yueshen_rag.Dockerfile  唯一带 chromadb 的 MCP 服务器，单独镜像（不并进 Fay，见「yueshen 知识库」）
-│   └── service.Dockerfile      原样 COPY service/，依赖读它自己的 pyproject.toml
+│   ├── service.Dockerfile      原样 COPY service/，依赖读它自己的 pyproject.toml
+│   ├── frontend.Dockerfile     两阶段：node 里 npm ci + vite build 出 dist-h5，
+│   │                           产物拷进 python-slim 与外壳一起跑（见「CareEcho H5 前端」）
+│   └── funasr.Dockerfile       torch(cpu) + funasr，运行时代码是本层的 asr/server.py（见「FunASR」）
 ├── overlay/                    ★ 覆盖层：不改源码的配置手段
 │   ├── {fay,fay-lite}/system.conf      仓库里不存在，容器里必须有（见下）
 │   ├── {fay,fay-lite}/config.json      关麦克风、关本地播放、换 edge_tts 音色
 │   ├── {fay,fay-lite}/mcp_servers.json  把 id=4 yueshen 从 stdio 换成 sse 指向容器（每实例一份、可写）
 │   ├── 依赖清单只有一份：
 │   │   overlay/fay/requirements-docker.txt     fay 与 fay-lite 同一镜像、同一份清单
-│   └── {service,yueshen_rag}/requirements-docker.txt  其余两个镜像各自的依赖清单（冲突处理见下）
+│   └── {service,yueshen_rag,funasr}/requirements-docker.txt  其余镜像各自的依赖清单（冲突处理见下）
 ├── patches/                    ★ 补丁层：构建期 patch -p1 盖到镜像里的 /app
 ├── seed/                       ★ 种子层：service 的参考语料不在仓库里，这里给一份能自测的
 │                               ├── kb_corpus/  外部科普语料的切片产物（`tools/slice_kb_corpus.py`
@@ -42,47 +48,140 @@ containerd/
 │                               · backend_probe.py（后端活体探针：路由/迁移/schema/鉴权/写路径/调度器）
 │                               · yueshen_probe.py（chromadb 那条链路：嵌入出口/清单/入库/检索/stats 一致性）
 │                               · kb_ingest.py（外部语料入库 + 12 问真实问法抽测，`./run.sh kb`）
+│                               · frontend_test.py（前端外壳契约：假后端 + 19 条判据 + 负面自检）
+│                               · frontend_probe.py（真栈：从外壳那一口穿到 backend→adapter→Fay→ollama）
+│                               · ws_relay_test.py（外壳的 WS 转发契约：手造掩码帧 + 假上游）
+│                               · wsutil.py（RFC 6455 握手与帧的最小构造器，上面那组与 asr_* 共用）
+│                               · asr_test.py（FunASR 协议自测：假模型、不加载 torch）
+│                               · asr_probe.py（真模型链路：把仓库里的真语音按浏览器节奏推进去）
 ├── tools/                      reset_test_db.py（跑 pytest 前重建测试库）· tts_negative_control.py
 │                               · make_yueshen_corpus.py（构建期造 yueshen 语料，见「yueshen 知识库」）
 │                               · slice_kb_corpus.py（把项目方给的 .docx 按原序摊平成可检索的切片）
-├── adapter/server.py           新增组件：后端 /api/chat ↔ Fay /api/send+get-msg
+│                               · check_mermaid.py（两份 README 里 mermaid 块的离线结构自查，见「服务拓扑」末）
+├── adapter/server.py           自己写的第一份代码：后端 /api/chat ↔ Fay /api/send+get-msg
+├── frontend/carecho_web.py     自己写的第二份代码：CareEcho H5 的同源外壳（静态 + /api + WS 转发）
+├── asr/server.py               自己写的第三份代码：FunASR 流式识别服务（H5 麦克风的真后端）
 ├── sql/init/00-create-database.sql
 └── _audit/                     ue-audit 的 JSON 报告落这里（README 的数字对着它复核）
 ```
 
+## 服务拓扑
+
+```mermaid
+flowchart TB
+  BRO["浏览器 / 手机"]
+  UEX["UE 5.1（另一台机器）"]
+  OLL["宿主 Ollama :11434<br/>对话 + 嵌入"]
+
+  subgraph PROD["常驻：docker compose up（prod 档位）"]
+    FE["dh-frontend<br/>:5173 同源外壳"]
+    BK["dh-backend<br/>:8000"]
+    AP["dh-adapter<br/>:8010"]
+    FY["dh-fay<br/>:5000 :10002 :10003"]
+    FS["dh-funasr<br/>容器内 :10095"]
+    YS["dh-yueshen-rag<br/>容器内 :8766"]
+    MY[("dh-mysql :13306")]
+    RE[("dh-redis :16379")]
+  end
+
+  subgraph DEVD["dev 档位追加发布（./run.sh dev）"]
+    DX["funasr :10095 · yueshen :8766<br/>fay 5010 / 8765 / 10001 / 10199"]
+  end
+
+  subgraph TST["profile: test（./run.sh test 时才存在）"]
+    T1["backend-test · backend-probe · adapter-test · probe-selftest"]
+    T2["frontend-test · ws-relay-test · asr-test"]
+    T3["fay-lite + probe-fay-lite · ue-audit · fay-probe · probe-yueshen"]
+    T4["frontend-probe · asr-probe（抢 CPU / 打 ollama 的排最后）"]
+  end
+
+  subgraph KBP["profile: kb（./run.sh kb）"]
+    KI["kb-ingest → yueshen-rag"]
+  end
+
+  BRO -->|"HTTP + WS 同源"| FE
+  FE --> BK
+  FE -->|"/funasr-ws 转发"| FS
+  BK --> AP --> FY
+  FY --> OLL
+  YS --> OLL
+  FY --> YS
+  BK --> MY
+  BK --> RE
+  FY --> RE
+  UEX -->|"拨入 :10002"| FY
+  FY -.->|"FAY_URL 指向本机 LAN 地址"| UEX
+  FY -.-> DX
+  FS -.-> DX
+  T2 -.-> FE
+  T2 -.-> FS
+  T3 -.-> FY
+  T4 -.-> FS
+  KI -.-> YS
+```
+
+`-.-` 是「按档位/按测试才发生」的关系，实线是常驻路径。`mysql` / `redis` 恒绑
+`127.0.0.1`，**不跟档位放开**（原因见「dev / prod 档位与跨机流量」）。
+
+改这两张图（还有根 README 那一张）之后跑一句 `python3 tools/check_mermaid.py ../README.md
+README.md`，它离线扫所有 ```` ```mermaid ```` 块并给出结论。为什么要有这么个东西：mermaid
+标签里的 `()` 不加引号会把解析器直接搞坏，而外部渲染器（kroki 之类）一旦开始回
+`400/500/000`，你分不清是图写坏了还是它自己不舒服 —— 这种检查必须能在断网时给出结论。
+它只做结构自查（引号成对、括号平衡、`subgraph`/`loop` 与 `end` 数量对得上、裸括号、边标签
+竖线数），不宣称能代替渲染。
+
 ## 快速开始
 
 ```bash
-cd /mnt/data/DigitalHuman/containerd
-./run.sh up        # 构建 + 起栈（首次约 3~6 分钟，pip 走阿里云镜像）
+cd containerd      # 本目录（仓库里唯一有可执行入口的地方）
+./run.sh up        # 构建 + 起栈（首次约 3~6 分钟，pip 走阿里云镜像、npm 走 npmmirror）
+./run.sh dev       # 同一套东西，但叠上 docker-compose.dev.yml：应用面端口放开、DEBUG=true
 ./run.sh smoke     # 端到端：后端 → adapter → Fay → Ollama → 落库
-./run.sh test      # 八组测试件：backend-test · backend-probe · adapter-test · probe-selftest
-                   #            · probe-fay-lite · ue-audit · fay-probe · probe-yueshen
+./run.sh test      # 十三组测试件：backend-test · backend-probe · adapter-test · probe-selftest
+                   #            · frontend-test · ws-relay-test · asr-test · probe-fay-lite
+                   #            · ue-audit · fay-probe · probe-yueshen · frontend-probe · asr-probe
 ./run.sh test fay-probe   # 只跑其中一组（改探针时不用等全套）
-./run.sh audit     # 核账：三个上游仓库是否仍然零改动、与上游不分叉（非零退出即可当断言）
+./run.sh audit     # 核账：四个上游仓库是否仍然零改动、与上游不分叉（非零退出即可当断言）
 ./run.sh upstream  # 跟上上游：fetch xszyou/Fay，报落后几条，并把每份 fay 补丁对 upstream/main 干跑预检
 ./run.sh kbslice   # 把 uploads/ 里那包 .docx 切片到 seed/kb_corpus/（换语料时才需要跑）
 ./run.sh kb        # 切片入库 + 12 问真实问法抽测（要求每问在 top3 命中自己的出处）
-./run.sh logs fay  # 单独看某个服务
+./run.sh asr-seed  # 本机若已有别处下好的 FunASR 模型缓存卷，拷进本栈的卷（省 1.3GB 下载）
+./run.sh logs fay  # 单独看某个服务（fay/backend/adapter/frontend/funasr/mysql/redis）
 ```
 
 入口：
 
 | 地址 | 是什么 |
 |---|---|
-| `http://127.0.0.1:5000/` | 本 fork Fay 的 Web 管理台（上游那份在 `:5100`） |
+| `http://127.0.0.1:5173/` | CareEcho H5 前端（伙伴方仓库构建产物 + 本层的外壳，见「CareEcho H5 前端」一节） |
+| `http://127.0.0.1:5000/` | Fay 的 Web 管理台 |
 | `http://127.0.0.1:8000/docs` | 后端 OpenAPI（`/openapi.json` 实测 64 个 path / 81 个 operation）；健康检查在 `/api/v1/health` |
-| `ws://127.0.0.1:10002` | 数字人 WS（`Topic:"human"` 协议，留给未来前端；上游那份在 `:10012`） |
-| `ws://127.0.0.1:10003` | Fay 浏览器面板 WS（上游那份在 `:10013`） |
+| `ws://127.0.0.1:10002` | 数字人 WS（`Topic:"human"` 协议，留给未来前端；`:10012` 曾是指向上游那份的映射，随参照实例一起撤了） |
+| `ws://127.0.0.1:10003` | Fay 浏览器面板 WS（同上，`:10013` 已撤） |
 | `http://127.0.0.1:8010/api/chat` | adapter，给后端用的同步问答口 |
+| `ws://127.0.0.1:5173/funasr-ws` | H5 麦克风那条：页面同源的 WS，由外壳按常量表转发进 `dh-funasr`（生产唯一的入口） |
+| `ws://127.0.0.1:10095/` | **dev 档位才有**（`./run.sh dev`）—— FunASR 直口，给探针和手工调试用；prod 不发布 |
+| `http://127.0.0.1:8766/` | **dev 档位才有** —— yueshen-rag 的 chromadb HTTP 口；prod 只在 compose 内网 |
 
-Fay 自己的 HTTP 面（`gui/flask_server.py`，两份 Fay 同一套）：问答是异步的
+Fay 自己的 HTTP 面（`gui/flask_server.py`）：问答是异步的
 `POST /api/send` + `POST /api/get-msg`；另有一组管理口
 （`/api/get-member-list`、`/api/get-system-status` …）和一对 **OpenAI 兼容 façade**
 `GET /v1/models` / `POST /v1/chat/completions`（:746 / :775）。façade 是"如果不想写
 adapter"的备选路线，但后端 `fay_gateway.py` 期待的是 `/api/chat`，所以本栈仍走 adapter。
-就绪探针用 `GET /api/get-system-status` —— **别用 `/panel/page1`，这个路由在两份 Fay 里
-都返回 404**（面板是 10003 上的 WS，不是 HTTP 页面路径）。
+就绪探针用 `GET /api/get-system-status` —— **别用 `/panel/page1`，这个路由返回 404**
+（面板是 10003 上的 WS，不是 HTTP 页面路径）。
+
+但这条探针只证明 **flask 活着**，不证明 **Fay 能对话**：`main.py` 先起 HTTP 服务，
+之后还要预热 embedding、才 `创建代理实例`。中间那段窗口里 `POST /api/send` 会**在 0.01s 内
+抛 500**（不是超时），也就是"端口就绪 ≠ 可以问话"。实测：2026-09-21 22:18 那次
+`docker compose restart fay` 之后 `:5000` 立刻可问，紧跟着那一问就是 502；到第 10s
+同样的 `/api/send` 返回 `{"result":"successful"}`。所以 `./run.sh smoke` 在 restart 之后
+等的不是端口，而是 `fay_booter.py:478`（`start()` 最后一行）那句「服务启动完成!」
+（`run.sh` 的 `wait_fay_agent`，`--since` 取容器本次启动时刻，不会把上一辈子的同一句读成"好了"）。
+compose 的健康判据没跟着改成这条：它在容器里跑，读不到自己的日志流，而那段时间里
+`/api/get-system-status` 本来就答得上 —— 于是 `healthy` 的含义是"HTTP 面可用"，
+不含"能对话"。真要在产品里避开这个窗口（embedding 要换入时它会拉长到分钟级），
+得在 adapter 侧对 500 做一次重试，本轮没做。
 
 容器内实测已监听的端口：5000 / 10002 / 10003 / 10001(远程音频 TCP) / 9001(音频桥)
 / 5010(MCP 管理) / 8765(MCP SSE)。**5001(genagents 决策面谈) 不在常态清单里 —— 它是按需拉起的**：
@@ -91,8 +190,116 @@ adapter"的备选路线，但后端 `fay_gateway.py` 期待的是 `/api/chat`，
 compose 只把前三个
 （5000 / 10002 / 10003）发布到宿主机，其余留在容器网络里。
 
-默认只绑 `127.0.0.1`。要给局域网设备（如 Windows 上的 UE）访问，把 `.env` 里
-`BIND_ADDR` 改成 `0.0.0.0` 后 `./run.sh up`。
+默认只绑 `127.0.0.1`。要给别的机器（手机、跑 UE 的那台 Windows）连，用的是
+**`./run.sh dev`**，不是手改 `BIND_ADDR` —— 后者在 prod 档位下会被直接拒掉，
+理由见下一节。
+
+## dev / prod 档位与跨机流量
+
+档位只有一个变量：`.env` 里的 `DH_ENV`（缺省 `prod`）。它只决定两件事：
+
+1. `run.sh` 里那串 `$COMPOSE` 叠不叠 `docker-compose.dev.yml`
+   （所有子命令都用同一个变量，所以各处不用改）；
+2. `dev` 下 `BIND_ADDR` 落到**探测出来的局域网地址**（`ip route get 1.1.1.1` 的源地址），
+   而不是 `0.0.0.0`。
+
+### prod 的硬闸
+
+```
+$ DH_ENV=prod BIND_ADDR=0.0.0.0 ./run.sh up
+[run] DH_ENV=prod 不接受 BIND_ADDR=0.0.0.0 —— 那会把管理台与无鉴权接口发布到外部。
+      要给别的机器连就用 ./run.sh dev（它绑到探测出的局域网 IP，不是 0.0.0.0）。
+$ echo $?
+1
+```
+
+不做「提醒之后继续」而直接退出，是因为这类暴露最常见的成因就是有人临时改过一次 `.env`
+然后忘了改回来 —— 而 `:5000` 一离开 loopback，同时出去的是 **Fay 的 Web 管理台**和它的
+**无鉴权 OpenAI 兼容 façade**（`POST /v1/chat/completions`，见 `fay/gui/flask_server.py:775`）。
+闸在 `use_profile` 里，跑在任何 docker 命令之前。
+
+### dev 追加什么
+
+`docker-compose.dev.yml` 只放开**应用面**：`frontend` 5173、`backend` 8000、`adapter` 8010、
+`fay` 5000/10002/10003 + 内网口 5010/8765/10001 + 音频桥 `${FAY_BRIDGE_PORT:-10199}:9001`、
+`yueshen-rag` 8766、`funasr` 10095，并给后端 `DEBUG: "true"`、给 Fay
+`FAY_URL: http://${DH_LAN_IP}:5000`。
+
+- **`mysql` / `redis` 即使在 dev 也恒 `127.0.0.1`**。它们没有任何外部消费者，
+  而「只靠一个口令的数据库/可写 KV 进局域网」是这类栈最常见的泄漏面。
+  这一条写在**基础文件**里而不是覆盖文件里 —— compose 的 `ports:` 是按
+  `host_ip` + `target` 合并的，覆盖层换个 `host_ip` 只会**多加一条**而不是改掉那条，
+  想收紧只能在源头写死。这是本轮踩实的一条合并语义。
+
+  两档的渲染结果（`docker compose ... config`，把 `BIND_ADDR` 设成本机局域网 IP 192.168.0.2 问的，
+  不是运行期截图 —— 它测的是 compose 的合并语义，与栈起没起无关）：
+
+  | 服务 | prod（基础文件） | dev（叠 `docker-compose.dev.yml`） |
+  |---|---|---|
+  | `frontend` / `backend` / `adapter` | `192.168.0.2:5173/8000/8010`（各一条） | 同左，端口不变 |
+  | `fay` | 5000 / 10002 / 10003 | 追加 5010 / 8765 / 10001 / `10199->9001` |
+  | `funasr` | **`(no published ports)`** | `192.168.0.2:10095` |
+  | `yueshen-rag` | **`(no published ports)`** | `192.168.0.2:8766` |
+  | `mysql` / `redis` | `127.0.0.1:13306` / `127.0.0.1:16379` | **与 prod 一字不差** |
+
+  值得看的是两件事：dev 每个服务仍然**只有一条**（没有因为 `host_ip` 变了就多出一条 loopback，
+  这正是"每个被碰的服务重写完整 `ports:` 清单"买来的结果），以及 prod 那一列里 `BIND_ADDR`
+  一旦被改成局域网地址，应用面端口就真的跟着出去了 —— 所以闸必须存在，见上面那条。
+- **`DEBUG` 不是 `DH_ENV` 的隐式含义，而是 dev 显式写出来的一个值**，因为后端只在
+  `DEBUG=true` 时挂载 `POST /api/v1/auth/dev-login`，而 H5 前端**根本没有登录这一步**
+  （身份由外壳替设备铸）。`DEBUG=false` 起 dev 档位的现象是：页面打得开、每一发问答都 502，
+  气泡上写着「后端 POST /auth/dev-login → HTTP 404」。这条耦合现在由
+  `probes/frontend_test.py` 判据 18 钉着，不用靠人记得这段文字。
+- 每个被 dev 碰到的服务都**重写完整的 `ports:` 清单**，这样「同标识覆盖」和「异标识追加」
+  两种合并语义下结果一样 —— 不必去猜 compose 实现到底按哪种处理。
+
+### 跨机：UE 在另一台电脑上
+
+真正影响正确性的只有两件：**进得来** 和 **取到可达的音频地址**。
+
+- 进得来 → 端口绑到局域网地址（上面那条），UE 里填 `ws://<本机 LAN IP>:10002`。
+- 音频地址 → Fay 回给 UE 的音频 URL 是拼 `fay_url` 得来的，而 `overlay/fay/system.conf:58`
+  钉的是 `http://127.0.0.1:5000` —— 换台机器 UE 就取不到文件。
+  `patches/fay/0007-fay-url-env-overridable-CRLF-source.patch` 把这一行放开成
+  `fay_url = os.environ.get('FAY_URL') or fay_url`（源文件是 CRLF，补丁按现有那批的写法逐行 `\r\n`）。
+  实测两向都对：不设 `FAY_URL` 时容器里读回 `http://127.0.0.1:5000`（完全等于上游原行为），
+  设了就等于设的值 —— 所以这个补丁对没跨机需求的人是隐形的。
+  复核命令：`docker exec dh-fay python -c "from utils import config_util as c;c.load_config();print(c.fay_url)"`。
+- 名字 → `docker-compose.yml` 的 `x-host-gateway` 锚点里一并给出
+  `extra_hosts: dh-host:${DH_LAN_IP:-127.0.0.1}` 与 `ue-host:${UE_LAN_IP:-127.0.0.1}`。
+  注意这两条写在**容器内**的 `/etc/hosts`，所以它们服务的是栈内将来需要外拨 UE 的地方，
+  **管不到 UE 那台 Windows 机器自己的解析**：那边想用 `ws://dh-host:10002` 这种写法，
+  得自己在 `C:\Windows\System32\drivers\etc\hosts` 加一行 `<本机 LAN IP>  dh-host`；
+  嫌麻烦就填 IP，效果一样。**这组映射只是便利**，不是任何判据的前提。
+
+`./run.sh dev` 起来后会把这三行直接打印出来（含本机实际 LAN 地址与容器里生效的 `fay_url`），
+免得每次都回来查文档。
+
+上面那张表是**渲染出来的**（compose 会怎么写）。两档真正跑起来之后 `ss -ltn` 各看过一次，
+数字对得上，而且 prod 那一列有个容易看错的细节：
+
+```
+prod（./run.sh up）  127.0.0.1:5173 8000 8010 5000 10002 10003 13306 16379 —— 共 8 条，全在 loopback
+                     10095 / 8766 / 5010 / 10001 / 10199 一条都没有（`docker ps` 里它们只是
+                     `8765/tcp` 这种"未发布"形态）
+dev （./run.sh dev） 应用面那六个口改绑 192.168.0.2（`mysql`/`redis` 那两条仍留在 loopback，
+                     见上面第一条），另加 10095 / 8766 / 5010 / 8765 / 10001 / 10199。
+                     `ss -ltn` 里真看过的是 `192.168.0.2:5173` 与 `:10095` 这两条（其余按
+                     上面那张渲染表算，别把"compose 会这么写"当成"实测过"）；
+                     从宿主真打 ws://192.168.0.2:10095/ 与经外壳的 ws://192.168.0.2:5173/funasr-ws
+                     各识别出同一句 final（1.5s / 1.2s，见「FunASR：麦克风这条链」末）
+```
+
+宿主上另有一个 `127.0.0.1:8765` 在听，那是**别人的进程**（`docker ps` 里没有任何容器发布 8765），
+所以核对 prod 姿态要按"我们发布的端口"数，别把宿主机上恰好占着的同号端口算成自己的泄漏面 ——
+反过来说，dev 档位选 10199 而不是 9001 给音频桥，也是同一种"先看宿主占了什么"的动作。
+
+### 一条与档位有关的产品边界
+
+`getUserMedia`（也就是 H5 那个麦克风按钮）只在 **https 或 localhost** 算安全上下文。
+从手机用 `http://192.168.x.x:5173` 打开页面时，文字问答照常、**语音一定点不动** ——
+浏览器的规则，不是本栈的缺陷。要么走 https（伙伴方那个小程序壳还额外要求备案域名），
+要么用 `adb reverse` / USB 调试把 5173 转成 localhost。
 
 ## 为什么 AI 走宿主机 Ollama
 
@@ -451,16 +658,22 @@ fay/.git/config
 `patch -p1 --dry-run --fuzz=0`。为这个判断建一次 worktree 要 checkout 314MB，
 所以它改成按补丁头取目标文件、在 `mktemp -d` 里摆一棵只含这几个文件的小树 ——
 `--fuzz=0` 是故意的：能靠容差糊过去的补丁在真实合并里通常已经贴错了位置。有贴不上的
-就非零退出，可以当 CI 断言。当前状态实测：落后 1 条（`d49f476 修复websocket与uvicorn
-版本不兼容问题`），6 份补丁全部可贴。顺带一条佐证 —— 上游那条修复加的就是
+就非零退出，可以当 CI 断言。当前状态实测（2026-09-21 23:42）：落后 1 条（`d49f476 修复websocket与uvicorn
+版本不兼容问题`）、领先 3 条，**7 份补丁全部可贴**（第 7 份是本轮为跨机加的 `FAY_URL` 覆盖）。
+顺带一条佐证 —— 上游那条修复加的就是
 `uvicorn<0.35`，与 `overlay/fay/requirements-docker.txt` 里那条判断一字不差
 （上游 `requirements.txt` 仍然留着裸 `mcp`，所以 `mcp>=1.2,<2` 那根钉还是我们的事）。
+
+这一轮它连着三次在 TLS 层断（`curl 56 … unexpected eof` / `OpenSSL SSL_read: error:0A000126`），
+第四次才通 —— 而 `https://api.github.com/repos/xszyou/Fay` 一直是 200，说明断的是
+`git upload-pack` 那条长连接，不是仓库没了。**`run.sh upstream` 拉不到就非零退出是对的**：
+那口气要是拿去报「落后 N 条」，用的其实是上一次 fetch 留下的旧 ref，看着像实时结论。
 
 真要合就在 `fay` 里 `git -C ../fay merge upstream/main`，然后 `./run.sh build && ./run.sh test`。
 补丁贴不上时按上面那段「一个一直咬人的坑：…都是 **CRLF** 行尾」说的字节层规矩重做，
 别去改 `fay/` 源码。
 
-## adapter：唯一新增的代码
+## 自己写的第一份代码：adapter
 
 `app/services/fay_gateway.py:38-52` 会 `POST {FAY_HTTP_URL}/api/chat`，但 Fay 的 Flask
 没有这个路由 —— 只有异步的 `/api/send`（投递后立即返回 `{"result":"successful"}`，
@@ -480,14 +693,32 @@ fay/.git/config
 超时链（compose 注入，必须单调递增，改一处就要顺着往上改）：
 
 ```
-Fay 内 LLM 420s  ≤  Fay 回复空闲判定 480s  <  adapter 等回话 500s
+浏览器 axios 30s  <  外壳 CARECHO_UPSTREAM_TIMEOUT 90s  <  Fay 内 LLM 420s
+                 ≤  Fay 回复空闲判定 480s  <  adapter 等回话 500s
                  <  后端 HTTP 520s         <  ./run.sh smoke 600s
+
+麦克风那条不看 LLM、看的是"这页还开着吗"，所以它是独立的一串，不与上面比大小：
+`CARECHO_WS_RELAY_IDLE=180s` 是外壳两侧连接的**空闲**上限（转发是字节泵，空闲 3 分钟才关）；
+`FUNASR_MAX_SECONDS=60s` 是服务端对**单个会话累计音频**的上限（超了强制收工并发 final，
+所以"按住麦克风不放"最坏也就是 60 秒后按钮自己停下来，而不是无限吃 CPU）；
+服务可用性那一维则是 `dh-funasr` 的健康判据 —— ready 文件在（首次含约 1.3GB 下载，
+`start_period 300s` / `retries 60`）。
 ```
 
 前两个都在 compose 的 `x-llm-timeouts` 锚点里（同一份锚点还带着 embedding 的
 `90`/`1`），后两个是
 `ADAPTER_MAX_WAIT_SECONDS` / `FAY_FORWARD_TIMEOUT_SECONDS`，全部可用环境变量改
 （后端那个是 `app/core/config.py:43` 的 pydantic `BaseSettings` 字段，不用打补丁）。
+外壳那条是 `CARECHO_UPSTREAM_TIMEOUT`，它和 axios 那 30s 都**排在后端之下**，
+含义很直白：在这台显存被占满的机器上（9b 一句话 172~301s），H5 一定先在后端之前
+报错 —— 而后端此时仍在正常生成，只是没人等它。30s 写死在伙伴方的
+`src/api/request.js:6`（axios 实例 `timeout: 30000`，`baseURL` 默认 `/api`），
+我们不改它们的项目，所以这份超时是**如实记录的既定事实**，不是调参能挪动的。
+`run.sh test` 的 `frontend-probe` 用 `--timeout 600` 从容器里打那一问（run #31 实测
+86.5s），量的就是「这条链在浏览器之外能不能通」，不与那 30s 混为一谈。
+但**那 600s 是拿不到的**：探针的请求先进外壳，外壳在 90s 就替它做了决定。run #32 里
+这一条两次撞在同一处（`90.4s` / `90.3s`，msg 都是 `后端 POST /chat/sessions/N/messages 不可达：timed out`），
+所以 86.5s 那次是擦着上限过的，不是"浏览器之外还有一大段余量"—— 外壳这 90s 才是真正的墙。
 之所以要放到 500/520：这台机器的显存被别人占着（见上一节），9b 只有 6% 权重进显存时
 一句话要 172~301s，500s 是"够等到但不至于挂死"的位置。显存充裕时同一句话是
 **冷启动 39~40s、暖态 4.8s、长回复 18s**，所以这套预算在好机器上只是等得早停而已。
@@ -497,7 +728,8 @@ Fay 内 LLM 420s  ≤  Fay 回复空闲判定 480s  <  adapter 等回话 500s
 ### adapter 自己的契约测试：`probes/adapter_test.py`
 
 前面所有判据都要经过真实的 Fay + ollama，也就是说它们**同时**在量"代码对不对"和
-"这台机器忙不忙"。adapter 是本层唯一新增的代码，它自己的正确性不该被显存抖动掩盖，
+"这台机器忙不忙"。adapter 是本层自己写的第一份代码（第二份是 `frontend/carecho_web.py`，
+见后面「CareEcho H5 前端」一节），它自己的正确性不该被显存抖动掩盖，
 所以给它一组不打 LLM 的测试：容器里起一个假 Fay（同 `/api/send` + `/api/get-msg`
 协议，能按需"新增一行"或"把已有行长一段"），把 `adapter/server.py` 当子进程拉起来，
 用 11 条断言钉住契约：
@@ -646,9 +878,11 @@ SKIP 记，理由写"dev 路由没挂载"，不去猜。
 
 ## 实测通过的链路
 
-`./run.sh test` **现在八组**（run #12 时是七组，`backend-probe` 在那之后加的，它自己的
+`./run.sh test` **现在十三组**（run #12 时是七组，`backend-probe` 在那之后加的，它自己的
 数字见下表与「后端活体探针」一节；`probe-yueshen` 是那一轮新加的第九组，见
-「yueshen 知识库」一节；`probe-origin-fay` 随参照实例一起撤了）。下面 run #27 / #28
+「yueshen 知识库」一节；`probe-origin-fay` 随参照实例一起撤了；run #31 加 `frontend-test`
+与 `frontend-probe` 两组、run #32 加 `ws-relay-test` / `asr-test` / `asr-probe` 三组，
+见「CareEcho H5 前端」与「FunASR：麦克风这条链」两节）。下面 run #27 / #28
 两张表记的都是**当时九组**的数字。旧基线上最近一次完整运行是 **run #27**（2026-09-21 02:13 起，
 `[test] 全部通过`）。它是第一次把 `probe-yueshen` 组、以及 0002 补丁（服药漏扫时钟冻结）
 和探针的 120s 排空重问一起放进完整一轮 —— 前两件各治一个 run #25 暴露的红，这一轮两者
@@ -659,7 +893,9 @@ origin 侧 9.4s），lite 侧 `qwen2.5:1.5b 1166/1166MB`、直连 1.1s，于是 
 没有置 `DEGRADED_LLM_HOST` —— 所有耗时类判据这次都是**硬判**：过就是真过，不过就记红。
 下面这一整段连同它的表，都是**换基线之前**那一版 `dh-fay` 的数字（见「2026-09-21 基线变更」）；
 新基线上的第一轮完整九组是 **run #28**，撤掉参照实例之后的第一轮八组是 **run #29**，
-外部语料进库之后的第一轮是 **run #30**（也是当前最新的一次完整运行），三节都在本节末。
+外部语料进库之后的第一轮是 **run #30**，接上 CareEcho H5 之后（十组）是 **run #31**，
+补上麦克风这条链之后（十三组）是 **run #32**（当前最新的一次完整运行，但它**不是全绿**：
+两条红 + 一处按环境收工，成因写在那一节里），几节都在本节末。
 
 | 组 | run #27 实测 |
 |---|---|
@@ -934,6 +1170,108 @@ images/*.Dockerfile` 一共 4 行），`system.conf` / `config.json` / `mcp_serv
 已经不再打印「先重建它」（39 passed / 2.93s）。另一个假阴性（run #29 末段那条）也修了：
 核对 ID 改成 `image_id_of()`，只跟 compose 拿 `REPOSITORY:TAG`、ID 用 `docker image inspect`
 按 tag 现查，不再读容器上的旧 ID。
+
+### run #31：CareEcho H5 接进来之后的两组（2026-09-21 19:08~19:10）
+
+这一轮**只跑了新加的两组**，不是完整十组 —— `frontend-test` 全程打假后端、
+`frontend-probe` 只发一问，两组各自 1 分多钟，没必要为它们重烧那三组 9b。
+集成细节见「CareEcho H5 前端」一节。
+
+| 组 | run #31 实测 |
+|---|---|
+| `frontend-test` | **17/17 通过**（含负面自检：改坏 `Set-Cookie` 后判据 8 确实变红） |
+| `frontend-probe` | **3/3** —— 外壳发产物 1583 字节、`/api/health` ok、真实一问 **86.5s / 47 字 / 会话 7 / cookie 有** |
+| 收尾一条 | `[test] fay-lite 优雅停止（SIGTERM）退出码 0`（两组各带一次） |
+
+86.5s 这一发比 run #30 里 9b 那三组的 172~301s 快 —— 但这一轮 ollama 那条单队列上
+只有它自己（另外三组 9b 问答没跑），所以这是"没有排队"的数，不能记成"机器变快了"，
+也不作为对其它轮次的基线。它证明的是：**从外壳进去的那一问，能穿过后端→adapter→Fay→
+宿主机 Ollama 拿到真回复再回来**。外壳那 90s 的上限当时是**擦着过的**（86.5s / 90s），
+浏览器那 30s 从一开始就不够 —— 这就是超时链一节里"H5 一定先报错"的具体数字。
+（这句当时写成"90s 够用"，run #32 把它证伪了：同一条判据那一轮 90.4s 撞死，见下一节。）
+
+### run #32：麦克风这条链接进来之后的第一轮十三组（2026-09-21 22:53:21~23:27:13，33 分 52 秒）
+
+第一次把 `ws-relay-test` / `asr-test` / `asr-probe` 三组放进完整一轮。这一轮**没有**拿到
+`[test] 全部通过`：十三组里十组全绿，`fay-probe` 与 `frontend-probe` 各红一条，
+`probe-yueshen` 按环境就地收工（退出码 0，但只判了两条）。三条的成因是同一条，见本节第二段。
+
+| 组 | run #32 实测 |
+|---|---|
+| `backend-test` | **39 passed（3.41s）** |
+| `backend-probe` | **11 PASS / 0 SKIP / 0 FAIL** |
+| `adapter-test` | **11/11** |
+| `probe-selftest` | **[ws-timing] 10/10** |
+| `frontend-test` | **19/19**（17、18 两条是本轮为 WS 转发与 `DEBUG` 耦合补的，19 是负面自检） |
+| `ws-relay-test` | **14/14**（新组：外壳那条同源转发，含 3 条负面自检 A/B/C，见「426」那节） |
+| `asr-test` | **13/13**（新组：`ASR_FAKE_MODEL=1`，不加载 torch；12 条线上协议判据 + 1 条负面自检） |
+| `probe-fay-lite` | **41/43 通过 · 2 SKIP**（`window capture` + `远程音频的 ASR`，两条都是划出的边界） |
+| `ue-audit` | **2 PASS / 0 SKIP / 0 FAIL** |
+| `fay-probe` | **33/44 · 8 项按环境降级 SKIP · 1 FAIL**（红的是 `MCP 现场连接离线服务器 yueshen rag`） |
+| `probe-yueshen` | **只判了 2 条**：第 1 条 PASS，嵌入出口那条 240.1s 超时记降级 SKIP，后面 4 条没跑 |
+| `frontend-probe` | **2/3 · 1 FAIL**（那一问 90.4s 后拿到 502，`后端 POST /chat/sessions/11/messages 不可达：timed out`） |
+| `asr-probe` | **9/9**（新组，全套最末） |
+| 收尾一条 | `[test] fay-lite 优雅停止（SIGTERM）退出码 0：一次正常的 stop 没被记成崩溃` |
+
+三条红/收工共用一个成因，而且**在栈外**：这轮开跑前显存就被别的进程占掉了 13.2 GiB
+（`nvidia-smi` 里那台 `freetoken` 的 python，16376 MiB 总量下只剩约 1.2 GiB 给 ollama），
+于是 `ollama ps` 报的是 `qwen3.5:9b 6.1 GB 94%/6% CPU/GPU` —— **94% 的权重在 CPU 上**。
+宿主侧同时是 `available 6.0 GiB / swap 已用 18.7 GiB`、`si` 长期十万量级。后果按链长度依次是：
+9b 问答从 60s 起（run #27 那轮 GPU 满驻留时是 6.3s）、嵌入模型换入 240s 不返回、
+`frontend-probe` 那一问在 90s 处超时。`check_llm_host()` 据此置了 `DEGRADED_LLM_HOST`，
+所以那 8 条问答类判据是**按环境降级**而不是硬判红 —— 这正是这套三态设计要挡住的事：
+把"这台机器今天没显存"写成"这条链坏了"。
+
+**两条红里只有一条在隔离重跑里翻绿了**（23:31 起只跑 `fay-probe probe-yueshen`，同一台机器、同一批镜像、
+显存占用没变）：`fay-probe` 那组重跑是 **41/45 通过 · 2 项降级 SKIP · 2 项边界 SKIP · 0 FAIL**，
+其中 run #32 里红的那条 `MCP 现场连接离线服务器 yueshen rag` 直接 PASS（"连上并取到 3 个工具，
+验完断开"），`WS :10002 收到文字播报` 走到了 120s 排空重问那条分支 ——
+第 1 发正文为空、第 2 发（换用户名）拿到 70 字，判据按第 2 发计；`HTTP 取到 audio 帧指向的音频文件`
+也从降级里回来（`http://fay:5000/audio/sample-….wav` 362014 字节）。
+同一轮里 `本地 LLM 主机就绪` 那条直连测到的是 **61.3s 且"模型未常驻(首次请求要先换入)"** ——
+run #27 那个 6.3s 的数要 GPU 满驻留才拿得到，两者差的那十倍就是本节上一段说的显存被占。
+底数从 44 变 45 也不是漂移：重问分支一旦触发，那次重问自己会多记一条同名判据。
+
+`frontend-probe` 那条重跑**复现了**（23:51 单跑，仍是 `90.3s → 502`，msg 一字不差是
+`后端 POST /chat/sessions/12/messages 不可达：timed out`），于是它不该被记成排队抖动：
+这是**超时链的最短那一环**在起作用。外壳给后端的预算是 `CARECHO_UPSTREAM_TIMEOUT`（默认 90s），
+9b 不驻显存时这一发要 172~301s（run #30 量过），所以 90s 处必然 502 ——
+把它调到 300s 也只是把错误往后挪，因为**浏览器侧 axios 那 30s 是伙伴方代码里写死的**
+（`request.js:6`）。也就是说这条链的真实边界是：`9b 答得比 30s 慢，H5 就已经放弃了`。
+所以 run #32 的两条红一条是排队（重跑即绿，但没写进白名单：完整一轮里它就是红，
+`./run.sh test` 的退出码就是 1），一条是**结构**（重跑仍红，改判据不如改部署前提：
+要么让 9b 常驻显存，要么把语音/问答放到显存充裕的机器上）。
+
+同一轮里 `probe-yueshen` 补跑回 **6/6**，代价的对比很干净：嵌入出口那一发 **57.0s**
+（run #30 那轮它是几秒），576 块语料 ingest **74.8s**（run #30 记的是 **5.1s**），
+检索 3 条命中 251 字、`vectors=576` 与 `inserted` 对上。同一条链、同一个模型、同一批镜像，
+差的只有"嵌模型今天有没有坐在显存里"—— 这就是为什么这组的预检只给自己找降级、
+不给后面的判据找通过的理由。
+
+`probe-yueshen` 那条"只判了 2 条"顺带暴露了一个观测漏洞：嵌入出口不通时它 `return fail_count()`
+= 0，退出码绿、收尾那行 tally 却整个没打，日志看上去像"这组跑完了"。已补一行收工说明
+（判了几条、后面几条为什么测不了），并把 `远程音频的 ASR` 那条 SKIP 的理由改了 ——
+它原文写"本机没有起 FunASR 服务"，而这一轮之后 `dh-funasr` 就在栈里跑着，那句话变成假的；
+现在它点名的是真正的边界：10197 上那是 Fay 自己的另一套方言（裸文本 + `{"vad_need":…}`），
+与本栈为 H5 起的 `{"text","is_final"}` 未接。
+
+`asr-probe` 那 9/9 里有两个数值得单独记：15.26s 的真实语音（`course_package_player_intro_abin_final.wav`，
+edge_tts 产出的）只认出 **0.5 字/秒**，而 2.64s 的合成句是 3.4 字/秒 —— 前者 final 是
+`飞。Ai.Ai.Ai.飞。飞。Z.Hip h.Ttp.Api.现在。Exceed.Mcp.拍上来。Cp.`。这不是判据松（那条判的是
+"字数与时长同量级 0.5~15 字/秒"），是 `CHUNK_BYTES=32000` 每次一发无上下文的 `generate` 的代价，
+详见「一个必须写下来的质量边界」。同一条链路的耗时构成也在这一组里第一次量到：
+15.9s 推流 + 0.5s 收尾 → 全组约 32s。
+
+本轮收尾又跑了几件，都归到上面那条成因里、不另开编号（23:52~00:06）：
+`./run.sh audit` 报四个上游仓库仍 `0/0` 且 `0 dirty`（containerd 侧 11 份补丁、13 个测试件、
+3 份自研 python 源文件）；`./run.sh smoke` **仍红在第 6 步**，前 5 步全过 ——
+`500.46s` 拿到 `HTTP 502: 等待 Fay 回答超时（500s，用户名 elder_1）`。它开跑那行自报的是
+`qwen3.5:9b 驻留显存 6%（387/6149MB）`，而等它收工再 `ollama ps`，9b 已经**根本不在清单里**
+（只剩嵌模型 `45%/55%`）：这发的失败连"换入"都没在 500s 内完成，与 `frontend-probe`
+撞的 90s 是同一件事的两个长度 —— 一个是外壳替浏览器做的决定，一个是 adapter 替后端做的决定。
+麦克风那三组在按上节那条把 `funasr-cache` 卷删了重建之后重跑是 **14/14 · 13/13 · 9/9**、
+`ASR READY secs=17.8 src=local bytes=1299078750`，与卷建好那次的 19.7s 同量级：
+这卷是**缓存不是状态**，删了重拷不影响任何判据，也因此才敢为消那行警告删它。
 
 
 ### 「Fay 会调工具」这句话，探针只敢证到中间那一档
@@ -1348,6 +1686,281 @@ yueshen 层用，成熟镜像维持不带。另一个坑：同一 Dockerfile 并
 > 注：`kb-embedding-test` 等是本地专属分支、未推送上游；其唯一副本随本次删除而移除，
 > 属用户在"确认无需回滚"前提下的知情决定。
 
+## CareEcho H5 前端（伙伴方的第四个仓库）
+
+`https://gitee.com/xie-zha-zha/carecho_final`，以 submodule 的形式落在
+`../frontend`（`4493fb9`「第3次提交」，master，`run.sh audit` 现在把它和另外三个仓库
+一起核：0 dirty、与 origin 不分叉）。仓库里是两个子项目：
+
+| 子项目 | 是什么 | 进不进容器 |
+|---|---|---|
+| `careecho-h5/` | Vue 3 + Vite 的 H5 业务前端（数字人 + 聊天面板 + 语音） | **进** —— 构建产物由本层的外壳发出去 |
+| `careecho-h5-wc/` | 微信小程序壳（WebView 容器，靠 `wxcmd` / `postMessage` 桥接原生能力） | **不进** —— 它只能在微信开发者工具里跑，上线还要 ICP 备案域名 + 业务域名白名单（见下「边界」） |
+
+### 集成形态：一个两阶段 Dockerfile + 一个 stdlib 外壳
+
+依旧**不改他们仓库里的任何文件**（他们的 `vite.config.js` / `package.json` /
+`src/**` 一个字节都不动）。落在 `containerd/` 的只有三份代码 + 一份 compose 服务：
+
+- `images/frontend.Dockerfile` —— 第一阶段 `node:22-alpine` 里 `npm ci`（registry 走
+  npmmirror）+ `npm run build`，产物固定是 `dist-h5/`（他们 `vite.config.js` 里的
+  `build.outDir`）；第二阶段 `python:3.12-slim` 只装 curl，把 `dist-h5` 拷成 `/app/dist`
+  并跑外壳。整镜像 132MB、产物 136KB（JS 122.4kB + CSS 11.6kB + `index.html` 1.8kB）。
+- `frontend/carecho_web.py` —— 本层自己写的**第二份**代码：纯 stdlib 的小服务器，
+  同源发静态产物 + 补一个 `/api/chat/send`。为什么要有它：`npm run build` 出来的东西
+  是**没有 Vite dev proxy 的**（proxy 只在 `server` 段生效），而他们的 axios
+  `baseURL` 默认 `/api`（`src/api/request.js:5`）—— 也就是说产物原样发出去，每一发
+  问答都会打到"发它的那个 origin"上，没人接。有了同源外壳，既不用改他们的代码，
+  也不用引 nginx、不用开 CORS。
+- `probes/frontend_test.py`（18 条契约判据 + 一条负面自检，合起来报 19/19）·
+  `probes/frontend_probe.py`（活体链路：真的穿过后端问一句）。
+
+compose 里的 `frontend` 是第 7 个常驻服务，默认只绑 `127.0.0.1:5173` —— 端口刻意
+跟他们 README 里 `npm run dev` 的默认值一致，伙伴方原来怎么描述这个地址，现在还怎么描述。
+
+### 先看明白他们真正调用的是什么，再决定外壳实现什么
+
+`src/api/` 摊开了六个模块、二十来个方法，但**产物里真正活着的一次 HTTP 调用只有一个**
+（对 `src/*.vue`、`src/components/*.vue` 逐个 grep 出来的，不是推测）：
+
+- `App.vue:100` → `chatAPI.sendMessage` → **`POST /api/chat/send {content, scene}`**。
+  外壳就实现这一条。
+- `chat.js` 里另外的 `createSession` / `getSessionList` / `getHistory` / `controlDigitalHuman`
+  / `deptChat` 和 `appointment.js` 的全部 11 个方法，**没有任何组件调用** —— 是留给
+  "预约挂号"那条还没接的业务的。外壳对未知 `/api/*` 回 501 并在 `msg` 里点名路径，
+  而不是假装成功。
+- `fay.js` 的 `FayClient` 只被 `import`（`App.vue:48`），从未 `new` —— 死导入。所以
+  前端**并不直连 `:10002`**，问答走上面那条 HTTP。
+- `funasr.js` 是活的（点麦克风按钮才 `connect()`），目标 `ws://<host>/funasr-ws`。
+  外壳**做**这一条 WS 转发：按常量表精确匹配路径，把升级请求原样隧道到 `dh-funasr:10095`
+  （实现与判据见「FunASR：麦克风这条链」）。表外的路径一律不碰网络，`/fay-ws` 故意留在
+  表外 —— `FayClient` 是死导入，而且那是另一条没接的协议。
+
+### 身份得由外壳铸：他们前端里没有"登录"这一步
+
+`request.js` 的拦截器会带上 `Bearer localStorage.careecho_token`，但**整个前端没有任何
+一处写入过 `careecho_token`** —— 没有登录调用。也就是说：identity 必须在服务端补出来，
+否则后端拿到的每个请求都是匿名的。外壳的做法：
+
+1. 第一次见到某个客户端就铸一个 32 hex 的设备号，用 `Set-Cookie:
+   carecho_device=…; HttpOnly; SameSite=Lax` 发下去；
+2. 拿 `openid = h5_<设备号>` 打后端 `POST /auth/dev-login` 换 JWT
+   （后端 `DEBUG=true` 才有这个口，生产得换真的 OAuth —— 见「边界」）；
+3. `POST /chat/sessions` 建会话，`POST /chat/sessions/{id}/messages` 发这一问；
+4. 同一个 cookie 的后续问题复用同一会话（判据 8）—— 否则每问一段新历史，
+   数字人永远记不住上一句。
+
+后端 `JWT_EXPIRE_MINUTES=720`（12 小时）短于一个长命的外壳进程，所以 401 不是错误而是
+例程：**撞到 401 就丢掉缓存的 token 重登、重建会话、把这问重发一次**（判据 15）。
+这条最初是真 bug —— `_api()` 收了 `extra` 却没往 `_send()` 传，`Set-Cookie` 被静默丢掉，
+于是每一发都是新设备、新会话。判据 7/8 现在钉的就是它，负面自检改坏 cookie 名字之后
+判据 8 确实变红（run #31 里 17/17 + 自检变红同时成立）。
+
+### 密钥不给全，产物里连 ID 都会消失（Vite 的 DCE，不是构建坏了）
+
+数字人形象是魔珐 Xmov SDK，三个 `VITE_XMOV_*`（APP_ID / APP_SECRET / GATEWAY）。
+最初给它们留空，结果构建产物里**连那个 APP_ID 的字符串都搜不到**，一度以为
+"Vite 不认 build arg"。逐条排掉三个假设（`docker run --entrypoint env` 证明 ARG/ENV
+确实进去了；干净小项目里复现证明 vite 6.4.3 的 `resolveConfig().env` 会读 `process.env`；
+不是 `.env.production` 抢占）之后，根因是 **rollup 的死代码消除**：
+`src/api/xmov.js:79` 是
+
+```js
+if (!XMOV_APP_ID || !XMOV_APP_SECRET) { reject(…); return }
+```
+
+两个常量在打包时是字面量，只要有一个为空，这个 `if` 恒真、后面整段（包括那两个
+字面量本身）被摇掉。实测对照：只给 ID → 产物 `index-C34WNEPg.js` **122.39kB、
+`grep -c "nebula-agent\|XMOV\|xingyun3d"` = 0**；两个都给 → `index-CkSrAofW.js`
+**126.77kB、哨兵字符串全在**。
+
+所以本仓库默认构建的是**不含密钥**的那一份（`ARG` 留空）：两个 GitHub 仓库都是公开的，
+把伙伴方的 SDK key 烤进镜像再推上去就是泄漏。要接数字人形象，得自己
+`--build-arg VITE_XMOV_APP_ID=… --build-arg VITE_XMOV_APP_SECRET=…` ——
+**并注意 BuildKit 会警告 `SecretsUsedInArgOrEnv`**：ARG 会留在客户端构建上下文和
+`docker history` 里，这种镜像不能推公开仓库（要推就先去掉那层，或改成 BuildKit secret）。
+
+### 外壳的判据：`probes/frontend_test.py`（不打 LLM，几十秒）
+
+和前一份自研代码同一套路（假上游在进程内、`check(ok,name,detail)`、负面自检）：
+在容器里起一个**假后端**，只实现 `auth/dev-login` / `chat/sessions` /
+`chat/sessions/{id}/messages` 三条真实形状的口（含"这个 token 是过期的"和"这轮没有
+回复"两种可控状态），把外壳当被测对象拉起来，19 条钉住：
+
+产物里确实是 CareEcho · 哈希 JS 200 且 `text/javascript` · 未知路径回退 `index.html`（SPA）·
+`/../etc/passwd` 这类穿越拿不到系统文件 · HTML 带 `no-cache` · 问答返回
+`{code:200,data:{session_id,reply,…}}` · 首发 HttpOnly 设备 cookie · 同 cookie 不新建会话 ·
+`content` 原样到后端且多带的 `scene` 不会 422（后端模型是宽松 schema）· 无 cookie 自成新设备 ·
+空 `content` → 400 且**不打**后端 · 后端不可达 → 502 且 `msg` 说清是连不上 ·
+后端没答 → 502 并把 `fay_error` 带进 `msg`（不让它静默成"数字人沉默"）· 未实现接口 → 501 点名路径 ·
+token 过期 → 自动重登换会话并答上 · 两设备并发各进各的会话不串线 ·
+`/funasr-ws` 不带升级头 → 400（**不掉进** SPA 回退，也不碰上游 —— 判据 3 已经证明任意
+未知路径都回 200 `index.html`，所以这条一旦失守，浏览器只会看到「握手失败 status=200」
+而日志里一个字节都没有）· 后端 `dev-login` 回 404（就是 `DEBUG=false` 那条路）→ 502 且
+`msg` 点名是哪个口 · 负面自检：把 `Set-Cookie` 里的名字改坏一个字母，判据 8 必须撑不住。
+
+`probes/frontend_probe.py` 则相反，它打的是**活栈**：真后端、真 adapter、真 Fay、
+宿主机 Ollama。三条就够 —— 外壳发得出产物、`/api/health` 通、那一问真的答上
+（run #31：86.5s、47 字）。连续性和降级路径不在这组里重复证明，它们已经钉死在上面
+那 19 条里，而那 19 条不依赖显存。
+
+## FunASR：麦克风这条链
+
+上一节成文时，外壳只发静态文件和 `/api`，那条链有个前提：**H5 的麦克风按钮是哑的**
+（现在不哑了，补的就是这一节）。
+`frontend/careecho-h5/src/api/funasr.js` 连的是**页面同源**的 `ws://<host>/funasr-ws`，
+而伙伴方那条路径能通只靠 `vite.config.js` 里的 dev proxy —— 我们发出去的是
+`npm run build` 的产物，prod 里没有 Vite，所以那个地址没人接。补这一跳需要三样东西：
+一个真在听的服务、外壳里一段 WS 转发、以及能证明这两件事的测试件。
+
+```mermaid
+sequenceDiagram
+  participant B as 浏览器（careecho-h5）
+  participant S as dh-frontend 外壳
+  participant A as dh-funasr :10095
+  B->>S: "GET /funasr-ws（Upgrade: websocket）"
+  S->>A: "同一条握手，Host 改成 funasr:10095"
+  A-->>S: "101 + Sec-WebSocket-Accept"
+  S-->>B: "原样透传（不解析帧）"
+  loop 每 4096 样点 = 8192 字节
+    B->>S: "二进制帧：无头 PCM int16 / 16k / 单声道"
+    S->>A: "同一帧，掩码位原样保留"
+    A-->>B: "每满 32000 字节（=1 秒）回一个 {\"text\": 从头到现在的累计, \"is_final\": false}"
+  end
+  B->>A: "{\"state\":\"StopTranscription}\"（经外壳）"
+  A-->>B: "恰有一个 final，哪怕整句是空串"
+```
+
+### 协议是照前端逐字段抄的，不是照那份镜像抄的
+
+`src/api/funasr.js` 与 `App.vue:138-148` 共同决定了四件事，改任何一件前端都会坏：
+
+- 入：二进制帧 = **无 WAV 头的 PCM**，int16 / 16kHz / 单声道；`ScriptProcessor(4096,1,1)`
+  所以每帧固定 8192 字节。
+- 控制帧只有一条：`{"state":"StopTranscription"}`。
+- 出：只有 JSON 文本帧 `{"text": str, "is_final": bool}`。
+- **`App.vue` 是每帧覆盖输入框、只在 `is_final` 收工** —— 所以服务端必须回**累计文本**
+  且**一定发一个 final**。这两条不是风格问题：回分片会让用户只看到最后半句，
+  没识别出字就不发帧的话录音按钮永远停不下来。
+
+### 与伙伴方那份 `server.py` 的四处差别
+
+机器上本来就有伙伴方在跑的 `careecho-integrated-dockerd-funasr:latest`（协议完全吻合），
+`docker history` 显示它**一个版本都没钉** —— 所以拿它当基线，但不拿它当决定。
+本层的 `asr/server.py`（第三份代码）改了四处会真咬人的实现：
+
+1. **推理不占事件循环**：原版每个 1 秒块直接 `model.generate(...)`（同步 CPU 推理），
+   单块一旦超过 1 秒，连 `ping_interval=10` 的心跳都发不出去，浏览器就把连接判死了。
+   现在走 `asyncio.to_thread`，另有 `FUNASR_MAX_INFLIGHT`（默认 2） semaphore 护内存。
+2. **回累计文本**（上面那条性质的直接实现），partial 与 final 都是"从第一个字到现在"。
+3. **final 必发且只发一个**，包括完全没识别出字的情况。
+4. **有边界**：单会话 `FUNASR_MAX_SECONDS`（默认 60s）超了强制收工 —— 音频是按秒计价的，
+   对外部输入不设上界等于把 CPU 交给一个按住麦克风不放的页面。
+
+版本钉死在 `overlay/funasr/requirements-docker.txt`：
+`funasr==1.3.14` `modelscope==1.38.1` `numpy==2.2.6` `torch==2.13.0+cpu`
+`torchaudio==2.11.0+cpu` `websockets==16.1`；三个模型（paraformer-zh / fsmn-vad / ct-punc-c）
+连 `REVISION=v2.0.4` 一起钉。`websockets` 14+ 的 handler 从 `(ws, path)` 变成 `(ws)`，
+所以 `handle(websocket, path=None)` 两头都吃。镜像 1.57 GB（build 阶段把
+`torch`/`torchaudio` 的 `--index-url` 单独分了一层，改代码不会击穿阿里云那层 pip 缓存）。
+
+### 就绪判据：那个 ready 文件必须写在 bind **之后**
+
+健康检查、`asr-test`、`asr-probe` 都拿 `/tmp/asr.ready` 当"可以打了"的唯一凭据。
+第一次实现时它写在模型加载完、`websockets.serve(...)` 之前 —— 假模型秒起，于是测试
+稳定连上一个还没人听的端口，`asr-test` 判据 1 就是这么红的。现在文件与 `ASR LISTEN`
+那行日志都在 `async with serve(...)` 里面。测试侧也自己把"端口真连得上"补上了
+（`wait_ready()` 除了看文件还拨一次 socket），不依赖被测实现的顺序。
+`start_period: 300s` / `retries: 60` 是为首次那 1.3GB 下载留的，缓存命中时是 19.7s：
+
+```
+ASR MODEL src=local cache=/models bytes=1299078750->1299078750 fake=False
+ASR READY secs=19.7 model=AutoModel chunk=32000B max=60s inflight=2
+ASR LISTEN ws://0.0.0.0:10095  入=PCM16/16k/mono  出={"text","is_final"}
+```
+
+`src=hub|local` 这个字段就是"这次到底下没下载"的判据（量的是 `MODELSCOPE_CACHE` 的字节差，
+不看目录名 —— paraformer-zh 是别名，缓存里落的是全名，按别名匹配必然假阴）。
+`./run.sh asr-seed` 只是本机便利：检测到别的 FunASR 缓存卷就 `cp -a` 过来，新克隆正常下载。
+它建卷时必须带上 compose 那两个 label（`com.docker.compose.project` + `.volume`）——
+不带就没有归属权，这个卷在 compose 眼里是"外人建的"，之后**每一条 `up`** 都要警告一句
+`already exists but was not created by Docker Compose`（实测 2026-09-21：asr-seed 首版就是这么建的，
+之后 test/up 全带这行噪音，`ps` 不带 —— 只有真需要建卷的命令才吭声）。
+而 label 只能在**建卷那一刻**给，`docker volume create` 对已存在的卷是**静默 no-op**
+（同一天实测：修完脚本重跑 asr-seed，Labels 仍为 null、警告照旧）。所以脚本遇到"卷在但没 label"
+只把删除重建那一行原样打出来，不代删 —— 那里面可能是别人下好的 1.3GB。
+
+### 为什么不走宿主 Ollama
+
+这是本栈第二处**不走** ollama 的 AI 依赖（第一处是浏览器里的 Xmov 云 TTS），
+理由不是偏好：ollama 的 `/api/chat` 只收 `text` + `images`，**没有音频输入口**，
+模型清单里也没有 paraformer。与其写一段"我们优先用本地"再悄悄绕过，不如把它写成一行事实。
+
+### 三组测试件，各测一段
+
+| 组 | 打谁 | 加载 torch？ | 判据 |
+|---|---|---|---|
+| `ws-relay-test` | 外壳的 WS 分派与隧道（假上游 + 手造掩码帧） | 不进 ASR 镜像 | 14 条，含 3 条负面自检 |
+| `asr-test` | `asr/server.py` 的协议（`ASR_FAKE_MODEL=1`，假 `generate`） | 不加载 | 13 条 |
+| `asr-probe` | 真模型 + 真音频 + 真推流节奏 | 加载（约 20s） | 9 条 |
+
+`asr-probe` 排在**全套最后**：它是这一轮唯一会真的把 torch 拉起来推理的组，
+而这台机器的 CPU 还要留给 ollama 那些不驻留显存的权重 —— 排序规则和 `fay-probe`
+那几组同理（见「实测通过的链路」里的排法）。它的音频不来自任何运行期产物，
+而来自仓库里那份 `fay/samples/course_package_player_intro_abin_final.wav`
+（15.26s，16kHz 单声道 16bit —— 正好是模型要的格式，所以只重采样不转码），
+理由是 `fay/main.py:181 __clear_samples()` 会在每次启动清空 `./samples`：
+那个卷是**临时目录，不是语料库**，拿它当测试输入会得到一跑就空。
+另有一层可选的"已知原文"验证（`to_sample` 合成一句我们知道的话再断言关键词命中），
+出网不通时只 SKIP 那半条。
+
+### 13 条判据全绿的那晚，手机仍一个字都识别不出来：426
+
+`ws-relay-test` 第一次跑就 13/13，可同一天从宿主经外壳打真链路是：
+
+```
+dev 直口    192.168.0.2:10095/ -> 101  final='飞。Ai.Ai.'  wall=1.5s
+经外壳转发  192.168.0.2:5173/funasr-ws -> HTTP/1.1 426 Upgrade Required
+```
+
+外壳自己没回这个 426（它的 `ws_dispatch` 只会回 400/404，拨号失败回 502）—— 它回的是**上游**的
+426：转发在建上游请求时把客户端的 `Upgrade` 透传了一份、又在末尾统一补了一份，上游收到两条
+`Upgrade`。拿同一份握手对真 ASR 直接试三种头组合：单条 `Upgrade` → 101，两条 → 426，
+两条 `Connection` → 仍然 101（`Server: Python/3.10 websockets/16.1`，实测 2026-09-21 22:44）。
+所以这不是"哪个上游更挑剔"的运气问题：`open_tunnel` 的剔除名单漏了一个名字。
+
+测试为什么没抓住更值得记：假上游用 `dict` 收请求头，同名头被折叠成一条，判据 5 于是永远看不见
+重复 —— **假上游比真上游宽松一寸，转发侧的 bug 就只在生产里露头**。三处一起改：
+
+- `frontend/carecho_web.py` 的剔除名单加 `"upgrade"`（客户端那条一律不进上游，由补回的那两条统一给）；
+- `probes/wsutil.py` 的 `server_handshake` 改成"照真上游的严度"：`Connection`/`Upgrade`/
+  `Sec-WebSocket-Key`/`Sec-WebSocket-Version` 任一重复就回 426 并记名（所以判据 4 会红，
+  detail 直接写"上游因为重复的请求头拒了握手"），头对象换成带 `.duplicates` 的 `RequestHeaders`
+  —— 观测能力没变窄，但重复这件事不再是不可见的；
+- 新增**负面自检 C**：把剔除名单里的 `"upgrade"` 删掉（即精确还原这次的 bug），判据必须变红。
+  改完 `ws-relay-test` 是 14/14，其中 `13 … 变红=True —— 上游因为重复的请求头拒了握手：['upgrade']`。
+
+修完再跑那次真链路，两个方向数字一致（外壳转发 wall=1.2s、直口 1.5s，同一条 final），
+这才是「生产里 H5 靠同源转发拿到识别」这句话的证据 —— 在此之前它只有假上游那一半。
+
+### 一个必须写下来的质量边界
+
+同一轮里两段的字数/时长比差了 6 倍：
+
+| 输入 | 结果 |
+|---|---|
+| 已知原文那句 2.64s | `'探针麦克。风链路自检。'`（3.4 字/秒，开头两字对上了） |
+| 仓库里那段 15.26s 真实语音 | `'飞。Ai.Ai.Ai.飞。飞。Z.Hip h.Ttp.Api.现在。Exceed.Mcp.拍上来。Cp.'`（0.5 字/秒） |
+
+短那句近乎全对、长那句近乎不可读 —— 差别不在容器，在**切块形状**：
+`CHUNK_BYTES=32000` 意味着每 1 秒音频做一次**互相没有上下文**的 `generate`，
+15 次拼接当然会碎。伙伴方那份 `server.py` 本来就是这个形状（前端也只把文本当输入框的回显），
+所以这不是"我们把它做坏了"，但也不是可以装作没有的缺陷：**要长句质量好，得换成流式
+（`AutoModel` 的 chunk 模式带 `cache`）或攒够一句再判**，那是协议层面的改动，
+会牵动"partial 什么时候出"这条前端可见的行为，本轮没做（见「未覆盖能力」）。
+判据 9 因此只卡一个很宽的量级区间（0.5~15 字/秒），它管的是"别在静音上编字、别把话吞掉"，
+不管识别准确率 —— 准确率不是这个容器能承诺的东西。
+
 ## UE 仓库的容器侧处置
 
 `ue/` 不进 compose，但理由不能靠印象 —— `./run.sh test` 里那个只读挂载的 `ue-audit`
@@ -1424,6 +2037,20 @@ UE 自己按 BOM 定字符集，读得懂，所以判据必须先认 BOM。实�
   两个补丁见上面「远程音频输入：无声卡也能测」。
   与输出侧正好相反：输入是**服务端自己**决定采不采集（麦克风）或**服务端收字节**（10001）；
   输出是**客户端声明** `Output:true` 就有的（见下一条）。
+- **Fay 自己那条 ASR 方言（10095 之外的 10197）没接，这是选择不是遗漏。**
+  `overlay/fay/system.conf` 里 `local_asr_ip/local_asr_port` 指的是
+  `host.docker.internal:10197`，那套协议是「裸文本回复 + `{"vad_need":…}`」，
+  与 H5 要的 `{"text","is_final"}` 不兼容 —— 所以 `dh-funasr` 只服务前端那一跳。
+  把 `fay_probe.py` 里 `远程音频的 ASR 认出了文字` 那条 SKIP 翻成 PASS 只差约 20 行
+  （同一个 `asr/server.py` 再监听一个口、按那条方言回，并把 `config.json` 的麦克风打开），
+  但它会改动 `dh-fay` 的运行期行为，代价是全部 Fay 那几组的稳定性，本轮明确不做。
+- **H5 麦克风在局域网 http 下必失败**：`getUserMedia` 只在 https 或 localhost 算安全上下文，
+  所以 `./run.sh dev` 之后从手机用 `http://<LAN IP>:5173` 打开页面，语音那颗按钮点不动是
+  浏览器的规则。链路与判据本身都在（见「FunASR：麦克风这条链」），差的是证书。
+- **长句识别质量没有承诺**：`CHUNK_BYTES=32000` 是每 1 秒一次互相没有上下文的 `generate`，
+  实测 2.64s 的短句近乎全对、15.26s 的真实语音近乎不可读（数字与原因在那一节里）。
+  要长句质量得换成带 `cache` 的流式识别或攒句再判，那会改动"partial 什么时候出"这条
+  前端可见的行为，属于协议层改动。
 - **语音输出**：**合成与推送都已实测通过**（此前这里写的是"TTS 尚未实测"，探针
   把它否证了）。链路上有三段：`tts/ms_tts_sdk.py` 的 `edge_tts` 真的能出网合成
   188KB wav；`core/fay_core.py:2212` 只要看到该用户名有 `Output:true` 的 WS 连接就
@@ -1490,5 +2117,23 @@ Docker MySQL + Redis 运行，数据库 `care_echo_rehab` 已创建」—— 也
 （被 `containerd/.gitignore` 排除）。两份的键名有重叠
 （`MYSQL_*` / `JWT_*` / `REDIS_*`）但值互不相同，且那份还带着 `WECHAT_APP_SECRET` 等第三方
 凭据 —— 本栈既不读它、也不把它复制进任何镜像层或 `.env`；**没删它**，那属于上游作者的本地文件。
-四个上游仓库的容器化覆盖情况：`fay/`、`origin_fay/`、`service/`（+ 新增的 `adapter/`）
+四个上游仓库的容器化覆盖情况：`fay/`、`service/`（+ 新增的 `adapter/`）、`frontend/`
 进 compose 并被测试件覆盖，`ue/` 的边界与判据见上面「UE 仓库的容器侧处置」。
+
+还有一处端口撞车值得记下来：dev 档位给 Fay 音频桥选的宿主端口是 **10199 而不是 9001**，
+因为这台机器的 9001 已经被别人的 nextcloud 占着。本栈不复用、也不重启宿主上任何
+既有容器 —— 需要端口时让 `FAY_BRIDGE_PORT` 可以让它落在别处。
+
+### ⚠️ 宿主机遗留：git 的 insteadOf 里躺着明文 token
+
+这一条不属于本栈，但会影响每一个照本 README 操作的人，所以记在这里而不是塞进根 README 的门面：
+
+本机 `~/.gitconfig` 里有一条全局改写
+`url."https://<用户>:gho_…@github.com/".insteadOf = "https://github.com/"`，
+把 `gh auth` 的 OAuth token 以明文写死，并让**所有** GitHub remote 在 `git remote -v`
+里显示成带 token 的形式 —— 包括 `fay/` 里那个 `upstream` remote。实际上四个上游仓库各自的
+`.git/config` 存的都是干净 URL，token 只在克隆/拉取时由这条改写注入。
+
+建议的处理：删掉这条 insteadOf，改用已装好的 `git credential helper`（`gh auth git-credential`）；
+主机若共享，还应**轮换该 token**，因为删配置不会让它从未出现在进程列表和 `git remote -v` 的历史里。
+这是宿主机全局 git 配置，本仓库不代为修改，也不把它当成集成问题来"修"。
