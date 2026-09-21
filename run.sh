@@ -2,13 +2,15 @@
 # DigitalHuman 容器集成入口。所有命令都在 containerd/ 下执行（脚本自动切换）。
 #   ./run.sh up        生成 .env（若缺）→ 构建 → 起全栈
 #   ./run.sh test      跑全套功能测试：service pytest + 后端活体探针 + adapter 契约测试
-#                      + 探针时机自测 + 三个 Fay 实例的契约探针 + ue 体检
+#                      + 探针时机自测 + 两个 Fay 实例的契约探针 + ue 体检
 #   ./run.sh test <组>  只跑指定测试件（backend-test / backend-probe / adapter-test /
-#                      probe-selftest / probe-fay-lite / fay-probe / probe-origin-fay /
-#                      ue-audit / probe-yueshen），改探针时不用等全套十几分钟
+#                      probe-selftest / probe-fay-lite / fay-probe / ue-audit /
+#                      probe-yueshen），改探针时不用等全套十几分钟
 #   ./run.sh build     只构建镜像
 #   ./run.sh smoke     打通链路冒烟测试：后端 → adapter → Fay → Ollama → 回库
-#   ./run.sh audit     核账：四个上游仓库必须零改动、与上游不分叉，并列出 containerd 侧全部产物
+#   ./run.sh audit     核账：fay/service/ue 三个仓库必须零改动、与上游不分叉，并列出 containerd 侧产物
+#   ./run.sh upstream  跟上上游：fetch xszyou/Fay，报 fork 落后/领先几条，
+#                      并把 containerd/patches/fay/*.patch 逐个 dry-run 预检一遍
 #   ./run.sh logs [s]  看日志（s 可为 fay/backend/adapter/mysql/redis）
 #   ./run.sh ps|down|reset
 set -euo pipefail
@@ -20,19 +22,6 @@ ensure_env() {
   if [ -f .env ]; then return; fi
   # 随机 DB 密码与 JWT 密钥的生成逻辑收敛到 tools/gen_keys.py（单一来源）
   python3 tools/gen_keys.py
-}
-
-ensure_origin_fay() {
-  # ../origin_fay 不是第 5 个仓库，而是 ../fay 里 `upstream` remote 的 git worktree，
-  # 所以它不在根仓库里（既没被 submodule 记录，也被 .gitignore 排除），新 clone 拿不到。
-  # 缺就在这里按固定路径补出来 —— 否则 origin-fay 要一路到 Dockerfile 的 COPY 那步
-  # 才报一个看不出原因的错。
-  [ -e ../origin_fay/.git ] && return
-  echo "[run] ../origin_fay 缺失：从 fay 的 upstream remote 建 worktree"
-  git -C ../fay fetch --quiet upstream || {
-    echo "[run] 拉不到 upstream（xszyou/Fay），origin-fay 起不来" >&2; return 1; }
-  git -C ../fay worktree add ../origin_fay upstream-main 2>/dev/null \
-    || git -C ../fay worktree add -b upstream-main ../origin_fay upstream/main
 }
 
 wait_http() { # wait_http <url> <deadline_sec> <name>
@@ -106,13 +95,15 @@ smoke() {
   # 自己有本地磁盘，容器把那块磁盘换成了具名卷。卷漏挂或名字写错时数据落进容器的可写层，
   # restart 后照样读得到（还是同一个容器），但 `up -d` 重建实例就全丢 —— 所以既看
   # Mounts 的结构，也真的 restart 一次把同一条行读回来。
-  # 挑 origin-fay 下手：没有任何服务 depends_on 它，重启不打扰后端那条链。
+  # 挑 fay 下手：产品真正服务的就是它，而且第 6 步紧接着走后端→adapter→fay→ollama，
+  # 重启完接不回来当场就红。原先这步用 origin-fay 参照实例（没人 depends_on 它），
+  # 那个实例已随「fork 是上游直接后代、代码逐字节相同」撤掉了。
   local cid mounts marker="smoke-persist-$$"
-  cid=$($COMPOSE ps -q origin-fay)
-  [ -n "$cid" ] || { echo "[smoke] origin-fay 没在跑，持久化这一步无从判起" >&2; return 1; }
+  cid=$($COMPOSE ps -q fay)
+  [ -n "$cid" ] || { echo "[smoke] fay 没在跑，持久化这一步无从判起" >&2; return 1; }
   mounts=$(docker inspect --format '{{range .Mounts}}{{.Type}}:{{.Destination}} {{end}}' "$cid")
   case "$mounts" in
-    *volume:/app/memory*) echo "  结构：origin-fay 的 /app/memory 是具名卷" ;;
+    *volume:/app/memory*) echo "  结构：fay 的 /app/memory 是具名卷" ;;
     *) echo "[smoke] 结构：/app/memory 不是具名卷（mounts: $mounts）" >&2; return 1 ;;
   esac
   # /api/send 会把这一行立刻写进记忆库（实测 type='member'，不等模型回话），
@@ -144,10 +135,10 @@ raise SystemExit("restart 之后读不到那一行：/app/memory 没有真正持
 '
   printf '%s' "$persist_py" | docker exec -i "$cid" python - write "$marker" \
     || { echo "[smoke] 持久化：写入侧失败" >&2; return 1; }
-  echo "[smoke]     restart origin-fay（宿主被压满时 :8765 可能要两分钟才回来，这里只等 :5000）"
-  $COMPOSE restart origin-fay >/dev/null \
-    || { echo "[smoke] restart origin-fay 失败" >&2; return 1; }
-  wait_http "http://127.0.0.1:${ORIGIN_FAY_HTTP_PORT:-5100}/api/get-system-status" 240 "origin-fay 重启后" \
+  echo "[smoke]     restart fay（宿主被压满时 :8765 可能要两分钟才回来，这里只等 :5000）"
+  $COMPOSE restart fay >/dev/null \
+    || { echo "[smoke] restart fay 失败" >&2; return 1; }
+  wait_http "http://127.0.0.1:${FAY_HTTP_PORT:-5000}/api/get-system-status" 240 "fay 重启后" \
     || return 1
   printf '%s' "$persist_py" | docker exec -i "$cid" python - verify "$marker" \
     || { echo "[smoke] 持久化：重启后读不回来，卷没挂对" >&2; return 1; }
@@ -182,7 +173,6 @@ sys.exit(0 if d.get("fay_forwarded") and (am.get("content") or "").strip() else 
 case "${1:-up}" in
   up)
     ensure_env
-    ensure_origin_fay
     $COMPOSE build
     $COMPOSE up -d
     shift 2>/dev/null || true
@@ -191,14 +181,12 @@ case "${1:-up}" in
     wait_http "http://127.0.0.1:${ADAPTER_PORT:-8010}/healthz" 180 "adapter"
     echo
     echo "Fay Web 管理台    : http://127.0.0.1:${FAY_HTTP_PORT:-5000}/"
-    echo "上游 Fay (v4.8.1) : http://127.0.0.1:${ORIGIN_FAY_HTTP_PORT:-5100}/"
     echo "后端接口文档      : http://127.0.0.1:${BACKEND_PORT:-8000}/docs"
     echo "数字人 WS         : ws://127.0.0.1:${FAY_HUMAN_WS_PORT:-10002}"
     echo "跑 ./run.sh smoke 做端到端验证；./run.sh test 跑全套功能测试"
     ;;
   test)
     ensure_env
-    ensure_origin_fay
     shift 2>/dev/null || true
     # 只在「构建输入比镜像新」时重建对应服务。两个方向都咬过人：
     #  - `up -d` 只认镜像存不存在，不认镜像是不是比补丁新。改完 patches/ 或
@@ -210,10 +198,9 @@ case "${1:-up}" in
     # 建失败立刻停在这里，绝不拿旧镜像继续测（补丁贴不上去时 patch 非零退出 -> build 失败）。
     stale=""
     before=""
-    for svc in fay origin-fay backend yueshen-rag; do
+    for svc in fay backend yueshen-rag; do
       case "$svc" in
         fay)        src="images/fay.Dockerfile patches/fay overlay/fay" ;;
-        origin-fay) src="images/fay.Dockerfile patches/fay overlay/origin_fay" ;;
         backend)    src="images/service.Dockerfile patches/service overlay/service" ;;
         yueshen-rag) src="images/yueshen_rag.Dockerfile patches/yueshen_rag overlay/yueshen_rag" ;;
       esac
@@ -266,11 +253,11 @@ case "${1:-up}" in
     # 依赖必须先就绪：探针要打 Fay 的 HTTP/WS，pytest 要打 MySQL 里的 schema，
     # backend-probe 打的是正在应答 HTTP 的那个 backend 进程（depends_on 会把
     # adapter 一起带起来，--wait 会等 backend 自己的健康检查过）。
-    $COMPOSE up -d --wait mysql redis fay origin-fay backend 2>&1 | tail -3
+    $COMPOSE up -d --wait mysql redis fay backend 2>&1 | tail -3
     # fay-lite 是 test profile 里的轻模型实例（qwen2.5:1.5b），只有它能在被其他
     # 服务占满显存的机器上秒级答完，用来判定「问答链路是否真的通」。
     $COMPOSE --profile test up -d --wait fay-lite 2>&1 | tail -3
-    ALL_GROUPS="backend-test backend-probe adapter-test probe-selftest fay-probe probe-origin-fay probe-fay-lite ue-audit probe-yueshen"
+    ALL_GROUPS="backend-test backend-probe adapter-test probe-selftest fay-probe probe-fay-lite ue-audit probe-yueshen"
     # 允许 ./run.sh test fay-probe 只跑一组：改探针时不必再等 20 分钟全套。
     # 变量名不能叫 GROUPS —— bash 的内置只读数组（当前用户的 gid），赋值会被吞掉。
     # 默认顺序把 probe-fay-lite 排在两个 9b 实例之前：ollama 是单条队列，
@@ -290,7 +277,7 @@ case "${1:-up}" in
     # 放在三组问答之前，等于我们自己制造一次模型换出、把问答判据挤成超时（那红的是
     # 排队，不是被测对象）。它自己第一发就是奔着「量嵌入出口 + 顺手把模型预热进显存」
     # 去的，所以这条链路的耗时证据仍然取得到。
-    DEFAULT_GROUPS="backend-test backend-probe adapter-test probe-selftest probe-fay-lite ue-audit fay-probe probe-origin-fay probe-yueshen"
+    DEFAULT_GROUPS="backend-test backend-probe adapter-test probe-selftest probe-fay-lite ue-audit fay-probe probe-yueshen"
     TEST_GROUPS="$*"
     [ -n "$TEST_GROUPS" ] || TEST_GROUPS="$DEFAULT_GROUPS"
     for g in $TEST_GROUPS; do
@@ -314,7 +301,7 @@ case "${1:-up}" in
     # 又是每个线程各排 2 秒的 join —— 两个卡在 recv 上的 __connect 就能把预算吃光，
     # 走进 os._exit(1)。于是一次完全正常的 docker stop 被容器运行时记成崩溃退出，
     # restart: on-failure 下还会把本该停掉的实例重新拉起来。实测（2026-09-20，
-    # 未打补丁的镜像）：fay-lite 5.27s/exit=1、origin-fay 5.45s/exit=1。
+    # 未打补丁的镜像）：fay-lite 5.27s/exit=1、当时的 origin-fay 参照实例 5.45s/exit=1。
     # 只在「这一刻它真的在跑」时才判：单独跑某一组时 lite 可能压根没起来，那时
     # inspect 读到的是上次停止留下的旧退出码，拿它判等于伪造证据。
     lite_cid=$($COMPOSE --profile test ps -q fay-lite 2>/dev/null || true)
@@ -339,13 +326,11 @@ case "${1:-up}" in
     shift
     rc=0
     # 表头用 ASCII：printf %-Ns 数的是字节，中文列头会把对齐整个搞坏
-    # 列宽按实际值放过：origin_fay 的分支是 upstream-main、上游是 upstream/main，
-    # 各比原来的 6/20 宽，窄一格整张表就错位。
     printf '%-11s %-14s %-22s %-11s %s\n' REPO BRANCH UPSTREAM AHEAD/BEHIND WORKTREE
-    for r in fay origin_fay service ue; do
+    for r in fay service ue; do
       d="../$r"
-      # -e 而不是 -d：origin_fay 现在是 ../fay 里 upstream remote 的 git worktree，
-      # 它的 .git 是一个指回 ../fay/.git/worktrees/ 的文件，不是目录。
+      # -e 而不是 -d：../fay 作为 submodule，它的 .git 是一个指回
+      # ../.git/modules/fay 的文件而不是目录；写成 -d 会把它误判成"不是仓库"。
       [ -e "$d/.git" ] || { echo "$r 不是 git 仓库" >&2; rc=1; continue; }
       branch=$(git -C "$d" rev-parse --abbrev-ref HEAD)
       up=$(git -C "$d" rev-parse --abbrev-ref '@{u}' 2>/dev/null || echo NO-UPSTREAM)
@@ -365,14 +350,58 @@ case "${1:-up}" in
     # tools/ 也是"不改上游、全在 containerd 侧"的一部分（跑 pytest 前重建测试库那个脚本），
     # 漏在这一行外面就等于 audit 少报一样东西。目录不存在时find 会报错，所以带 2>/dev/null。
     echo "  tools/    $(find tools -type f 2>/dev/null | wc -l) 个 containerd 自带工具：$(find tools -type f -printf '%P ' 2>/dev/null || echo 无)"
-    [ $rc -eq 0 ] && echo "[audit] 上游四个仓库干净" || echo "[audit] 有仓库不干净或与上游分叉" >&2
+    [ $rc -eq 0 ] && echo "[audit] 上游三个仓库干净" || echo "[audit] 有仓库不干净或与上游分叉" >&2
     exit $rc
     ;;
-  build)   ensure_env; ensure_origin_fay; $COMPOSE build ;;
+  upstream)
+    # fork（chuan918/Fay）里配了 `upstream` = xszyou/Fay，合并上游前真正想知道的是
+    # 「上游这几条会不会把 containerd/patches/fay 那几份补丁顶掉」—— 补丁是按字节贴的，
+    # 上游一动被贴的那个文件，要等构建才炸。这里提前把每份补丁对 upstream/main 干跑一遍。
+    # 不为它建 worktree（314MB 全量 checkout 换个只读判断不值），改成按补丁头把目标文件
+    # 单独取出来摆一棵小树，patch -p1 --dry-run 只看这些文件，效果一样。
+    shift
+    here=$PWD
+    [ -n "$(git -C ../fay remote get-url upstream 2>/dev/null)" ] \
+      || { echo "[upstream] ../fay 里没有 upstream remote：git -C ../fay remote add upstream https://github.com/xszyou/Fay.git" >&2; exit 1; }
+    git -C ../fay fetch --quiet upstream \
+      || { echo "[upstream] 拉不到 upstream（xszyou/Fay）" >&2; exit 1; }
+    echo "fork   origin/main  = $(git -C ../fay rev-parse --short origin/main)"
+    echo "上游   upstream/main = $(git -C ../fay rev-parse --short upstream/main)"
+    behind=$(git -C ../fay rev-list --count origin/main..upstream/main)
+    ahead=$(git -C ../fay rev-list --count upstream/main..origin/main)
+    echo "落后 $behind 条 / 领先 $ahead 条"
+    [ "$behind" = 0 ] && { echo "[upstream] 没有要合的"; exit 0; }
+    git -C ../fay log --oneline origin/main..upstream/main | sed 's/^/  待合 /'
+    tmp=$(mktemp -d); trap 'rm -rf "$tmp"' EXIT
+    rc=0
+    for p in "$here"/patches/fay/*.patch; do
+      for f in $(grep -oE '^\+\+\+ b/[^[:space:]]+' "$p" | sed 's|^+++ b/||'); do
+        mkdir -p "$tmp/$(dirname "$f")"
+        git -C ../fay show "upstream/main:$f" > "$tmp/$f" 2>/dev/null || : > "$tmp/$f"
+      done
+      # --fuzz=0：容差不算数。合并后要的是「一字不差还能贴」，能靠 fuzz 糊过去的
+      # 补丁在真实合并里通常已经贴错位置了。
+      if (cd "$tmp" && patch -p1 --dry-run --silent --fuzz=0 < "$p") >/dev/null 2>&1; then
+        echo "  可贴    $(basename "$p")"
+      else
+        echo "  贴不上  $(basename "$p") ← 合并之后这份要照新字节重做" >&2; rc=1
+      fi
+      rm -rf "$tmp"/*
+    done
+    if [ $rc -eq 0 ]; then
+      # 用单引号：这行里的命令名写在双引号里会被当命令替换执行掉 —— 实测把
+      # upstream/main 直接 merge 进了 fay 的 main，靠 reflog 才复位。
+      echo '[upstream] 补丁全部还能贴，git -C ../fay merge upstream/main 之后 ./run.sh build 即可'
+    else
+      echo "[upstream] 有补丁贴不上：先合再按 containerd/README「补丁为什么贴不上：源文件是 CRLF」那节重做" >&2
+    fi
+    exit $rc
+    ;;
+  build)   ensure_env; $COMPOSE build ;;
   smoke)   shift; smoke ;;
   ps)      shift; $COMPOSE ps ;;
   logs)    shift; $COMPOSE logs -f --tail=120 ${1:-} ;;
   down)    shift; $COMPOSE down ${1:-} ;;
   reset)   shift; echo "[run] 将删除全部卷（DB/记忆/日志），5 秒内 Ctrl-C 取消"; sleep 5; $COMPOSE down -v ${1:-} ;;
-  *)       echo "用法: $0 {up|build|test|smoke|audit|ps|logs [svc]|down|reset}" >&2; exit 1 ;;
+  *)       echo "用法: $0 {up|build|test|smoke|audit|upstream|ps|logs [svc]|down|reset}" >&2; exit 1 ;;
 esac

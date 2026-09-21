@@ -30,26 +30,23 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /app
 
-# 同一份 Dockerfile 构建两个 Fay 实例：fay（fork，chuan918/Fay）与 origin_fay（上游 v4.8.1）。
-# 只有源码目录按 FAY_SRC 换；补丁与依赖清单两份共用，因为 fork 是上游的直接后代、
-# Python 源码逐字节相同（fork 只多了 .gitignore / config.json / explain.md）。
-# 哪天 fork 又改代码，把这两个 ARG 指回各自的目录即可（overlay/<src>/、patches/<src>/）。
-ARG FAY_SRC=fay
-ARG PATCH_DIR=containerd/patches/fay
-ARG REQS_DIR=containerd/overlay/fay
+# 源码就是 ../fay 那一份（chuan918/Fay，上游 v4.8.1 的直接后代）。
+# 曾经还有第二份「上游直出」参照实例（origin_fay，靠 FAY_SRC/PATCH_DIR 换目录），
+# fork 与上游的 Python 源码已逐字节相同、对照只剩 config 差别，那个实例已撤掉，
+# 三个 ARG 一起删了。想再看上游原样跑一遍：`git -C ../fay worktree add ../origin_fay upstream/main`。
 
 # 依赖清单单独先拷，保证改业务代码不会击穿 pip 层缓存。
-COPY ${REQS_DIR}/requirements-docker.txt /tmp/requirements-docker.txt
+COPY containerd/overlay/fay/requirements-docker.txt /tmp/requirements-docker.txt
 RUN pip install --no-cache-dir -r /tmp/requirements-docker.txt
 
 # 原样拷贝上游代码。
-COPY ${FAY_SRC}/ /app/
+COPY fay/ /app/
 
 # ---- 补丁层 ---------------------------------------------------------------
 # 发现上游代码有 bug 时，补丁写在 containerd/patches/<repo>/*.patch，
 # 构建时用 `patch -p1` 盖到 /app 上；上游仓库的工作树保持零改动，
 # `git -C <repo> status` 永远是干净的。目录里只有 .gitkeep 时循环空转。
-COPY ${PATCH_DIR}/ /tmp/patches/
+COPY containerd/patches/fay/ /tmp/patches/
 RUN set -eux; \
     for p in /tmp/patches/*.patch; do \
         [ -e "$p" ] || continue; \

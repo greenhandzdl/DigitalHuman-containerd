@@ -1,28 +1,35 @@
 # containerd —— DigitalHuman 容器集成层
 
-这一层把散在四个仓库里的东西拢到一个 `docker compose` 里跑起来，**不改动 `fay` /
-`origin_fay` / `service` / `ue` 任何一个仓库的代码**：四个目录的 `git status`
-始终干净、`main` 始终 == `origin/main`（`./run.sh audit` 会把这件事打成输出，
-而不是留成一句承诺）。
+这一层把散在三个仓库里的东西拢到一个 `docker compose` 里跑起来，**不改动 `fay` /
+`service` / `ue` 任何一个仓库的代码**：三个目录的 `git status` 始终干净、`main`
+始终 == `origin/main`（`./run.sh audit` 会把这件事打成输出，而不是留成一句承诺）。
+
+> **2026-09-21 撤掉了 `origin_fay` 参照实例。** 它曾经是「上游直出的第二个 Fay」，用来回答
+> 「fork 相对上游改了什么」。fork 换成 `chuan918/Fay` 之后它成了上游的**直接后代**、Python
+> 源码逐字节相同，这个对照就不再有内容 —— 两份镜像的唯一差别只剩 config，而 config 差异
+> 早就是 `overlay/` 里可读的文件。于是那个服务、它的镜像、`overlay/origin_fay/`、
+> `probe-origin-fay` 测试组一起删了；上游本身改为**只当 `fay` 里的一个 remote** 留着
+> （见下「跟上上游」）。下文凡是以 `origin-fay` 为主语的实测数字都按原样保留 ——
+> 那是它还在的时候量的，属于历史。
 
 ```
 containerd/
-├── docker-compose.yml          常驻 6 个服务：mysql / redis / fay / origin-fay
+├── docker-compose.yml          常驻 6 个服务：mysql / redis / fay / yueshen-rag
 │                               / adapter / backend；另有 profiles:["test"] 的
-│                               fay-lite（测试用轻模型 Fay）+ 9 个一次性测试件
-├── run.sh                      up · build · test · smoke · audit · logs · ps · down · reset
+│                               fay-lite（测试用轻模型 Fay）+ 8 个一次性测试件
+├── run.sh                      up · build · test · smoke · audit · upstream · logs · ps · down · reset
 ├── .env.example                模板；run.sh 首次执行会复制成 .env 并填随机密钥
 ├── images/
-│   ├── fay.Dockerfile          一份 Dockerfile 靠 ARG FAY_SRC 构建 fay 与 origin_fay 两个镜像
-│   │                         （补丁与依赖清单两份共用：PATCH_DIR / REQS_DIR 默认都指 overlay|patches/fay）
+│   ├── fay.Dockerfile          Fay 镜像（唯一一份 Fay 源码 ../fay；原先靠 ARG FAY_SRC
+│   │                           多构建一个上游参照镜像，那三个 ARG 随实例一起删了）
 │   ├── yueshen_rag.Dockerfile  唯一带 chromadb 的 MCP 服务器，单独镜像（不并进 Fay，见「yueshen 知识库」）
 │   └── service.Dockerfile      原样 COPY service/，依赖读它自己的 pyproject.toml
 ├── overlay/                    ★ 覆盖层：不改源码的配置手段
-│   ├── {fay,origin_fay}/system.conf      仓库里不存在，容器里必须有（见下）
-│   ├── {fay,origin_fay,fay-lite}/config.json      关麦克风、关本地播放、换 edge_tts 音色
-│   ├── {fay,origin_fay,fay-lite}/mcp_servers.json  把 id=4 yueshen 从 stdio 换成 sse 指向容器（每实例一份、可写）
-│   ├── {fay,origin_fay,fay-lite}/system.conf 等之外，依赖清单只有一份：
-│   │   overlay/fay/requirements-docker.txt     fay 与 origin-fay 共用（两边源码逐字节相同）
+│   ├── {fay,fay-lite}/system.conf      仓库里不存在，容器里必须有（见下）
+│   ├── {fay,fay-lite}/config.json      关麦克风、关本地播放、换 edge_tts 音色
+│   ├── {fay,fay-lite}/mcp_servers.json  把 id=4 yueshen 从 stdio 换成 sse 指向容器（每实例一份、可写）
+│   ├── 依赖清单只有一份：
+│   │   overlay/fay/requirements-docker.txt     fay 与 fay-lite 同一镜像、同一份清单
 │   └── {service,yueshen_rag}/requirements-docker.txt  其余两个镜像各自的依赖清单（冲突处理见下）
 ├── patches/                    ★ 补丁层：构建期 patch -p1 盖到镜像里的 /app
 ├── seed/                       ★ 种子层：service 的参考语料不在仓库里，这里给一份能自测的
@@ -43,10 +50,11 @@ containerd/
 cd /mnt/data/DigitalHuman/containerd
 ./run.sh up        # 构建 + 起栈（首次约 3~6 分钟，pip 走阿里云镜像）
 ./run.sh smoke     # 端到端：后端 → adapter → Fay → Ollama → 落库
-./run.sh test      # 九组测试件：backend-test · backend-probe · adapter-test · probe-selftest
-                   #            · probe-fay-lite · ue-audit · fay-probe · probe-origin-fay · probe-yueshen
+./run.sh test      # 八组测试件：backend-test · backend-probe · adapter-test · probe-selftest
+                   #            · probe-fay-lite · ue-audit · fay-probe · probe-yueshen
 ./run.sh test fay-probe   # 只跑其中一组（改探针时不用等全套）
-./run.sh audit     # 核账：四个上游仓库是否仍然零改动、与上游不分叉（非零退出即可当断言）
+./run.sh audit     # 核账：三个上游仓库是否仍然零改动、与上游不分叉（非零退出即可当断言）
+./run.sh upstream  # 跟上上游：fetch xszyou/Fay，报落后几条，并把每份 fay 补丁对 upstream/main 干跑预检
 ./run.sh logs fay  # 单独看某个服务
 ```
 
@@ -145,8 +153,8 @@ compose 只把前三个
 LLM 自己的超时 —— 两条时间线本来就没对齐（实测 `/v1/chat/completions`
 精确地在 180.0s 返回，而同一发请求在 origin-fay 身上 172.1s 就出字了）。
 
-修复仍然不进两个 Fay 仓库：`containerd/patches/` 把这四个数字开成环境变量，
-compose 给 `fay` / `origin-fay` 两个服务注入 ——
+修复仍然不进 Fay 仓库：`containerd/patches/` 把这四个数字开成环境变量，
+compose 的 `x-llm-timeouts` 锚点给 `fay` / `fay-lite` 两个服务注入 ——
 
 | 环境变量 | 容器里的值 | 作用 | 补丁 |
 |---|---|---|---|
@@ -160,7 +168,7 @@ compose 给 `fay` / `origin-fay` 两个服务注入 ——
 
 ### 就绪判据：五个契约端口全监听，不是「`:5000` 能连就算起」
 
-三个 Fay 实例（`fay` / `origin-fay` / `fay-lite`）共用一份镜像，也共用 compose 里
+两个 Fay 实例（`fay` / `fay-lite`）共用一份镜像，也共用 compose 里
 `x-fay-healthcheck` 这一个锚点：`5000`（Flask）、`5010`（MCP 管理面）、`8765`（MCP SSE）、
 `10002` / `10003`（两条 WS）全 bind 才算 healthy。原先那份只看 `:5000`，实测开机
 `:5000/:5010/:10002/:10003` 第 6 秒就全在听，`:8765` 要等到第 24~61 秒 ——
@@ -263,7 +271,7 @@ tools」有没有成功 —— 在线的原本只有知识库。run #4 却把这
 被挤到 180s 超时，唯一能给出正面证据的一组反而降级了。现在 `./run.sh test` 的默认
 顺序把不打 LLM 的四组排在前面、lite 排在两个 9b 实例之前（`backend-test →
 backend-probe → adapter-test → probe-selftest → probe-fay-lite → ue-audit →
-fay-probe → probe-origin-fay`）。
+fay-probe → probe-yueshen`）。
 
 SKIP 只说明「这台机器判不了这一条」，所以问答链路的**真实功能**由 compose 里第三个
 Fay 实例 `fay-lite` 兜住：同一个镜像、同一套补丁、同一份 `system.conf`，只是模型换成
@@ -358,6 +366,9 @@ RUN for p in /tmp/patches/*.patch; do patch -p1 -d /app --silent < "$p"; done
 > 不重新解释（它们记录的是当时那个镜像的行为，不再描述现在的 `dh-fay`）；在 `origin-fay` 上
 > 量的那批本来就打在 v4.8.1 上，换基线后仍然是现状。两实例的对照从此量的不再是「fork 改了
 > 什么代码」，而是同一份代码在两份 config 下的差别 —— 想恢复代码档的对照，得回到 `45b44e9`。
+> **同一天稍后又把 origin_fay 参照实例整个撤了**（服务、镜像、`overlay/origin_fay/`、
+> `probe-origin-fay` 组），上游从此只以 `fay` 仓库里的 `upstream` remote 形式存在，合并不再
+> 需要一个并排跑的实例 —— 见下面「跟上上游」。
 
 | 补丁 | 治什么 |
 |---|---|
@@ -405,6 +416,36 @@ alembic upgrade head → scripts.import_reference_json --category all
 导入是 upsert，重复启动幂等；两份交叉引用校验（`recommended_action_ids`、
 随访/分级规则互引）都报"通过"。生产要换正式语料时，把 `JSON_DATA_DIR`
 指到真实目录即可，不必改镜像。
+
+### 跟上上游（origin_fay 撤掉之后怎么合）
+
+上游 `xszyou/Fay` 不再有一份并排跑的参照实例，但它作为 **remote 留在 `fay` 仓库里**，
+合并照常可作：
+
+```
+fay/.git/config
+  [remote "origin"]   url = https://github.com/chuan918/Fay.git     # fork，子模块记录的远端
+  [remote "upstream"] url = https://github.com/xszyou/Fay.git       # 上游，只为 fetch + merge
+```
+
+两个 URL 都不含凭据（`git remote -v` 里显示成带 token 的形式是宿主机 `~/.gitconfig`
+那条全局 `insteadOf` 改写，不是仓库里存的值）。`main` 只 track `origin/main`，
+`upstream/main` 永远不 track —— 这样 `./run.sh audit` 的 `0/0` 仍然只回答「fork 有没有偷偷
+改代码」，不被上游的领先量污染。
+
+合并前的预检是 `./run.sh upstream`：fetch 一次，报「落后几条 / 领先几条」+ 待合提交，
+然后把 `containerd/patches/fay/*.patch` 每份对 **upstream/main 的那几个文件** 跑一遍
+`patch -p1 --dry-run --fuzz=0`。为这个判断建一次 worktree 要 checkout 314MB，
+所以它改成按补丁头取目标文件、在 `mktemp -d` 里摆一棵只含这几个文件的小树 ——
+`--fuzz=0` 是故意的：能靠容差糊过去的补丁在真实合并里通常已经贴错了位置。有贴不上的
+就非零退出，可以当 CI 断言。当前状态实测：落后 1 条（`d49f476 修复websocket与uvicorn
+版本不兼容问题`），6 份补丁全部可贴。顺带一条佐证 —— 上游那条修复加的就是
+`uvicorn<0.35`，与 `overlay/fay/requirements-docker.txt` 里那条判断一字不差
+（上游 `requirements.txt` 仍然留着裸 `mcp`，所以 `mcp>=1.2,<2` 那根钉还是我们的事）。
+
+真要合就在 `fay` 里 `git -C ../fay merge upstream/main`，然后 `./run.sh build && ./run.sh test`。
+补丁贴不上时按上面那段「一个一直咬人的坑：…都是 **CRLF** 行尾」说的字节层规矩重做，
+别去改 `fay/` 源码。
 
 ## adapter：唯一新增的代码
 
@@ -592,9 +633,10 @@ SKIP 记，理由写"dev 路由没挂载"，不去猜。
 
 ## 实测通过的链路
 
-`./run.sh test` 九组测试件（run #12 时是七组，`backend-probe` 在那之后加的，它自己的
-数字见下表与「后端活体探针」一节；`probe-yueshen` 是这一轮新加的第九组，见
-「yueshen 知识库」一节）。旧基线上最近一次完整运行是 **run #27**（2026-09-21 02:13 起，
+`./run.sh test` **现在八组**（run #12 时是七组，`backend-probe` 在那之后加的，它自己的
+数字见下表与「后端活体探针」一节；`probe-yueshen` 是那一轮新加的第九组，见
+「yueshen 知识库」一节；`probe-origin-fay` 随参照实例一起撤了）。下面 run #27 / #28
+两张表记的都是**当时九组**的数字。旧基线上最近一次完整运行是 **run #27**（2026-09-21 02:13 起，
 `[test] 全部通过`）。它是第一次把 `probe-yueshen` 组、以及 0002 补丁（服药漏扫时钟冻结）
 和探针的 120s 排空重问一起放进完整一轮 —— 前两件各治一个 run #25 暴露的红，这一轮两者
 都没再红，重试分支本轮也没触发（`重问` 全轮 0 次，见问答表下面那段）。
@@ -696,7 +738,8 @@ run #14 上 `test_human_queue_flow` 红了，根因是上游 conftest 不清表�
 **Fay 契约探针：`fay-lite` 41/43 通过 · 2 SKIP**（run #27 共 43 条；底数从上一版的 42 涨到
 43 是连上的 yueshen 新增了 `MCP 工具清单 server_id=4 yueshen rag` 一条，SKIP 从 3 降到 2 是
 `yueshen rag` 不再是白名单里的离线服务器）。同一份 `probes/fay_probe.py` 分别打三个实例
-（`fay` = fork、`origin-fay` = 上游那份、`fay-lite` = 同镜像换 1.5b），下表仍是 run #24
+（`fay` = fork、`origin-fay` = 上游那份、`fay-lite` = 同镜像换 1.5b —— 前两个实例的那份
+表是撤掉参照实例之前的，现在探针打的是 `fay` 与 `fay-lite`），下表仍是 run #24
 （2026-09-20 23:44）那次 lite 组的逐条实际输出，作为最细颗粒的留档保留（run #27 相对它的
 结构变化只有两处：`yueshen rag` 那行从 SKIP 变两条 PASS、`:10002` 文字播报第一发命中没有触发
 重试；上面「实测通过的链路」那张汇总表才是 run #27 的当轮数字）：
@@ -736,7 +779,7 @@ origin-fay 连问答前提那几条也是正面通过的（230 字回复 + audio
 不是把故障糊过去」最直接的对照：同一份探针、同一条 9b 链路，#10 假红、#12 真绿。
 
 `./run.sh smoke` 六步全绿：`/api/v1/health` → adapter `/healthz`
-→ dev-login 拿 JWT → 建会话 → **重启 origin-fay 后那一行还在**（卷持久化）→ 发一句话。后端返回 `fay_forwarded=true`、
+→ dev-login 拿 JWT → 建会话 → **重启 `fay` 后那一行还在**（卷持久化）→ 发一句话。后端返回 `fay_forwarded=true`、
 `fay_error=null`、`tier=medium`，并落库为完整中文回复：
 
 ```
@@ -761,7 +804,7 @@ id  role       content                                    len
 | `probe-fay-lite` | **41/43 通过 · 2 SKIP** —— 与 run #27 同一档：问答、MCP（含 yueshen rag 3 工具）、prestart、TTS、远程 PCM 跨 VAD、决策面谈全部正面通过 |
 | `ue-audit` | **2 PASS / 0 SKIP / 0 FAIL** |
 | `fay-probe` | **35/45 通过 · 8 SKIP（LLM 证据降级）+ 2 SKIP（边界）** |
-| `probe-origin-fay` | **38/46 通过 · 6 SKIP（降级）+ 2 SKIP（边界）** |
+| `probe-origin-fay` | **38/46 通过 · 6 SKIP（降级）+ 2 SKIP（边界）**（跑完之后这个参照实例被撤掉了，见本节开头）|
 | `probe-yueshen` | **6/6** |
 | 收尾一条 | `[test] fay-lite 优雅停止（SIGTERM）退出码 0` |
 
@@ -786,8 +829,8 @@ QA 链的正面证据由 lite 那组给。**这不是换基线换来的回归**�
 
 `overlay/*/mcp_servers.json` 会被运行期回写这件事，本轮也留下了具体后果：跑完测试
 `git status` 必脏（探针现场 `connect`/`disconnect` 与 Fay 自己写 `connection_time` 都落在这
-三份 bind-mount 的可写文件上），而 `run.sh test` 的「构建输入是否比镜像新」又是按 mtime
-判的，所以下一轮一上来就白重建一次 fay 与 origin-fay —— 镜像 ID 没变（这三份是运行时
+三份 bind-mount 的可写文件上，当时还挂着 origin-fay 那一份），而 `run.sh test` 的
+「构建输入是否比镜像新」又是按 mtime 判的，所以下一轮一上来就白重建一次镜像 —— 镜像 ID 没变（这三份是运行时
 挂载、根本没进镜像），BuildKit 全量命中缓存，所以只是空转。**没有**为此改挂载方式：
 把 `faymcp/data/` 换命名卷要动运行期注册表的落盘位置，收益不值那个风险。提交前
 `git checkout -- overlay/<实例>/mcp_servers.json` 即可，纯时间戳漂移。
@@ -992,7 +1035,7 @@ run #24 起探针把这条起落做成三条判据，三个实例上都是 PASS�
   （见「真实瓶颈是显存」），超时会落进 `upsert_chunks` 的 `except: 跳过这条 chunk`
   （`server.py:363`），于是 `ingest_yueshen` 返回 `success: true, inserted: 0` ——
   一句错都不报。
-- `overlay/{fay,fay-lite,origin_fay}/mcp_servers.json`：三份都只把 id=4 从
+- `overlay/{fay,fay-lite}/mcp_servers.json`：两份都只把 id=4 从
   `stdio` + `command=python` 换成 `sse` + `ip=http://yueshen-rag:8766/sse`，
   `autostart` 维持原样。必须是**可写**挂载且**每实例一份**：
   `faymcp/mcp_service.py:111-137` 的 `save_mcp_servers` 是整文件重写，

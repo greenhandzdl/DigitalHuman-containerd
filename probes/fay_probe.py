@@ -1149,8 +1149,8 @@ def check_remote_audio_input(host: str) -> None:
          需要另外起的 FunASR 服务；它不在线时这条判不了，按 SKIP 记并写明缺什么。
 
     实测（2026-09-20，两个 9b 实例 + 一个 lite 实例）：打上
-    patches/{fay,origin_fay}/0004-remote-audio-*.patch 之后 1 是 PASS、2 是 SKIP；
-    打之前 origin-fay 连 10001 都握不上（上游 74b49ae 的线程竞态），fay 能连上但
+    patches/fay/0004-remote-audio-*.patch 之后 1 是 PASS、2 是 SKIP；
+    打之前参照实例连 10001 都握不上（上游 74b49ae 的线程竞态），fay 能连上但
     每条断开的连接留一个 fd 和两个线程。详见 README「远程音频输入：无声卡也能测」。
     """
     user = f"probe_mic_{int(time.time())}"

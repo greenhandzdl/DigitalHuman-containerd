@@ -38,7 +38,7 @@ x-restart: &restart
 # 空闲上限 180s。它必须 >= 上面的 LLM_REQUEST_TIMEOUT，否则「模型正在慢慢想」会被
 # 判成「Fay 卡住」：run #2 实测 fork 的规划器链路单次 180~240s，于是
 # /v1/chat/completions 每次都正好在 180.0s 返回空 content，而同机同模型的
-# origin-fay（上游直出，无规划器）172.1s 拿到了「好」。
+# 上游直出实例 172.1s 拿到了「好」（当时为对照起的 origin-fay，该实例已撤）。
 x-llm-timeouts: &llm-timeouts
   LLM_REQUEST_TIMEOUT: "420"
   LLM_REQUEST_MAX_RETRIES: "0"
@@ -51,7 +51,7 @@ x-llm-timeouts: &llm-timeouts
   EMBEDDING_MAX_RETRIES: "1"
   STREAM_REPLY_IDLE_TIMEOUT: "480"
 
-# Fay 三实例（fay / origin-fay / fay-lite）共用同一份镜像、同一套对外端口，
+# Fay 两实例（fay / fay-lite）共用同一份镜像、同一套对外端口，
 # 也就共用同一条就绪判据。只看 :5000 会过早放行：实测开机 :5000/:5010/:10002/
 # :10003 第 6 秒全 bind，而 :8765（MCP SSE）要等到第 24~61 秒 —— 它排在开机自检
 # 那串 embedding 重试之后。compose --wait 提前判 healthy，探针就会打进一个只起了
@@ -75,9 +75,9 @@ x-fay-healthcheck: &fay-healthcheck
 # Fay 的 MCP 服务器清单（faymcp/mcp_service.py:29 就是这个路径）。三份 overlay 与
 # 仓库里的只差 id=4 一项：transport stdio → sse、ip 填本栈的容器地址。为什么必须换
 # 掉而不是留着 —— 上游那份是 stdio，容器里没人在 stdin 那头写，这条服务永远连不上；
-# 详见 patches/yueshen_rag/0001。三份而不是共用一份，因为 mcp_service.py:132 在每次
+# 详见 patches/yueshen_rag/0001。两份而不是共用一份，因为 mcp_service.py:132 在每次
 # 连接/断开后整份重写这个文件（更新 connection_time），两个容器写同一个宿主文件会互相盖。
-# 所以这条挂载刻意不带 :ro。三个实例各挂自己那份，见 overlay/{fay,fay-lite,origin_fay}/。
+# 所以这条挂载刻意不带 :ro。两个实例各挂自己那份，见 overlay/{fay,fay-lite}/。
 
 services:
   mysql:
@@ -245,7 +245,7 @@ services:
       # 超时链自下而上必须单调变长，否则下层还在等、上层先放弃，
       # 用户看到的就是「后端说超时」而不是 Fay 真正给出的回复：
       #   LLM 420 < Fay 回复空闲上限 480 ≤ adapter 500 < backend 520
-      # 依据是实测：本机 9b 只有 6% 权重驻留显存，origin-fay 一句话要 172~301s，
+      # 依据是实测：本机 9b 只有 6% 权重驻留显存，无规划器的对照实例一句话都要 172~301s，
       # 上游默认值（adapter 60 / backend 30，见 service/app/core/config.py:43）
       # 在这台机器上必然抢跑。显存腾开后按注释把这几个数字调小即可。
       FAY_FORWARD_TIMEOUT_SECONDS: ${FAY_FORWARD_TIMEOUT_SECONDS:-520}
@@ -281,44 +281,6 @@ services:
       redis:
         condition: service_healthy
       adapter:
-        condition: service_started
-
-  # ---------------------------------------------------- origin_fay（上游 v4.8.1 参照实例）
-  # 目录 ../origin_fay 不再是第二份 clone，而是 ../fay 里 `upstream` remote 的 git worktree
-  # （git -C fay worktree add ../origin_fay -b upstream-main upstream/main）。
-  # fork（chuan918/Fay）现在是上游 v4.8.1 的直接后代，两边 Python 源码逐字节相同，
-  # 所以补丁与依赖清单共用 overlay/fay 那一份，这里只换源码目录。这一组对照因此
-  # 量的不再是「fork 改了代码」，而是同一份代码在两份 config.json/system.conf 下的差别。
-  origin-fay:
-    <<: [*host-gateway, *restart]
-    build:
-      context: ..
-      dockerfile: containerd/images/fay.Dockerfile
-      args:
-        FAY_SRC: origin_fay
-    image: dh-origin-fay:local
-    container_name: dh-origin-fay
-    command: ["python", "main.py", "start"]
-    environment:
-      TZ: Asia/Shanghai
-      <<: *llm-timeouts
-    volumes:
-      - ./overlay/origin_fay/system.conf:/app/system.conf:ro
-      - ./overlay/origin_fay/config.json:/app/config.json
-      - ./overlay/origin_fay/mcp_servers.json:/app/faymcp/data/mcp_servers.json
-      - origin-fay-memory:/app/memory
-      - origin-fay-cache:/app/cache_data
-      - origin-fay-logs:/app/logs
-      - origin-fay-samples:/app/samples
-    ports:
-      - "${BIND_ADDR:-127.0.0.1}:${ORIGIN_FAY_HTTP_PORT:-5100}:5000"
-      - "${BIND_ADDR:-127.0.0.1}:${ORIGIN_FAY_HUMAN_WS_PORT:-10012}:10002"
-      - "${BIND_ADDR:-127.0.0.1}:${ORIGIN_FAY_WEB_WS_PORT:-10013}:10003"
-    healthcheck: *fay-healthcheck
-    depends_on:
-      redis:
-        condition: service_started
-      yueshen-rag:
         condition: service_started
 
   # ------------------------------------------------------- 测试件（compose --profile test）
@@ -438,27 +400,8 @@ services:
     depends_on:
       fay:
         condition: service_healthy
-
-  probe-origin-fay:
-    <<: [*host-gateway]
-    profiles: ["test"]
-    image: dh-origin-fay:local
-    container_name: dh-origin-fay-probe
-    restart: "no"
-    working_dir: /app
-    environment:
-      <<: *llm-timeouts
-    volumes:
-      - ./probes:/probe:ro
-      - ./overlay/origin_fay/system.conf:/app/system.conf:ro
-      - ./overlay/origin_fay/config.json:/app/config.json:ro
-    command: ["python", "/probe/fay_probe.py", "--base", "http://origin-fay:5000", "--timeout", "90"]
-    depends_on:
-      origin-fay:
-        condition: service_healthy
-
   # ------------------------------------------------ 轻模型实例：把问答链路真正跑通一次
-  # fay / origin-fay 用的是 system.conf 里配好的 qwen3.5:9b，这是用户的真实配置，
+  # fay 用的是 system.conf 里配好的 qwen3.5:9b，这是用户的真实配置，
   # 不该为了跑测试去改。但这台机器 16GB 显存被其他常驻服务占掉 15.2GB，
   # ollama /api/ps 实测 size_vram=387029401 / size=6149206178 —— 只有 6% 权重进显存，
   # 于是规划器一次要 165~240s，问答质量根本没法在测试里判定。
@@ -602,10 +545,6 @@ volumes:
   fay-cache:
   fay-logs:
   fay-samples:
-  origin-fay-memory:
-  origin-fay-cache:
-  origin-fay-logs:
-  origin-fay-samples:
   fay-lite-memory:
   fay-lite-cache:
   fay-lite-logs:
