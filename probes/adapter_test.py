@@ -20,6 +20,12 @@
   8. Fay 不可达：连历史都读不到时也是 502，且文案区分「历史读取失败」
   9. 入参：空 content / 非法 JSON → 400；未知路径 → 404；GET /healthz → 200
  10. 用户名：显式 `username` 优先，否则 `ADAPTER_USERNAME_PREFIX + user_id`
+ 11. 两阶段协议 + 哨兵（patches/fay/0008）：占位句写完、工具还在跑的 3 秒静默里
+     不能收工；看到 `<dh-end>` 立刻收工，且返回的是**洗完的正文**
+ 12. 没有哨兵（镜像没按 0008 重建）时仍按静默退路收工，但清洗照做
+ 13. 整轮只有占位句和思考内容 → 502 且文案是「没有给出正文」，不是把噪声回给用户
+ 14. 反向对照：把哨兵判定改坏，判据 11 的耗时那条必须变红（见 negative_control()）
+ 15. 正文迟到过整个静默窗口 → 继续等，不在「手里还没有正文」时收工交空
 
 只用标准库，和 adapter 一样：`python:3.12-slim` 里直接跑得起来。
 """
@@ -29,6 +35,7 @@ import json
 import os
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import urllib.error
@@ -169,7 +176,7 @@ class FakeFay:
 
 # ----------------------------------------------------------------------- adapter 起停
 class Adapter:
-    def __init__(self, fay_port: int, **env):
+    def __init__(self, fay_port: int, adapter_path: str | None = None, **env):
         self.port = 18100 + int(time.monotonic() * 1000) % 900
         base = {
             "FAY_BASE_URL": f"http://127.0.0.1:{fay_port}",
@@ -180,7 +187,7 @@ class Adapter:
         }
         base.update({k.upper(): str(v) for k, v in env.items()})
         merged = dict(os.environ, **base)
-        self.proc = subprocess.Popen([sys.executable, ADAPTER], env=merged,
+        self.proc = subprocess.Popen([sys.executable, adapter_path or ADAPTER], env=merged,
                                      stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                      text=True)
         self.log = ""
@@ -225,6 +232,70 @@ class Adapter:
 
 
 # ------------------------------------------------------------------------------- 场景
+# 两阶段协议在库里长什么样（core/fay_core.py:1181-1233 只在 is_first 时新建行，
+# 续写一律 update_content 覆写同一行），所以这些片段全部落在**同一行**上。
+GAP = 3.0                     # 占位句写完到正式回答写出之间的那段静默
+ACK = "我来帮你查一下，稍等…\n"
+NOISE = (ACK + "<prestart>血压参考值：收缩压 90~139 mmHg，舒张压 60~89 mmHg。</prestart>\n"
+             "<think>\n执行耗时: 2.9s，共 1 步\n命中知识库片段 3 条\n</think>\n")
+BODY = "老人测血压，收缩压在 90 到 139 之间算正常。"
+SENTINEL = "\n<dh-end>"
+
+
+def two_phase(with_sentinel: bool = True) -> list:
+    ops = [(0.0, [("add", ("fay", ACK))]),
+           (GAP, [("grow", (-1, NOISE + BODY))])]
+    if with_sentinel:
+        ops.append((GAP + 0.3, [("grow", (-1, NOISE + BODY + SENTINEL))]))
+    return ops
+
+
+def run_two_phase(port: int, script, settle: float, max_wait: float,
+                  adapter_path: str | None = None) -> tuple[int, dict, float]:
+    """起一套「假 Fay + adapter」跑两阶段脚本，返回 (HTTP 码, 回包, 整轮耗时)。
+
+    耗时是判据 11/14 的**主断言对象**：哨兵该收工的时刻是 GAP+0.3，静默退路的收工
+    时刻是「最后一次增长 + settle」，两者差好几秒，只有把时间量出来才分得清是哪条
+    路生效了 —— 只看内容的话两条路都是绿的。
+    """
+    fake = FakeFay(port, lambda sent: script)
+    ad = Adapter(port, adapter_path, adapter_settle_seconds=settle,
+                 adapter_max_wait_seconds=max_wait, adapter_poll_interval=0.2)
+    started = time.monotonic()
+    try:
+        code, body = ad.post("/api/chat", {"content": "血压正常值是多少？", "username": "elder_11"})
+    finally:
+        took = time.monotonic() - started
+        ad.close()
+        fake.stop()
+    return code, body, took
+
+
+def negative_control(port: int) -> None:
+    """把哨兵判定改坏，判据 14 必须变红。
+
+    一份杀不掉任何 bug 的测试比没有测试更糟：这里不是"再测一遍"，而是**证明**
+    「哨兵一到就收工」这条判据真的挂在哨兵上。锚点匹配不上就直接判 FAIL ——
+    那说明这份自检已经和实现漂走了，绿也没有意义（照 probes/asr_test.py 的写法）。
+    """
+    anchor = ("        if any(END_SENTINEL in text for text in fresh.values()):\n"
+              "            break")
+    src = open(ADAPTER, encoding="utf-8").read()
+    if anchor not in src:
+        check(False, "14 反向对照：改坏哨兵判定后「一到就收工」变红",
+              "这份自检已不可信：adapter 里找不到哨兵判定的锚点")
+        return
+    with tempfile.TemporaryDirectory() as tmp:
+        broken = os.path.join(tmp, "server_broken.py")
+        with open(broken, "w", encoding="utf-8") as f:
+            f.write(src.replace(anchor, "        if False:  # 反向对照：拔掉哨兵\n            break", 1))
+        # settle=8 让退路比哨兵晚得多，改坏之后必须明显更慢（照 11 的同一个脚本）
+        code, body, took = run_two_phase(port, two_phase(), 8, 25, adapter_path=broken)
+        check(code == 200 and body.get("content") == BODY and took > GAP + 2.0,
+              "14 反向对照：改坏哨兵判定后「一到就收工」变红",
+              f"改坏后 {took:.1f}s 才收工（哨兵在位时 {GAP + 0.3:.1f}s 出头）")
+
+
 def main() -> int:
     port = 19001
 
@@ -305,6 +376,53 @@ def main() -> int:
     check(code == 502 and "历史读取失败" in err,
           "8 Fay 不可达时报「历史读取失败」而不是超时", f"HTTP {code} {err}")
     ad.close()
+
+    # 11/12 是一对**只差哨兵**的对照：同一套两阶段脚本、同一个 settle=8。
+    # 11 有哨兵 → 3.4s 上下收工；12 没哨兵（= 镜像没按 patches/fay/0008 重 build）
+    # → 只能等静默，11.2s 上下收工。两条都必须是**洗干净的正文**，这正说明
+    # 「正确性」靠的是 settle 2→8 + _clean，哨兵买的是**不用白等那 8 秒**。
+    code, body, took = run_two_phase(port, two_phase(), 8, 25)
+    content = str(body.get("content") or "")
+    check(code == 200 and content == BODY,
+          "11 两阶段回答：只留正文，占位句/prestart/think 全洗掉", f"HTTP {code} {content!r}")
+    check("<think" not in content and "<prestart" not in content
+          and "我来帮你查" not in content and "dh-end" not in content,
+          "11b 清洗后不含任何协议噪音", repr(content))
+    check(GAP <= took < GAP + 2.0,
+          "11c 看到哨兵立刻收工，不等静默", f"{took:.1f}s（静默退路要 {GAP + 8:.0f}s）")
+
+    code, body, took = run_two_phase(port, two_phase(with_sentinel=False), 8, 25)
+    content = str(body.get("content") or "")
+    check(code == 200 and content == BODY and took > GAP + 2.0,
+          "12 没哨兵时退回静默判定，内容仍然是洗干净的正文",
+          f"HTTP {code} {content!r} 用了 {took:.1f}s")
+
+    # 13 只吐占位句 + think、没有正文：不能返回空 200 糊弄后端
+    #    （上游 nlp_cognitive_stream.py:2277 的占位句 + 共 0 步的 think 块，
+    #      就是本轮真实故障现场里 H5 看到的那一行）
+    noise_only = [(0.0, [("add", ("fay", ACK))]),
+                  (0.2, [("grow", (-1, ACK + "<think>\n执行耗时: 0.3s，共 0 步\n</think>\n"))]),
+                  (0.4, [("grow", (-1, ACK + "<think>\n执行耗时: 0.3s，共 0 步\n</think>\n" + SENTINEL))])]
+    code, body, took = run_two_phase(port, noise_only, 8, 25)
+    err = str(body.get("error") or "")
+    check(code == 502 and "没有给出正文" in err,
+          "13 清洗后为空 → 502 而不是空回答", f"HTTP {code} {err}")
+
+    # 15 正文**迟到**过整个静默窗口：库里先只有占位句，正文在 settle 的若干倍之后才写进来。
+    #    这是 2026-09-22 真链路里红过的那一类（远端 26B 有一轮 17.8s 才出全，另一轮
+    #    12.4s 一个字没出）：静默退路若在「手里还没有正文」时就收工，交出去的是空，
+    #    于是把一次「慢但会来」的回答报成「本轮没有给出正文」。等下去不亏，MAX_WAIT 兜底。
+    LATE = 7.0
+    late_body = [(0.0, [("add", ("fay", ACK))]),
+                 (LATE, [("grow", (-1, NOISE + BODY))])]
+    code, body, took = run_two_phase(port, late_body, 1.5, 25)
+    content = str(body.get("content") or "")
+    check(code == 200 and content == BODY and took > LATE,
+          "15 正文迟到过静默窗口时继续等，不提前交空正文",
+          f"HTTP {code} {content!r} 用了 {took:.1f}s")
+
+    # 14 反向对照：拔掉哨兵判定，11c 这条必须红（否则它没有真的挂在哨兵上）
+    negative_control(port)
 
     bad = sum(1 for ok, _, _ in RESULTS if not ok)
     print(f"\n[adapter-test] {len(RESULTS) - bad}/{len(RESULTS)} 通过"

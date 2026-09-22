@@ -633,8 +633,9 @@ def check_prestart_tool(base: str, host: str, user: str, budget: float) -> None:
     更关键的是这条执行**不经 :5010**（runtime_bridge 直接进程内调），所以 :5010 上
     数不出请求、也伪造不出这个帧：判据要的就是这份不可伪造性。
 
-    注册/注销必须成对：配置写在容器层的 faymcp/data/mcp_prestart_tools.json，
-    漏注销会让这台实例之后每一轮都白白跑一次工具。
+    注册/注销必须成对：配置写回的是挂载进来的 faymcp/data/mcp_prestart_tools.json
+    （运行时会回写它，所以这份 overlay 不能挂 :ro），漏注销既让这台实例之后每一轮
+    都白白跑一次工具，又会把那一行留在宿主的 JSON 里 —— 跟着仓库提交走下去。
     """
     svc = f"http://{host}:5010"
 
@@ -660,18 +661,32 @@ def check_prestart_tool(base: str, host: str, user: str, budget: float) -> None:
         return [(int(r["server_id"]), str(r["tool"]))
                 for r in rows if isinstance(r, dict) and r.get("server_id") and r.get("tool")]
 
-    clean = "MCP 预启动工具注销后清单回到空"
+    clean = "MCP 预启动工具注销后清单回到登记前"
 
-    def disable_and_verify(sid: int) -> None:
+    def disable_and_verify(sid: int, before: list | None) -> None:
+        """摘掉这条判据自己登记的那条，并核对清单**回到登记前**。
+
+        不能要求「回到空」：`overlay/<inst>/mcp_prestart_tools.json` 让实例一开机就带着
+        `(4, query_yueshen)`（2026-09-22 起的配置，见 README 的 autostart+prestart 那段），
+        那是配置不是残留 —— 判据登记的却是另一台服务器（`PRESTART_TOOL` 在 id=6）。
+        等式比「我那条没了」更严：注册/注销走同一个 `_save_locked()`，它把**整个 dict**
+        重写回那个 bind-mount 的宿主文件，所以探针要是顺手摘掉了配置里的条目，这个误删
+        会留在 git 里跟着仓库走，而不是死在容器层。
+        """
         try:
             post(f"/api/mcp/servers/{sid}/tools/{PRESTART_TOOL}/prestart", {"enabled": False})
         except Exception as exc:
             record(False, clean, repr(exc))
             return
         left = runnable()
-        record(left is not None and not left, clean,
-               f"{sid}/{PRESTART_TOOL} 已摘掉" if left == [] else
-               ("注销之后清单仍读不回来" if left is None else f"剩余 {left}"))
+        same = left is not None and before is not None and set(left) == set(before)
+        if left is None:
+            detail = "注销之后清单读不回来"
+        elif same:
+            detail = f"登记的那条已摘掉，其余与登记前一致：{left}"
+        else:
+            detail = f"应与登记前 {before} 一致，实际 {left}"
+        record(same, clean, detail)
 
     # 挑一台「在线」且暴露 PRESTART_TOOL 的服务器：runnable 那份清单只认在线的
     # （mcp_service.py:1248 那句 status != "online" 直接 continue），拿离线的那台
@@ -707,9 +722,10 @@ def check_prestart_tool(base: str, host: str, user: str, budget: float) -> None:
         return
 
     name = "MCP 预启动工具注册与可运行清单 (:5010)"
-    # 先看清单是不是已经脏了：上一轮探针被中途杀掉时注册会留在容器层
-    # （faymcp/data/mcp_prestart_tools.json 跟着容器活），那下面那句「注册之后清单里
-    # 有它」就成了空话 —— 残留本来就在里面，注册成功与否都判得出 PASS。
+    # 先看清单是不是已经脏了：上一轮探针被中途杀掉时注册会留在挂载文件里
+    # （2026-09-22 起 `faymcp/data/mcp_prestart_tools.json` 是 overlay 的 bind-mount，
+    # 漏注销不再随容器一起消失，而是写进宿主那份 JSON 等着被提交），那下面那句
+    # 「注册之后清单里有它」就成了空话 —— 残留本来就在里面，注册成功与否都判得出 PASS。
     stale = runnable()
     leftover = stale is not None and (target, PRESTART_TOOL) in stale
     if leftover:
@@ -718,6 +734,9 @@ def check_prestart_tool(base: str, host: str, user: str, budget: float) -> None:
         except Exception as exc:
             record(False, name, f"清单里本来就有它（上一轮漏注销的残留），而这次连注销都失败了：{exc!r}")
             return
+    # 登记前的清单，注销之后要回到这份。放在这里读而不是复用 stale，是为了把上面
+    # 那句「清掉残留」也算进基线 —— 否则清掉的那一条会被判成探针弄丢的。
+    baseline = runnable()
     try:
         post(f"/api/mcp/servers/{target}/tools/{PRESTART_TOOL}/prestart",
              {"enabled": True, "params": {}, "include_history": True,
@@ -735,7 +754,7 @@ def check_prestart_tool(base: str, host: str, user: str, budget: float) -> None:
     if not registered:
         # 没登记上就别往下走了：后面的会话只会因为「没有工具可跑」而拿不到帧，
         # 那条 SKIP 会把真正的故障（注册面）盖掉。注销仍然要做。
-        disable_and_verify(target)
+        disable_and_verify(target, baseline)
         return
 
     try:
@@ -764,7 +783,7 @@ def check_prestart_tool(base: str, host: str, user: str, budget: float) -> None:
             + (f"，{error}" if error else "")
             + f"｜注册已确认成功（server_id={target}），所以缺的是执行或推送那一段")
 
-    disable_and_verify(target)
+    disable_and_verify(target, baseline)
 
 
 def check_llm_baseline(base: str, timeout: float) -> float:
@@ -1451,7 +1470,7 @@ def main() -> int:
 
     check_chat(args.base, user, budget)
     # 「一句话进来到底有没有驱动工具」排在 :10002/:10003 那个会话循环之前：它会给
-    # 这个实例临时注册一个预启动工具（配置落在容器层 faymcp/data/mcp_prestart_tools.json），
+    # 这个实例临时注册一个预启动工具（配置写回挂载进来的 overlay/<inst>/mcp_prestart_tools.json），
     # 函数自己在返回前注销；排在后面就会让那几轮问答也带上工具输出，量到的不再是原契约。
     check_prestart_tool(args.base, host, f"{user}_pre", budget)
     # TTS 挪到这些会话之前：它只出网、不碰显存，而它的结论要能解释后面 audio 帧那条判据

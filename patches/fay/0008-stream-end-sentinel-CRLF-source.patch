@@ -1,0 +1,42 @@
+--- a/core/fay_core.py	2026-09-22 13:06:35.250367600 +0800
++++ b/core/fay_core.py	2026-09-22 13:07:16.442235007 +0800
+@@ -1224,13 +1224,13 @@
+                 if text and text.strip():
+ 
+ 
+-                    content_id, _ = content_db.new_instance().add_content('fay', 'speak', text, username, uid)
++                    content_id, _ = content_db.new_instance().add_content('fay', 'speak', text + ('\r\n<dh-end>' if is_end else ''), username, uid)
+ 
+ 
+                 else:
+ 
+ 
+-                    content_id, _ = content_db.new_instance().add_content('fay', 'speak', '', username, uid)
++                    content_id, _ = content_db.new_instance().add_content('fay', 'speak', '\r\n<dh-end>' if is_end else '', username, uid)
+ 
+ 
+ 
+@@ -1316,7 +1316,7 @@
+                 # 如果有新内容，更新数据库
+ 
+ 
+-                if content_id > 0 and text and text.strip():
++                if content_id > 0 and ((text and text.strip()) or is_end):
+ 
+ 
+                     # 获取当前已有内容
+@@ -1331,7 +1331,13 @@
+                         # 累积内容
+ 
+ 
+-                        accumulated_text = existing_content[3] + text
++                        accumulated_text = existing_content[3] + (text or "")
++                        # containerd 补丁：给这一轮回答落一个明确的结束哨兵。
++                        # _<isend> 标记在 core/stream_manager.py:332-335 就被 replace 掉了，永远进不了
++                        # T_Msg.content；单模型模式下工具循环又是同步跑的，/api/execution-status 全程 idle。
++                        # 容器外面没有任何信号能区分“工具正在跑”和“这句就是最后一句”，只能落在库里。
++                        if is_end and '<dh-end>' not in accumulated_text:
++                            accumulated_text = accumulated_text + '\r\n<dh-end>'
+ 
+ 
+                         update_ms = content_db.new_instance().update_content(content_id, accumulated_text)

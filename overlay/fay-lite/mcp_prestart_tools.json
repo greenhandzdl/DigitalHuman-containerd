@@ -1,0 +1,12 @@
+{
+    "4": {
+        "query_yueshen": {
+            "params": {
+                "query": "{{question}}",
+                "top_k": 3
+            },
+            "include_history": false,
+            "allow_function_call": false
+        }
+    }
+}

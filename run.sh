@@ -45,19 +45,20 @@ use_profile() {
   # 缺省 prod —— 「严谨关闭映射」是默认姿态，放开端口得是显式决定。
   DH_ENV=${DH_ENV:-$(envval DH_ENV)}
   DH_ENV=${DH_ENV:-prod}
+  local bind=${BIND_ADDR:-$(envval BIND_ADDR)}
   case "$DH_ENV" in
     prod) COMPOSE="docker compose --env-file .env -f docker-compose.yml" ;;
     dev)  COMPOSE="docker compose --env-file .env -f docker-compose.yml -f docker-compose.dev.yml" ;;
     *) echo "[run] DH_ENV 只认 prod|dev，当前是 '$DH_ENV'" >&2; exit 2 ;;
   esac
-  local bind=${BIND_ADDR:-$(envval BIND_ADDR)}
   if [ "$DH_ENV" = prod ] && [ -n "$bind" ] \
      && [ "$bind" != "127.0.0.1" ] && [ "$bind" != "localhost" ]; then
-    # prod 的整套端口都靠 ${BIND_ADDR:-127.0.0.1} 收在 loopback 上；把它改成 0.0.0.0
-    # 或某个局域网地址，等于把 Fay 的管理台和无鉴权的 OpenAI 兼容 façade 一起放出去。
-    # 这一步不做「提醒后继续」而直接拒：这类泄漏的常见成因就是有人临时改过一次 .env。
-    echo "[run] DH_ENV=prod 不接受 BIND_ADDR=$bind —— 那会把管理台与无鉴权接口发布到外部。" >&2
-    echo "      要给别的机器连就用 ./run.sh dev（它绑到探测出的局域网 IP，不是 0.0.0.0）。" >&2
+    # prod 的整套端口（含 13306 / 16379 那两个管理口）都靠 ${BIND_ADDR:-127.0.0.1}
+    # 收在 loopback 上；把它改成 0.0.0.0 或某个局域网地址，等于把 Fay 的管理台、无鉴权的
+    # OpenAI 兼容 façade 和数据库一起放出去。这一步不做「提醒后继续」而直接拒：
+    # 这类泄漏的常见成因就是有人临时改过一次 .env。
+    echo "[run] DH_ENV=prod 不接受 BIND_ADDR=$bind —— 那会把管理台、无鉴权接口与数据库发布到外部。" >&2
+    echo "      要给别的机器连就用 ./run.sh dev（那个档位按设计就是绑 0.0.0.0 全开）。" >&2
     exit 1
   fi
 }
@@ -280,14 +281,21 @@ case "${1:-up}" in
     [ "${1:-up}" = dev ] && DH_ENV=dev   # 子命令就是档位的显式写法，不必去改 .env
     ensure_env
     if [ "${DH_ENV:-}" = dev ]; then
-      # dev 的 BIND_ADDR 取探测出的局域网地址，而不是 0.0.0.0：绑 0.0.0.0 会把
-      # 端口同时挂到所有网卡（含公网口、docker0 之外的桥），而这里要的只是"局域网能连"。
+      # dev 按设计就是全开：BIND_ADDR 落到 0.0.0.0，本机每个地址（LAN、tailscale、以后
+      # 再插的网卡）上同一批端口各有一份，所以不存在"第二个绑定口"那种东西。
+      # 局域网地址仍然探 —— 但它用于两件事：打印给人点的链接，和喂 Fay 的 FAY_URL
+      # （音频地址必须是远端真能取到的那个 IP，写 0.0.0.0 等于把对端引向它自己）。
       : "${DH_LAN_IP:=$(detect_lan_ip)}"
-      : "${BIND_ADDR:=$DH_LAN_IP}"
+      : "${BIND_ADDR:=0.0.0.0}"
       export DH_LAN_IP BIND_ADDR
     fi
     use_profile
     echo "[run] 档位 DH_ENV=$DH_ENV，BIND_ADDR=${BIND_ADDR:-（compose 默认）}"
+    # 打印用的地址：绑 0.0.0.0 时不能把 http://0.0.0.0:5173 交给用户当链接。
+    case "${BIND_ADDR:-}" in
+      ""|0.0.0.0) DISP=${DH_LAN_IP:-127.0.0.1} ;;
+      *)          DISP=$BIND_ADDR ;;
+    esac
     $COMPOSE build
     $COMPOSE up -d
     shift 2>/dev/null || true
@@ -304,20 +312,23 @@ case "${1:-up}" in
     # 把 up 卡在那儿十分钟不值。只报当前状态，等它就去看 ./run.sh logs funasr。
     echo "[run] funasr 就绪状态：$(docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}' dh-funasr 2>/dev/null || echo 未起)"
     echo
-    echo "CareEcho H5       : http://${BIND_ADDR:-127.0.0.1}:${FRONTEND_PORT:-5173}/"
-    echo "Fay Web 管理台    : http://${BIND_ADDR:-127.0.0.1}:${FAY_HTTP_PORT:-5000}/"
-    echo "后端接口文档      : http://${BIND_ADDR:-127.0.0.1}:${BACKEND_PORT:-8000}/docs"
-    echo "数字人 WS         : ws://${BIND_ADDR:-127.0.0.1}:${FAY_HUMAN_WS_PORT:-10002}"
+    echo "CareEcho H5       : http://${DISP}:${FRONTEND_PORT:-5173}/"
+    echo "Fay Web 管理台    : http://${DISP}:${FAY_HTTP_PORT:-5000}/"
+    echo "后端接口文档      : http://${DISP}:${BACKEND_PORT:-8000}/docs"
+    echo "数字人 WS         : ws://${DISP}:${FAY_HUMAN_WS_PORT:-10002}"
     if [ "${DH_ENV}" = dev ]; then
       # 跨机三行：UE 在另一台电脑上时，那台机器需要的就只是这三件事。
       echo
       echo "[dev] 另一台电脑（UE / 手机）要连过来："
-      echo "  1. Windows 的 C:\\Windows\\System32\\drivers\\etc\\hosts 加一行：  ${BIND_ADDR}  dh-host"
-      echo "  2. UE 里填 ws://dh-host:${FAY_HUMAN_WS_PORT:-10002}（或直接写 ${BIND_ADDR}，跳过 hosts 那步）"
+      echo "  端口绑在 0.0.0.0：本机每个地址都收（LAN / tailscale / 以后新插的网卡），换网卡不必重起。"
+      echo "  1. Windows 的 C:\\Windows\\System32\\drivers\\etc\\hosts 加一行：  ${DISP}  dh-host"
+      echo "  2. UE 里填 ws://dh-host:${FAY_HUMAN_WS_PORT:-10002}（或直接写 ${DISP}，跳过 hosts 那步）"
       echo "  3. 复核 UE 拿到的音频地址不是 127.0.0.1： docker exec dh-fay python -c \"from utils import config_util as c;c.load_config();print(c.fay_url)\""
-      echo "     （那行由 FAY_URL 控制，dev 档位已设成 http://${BIND_ADDR}:5000；见 patches/fay/0007 与 README「跨机流量」）"
+      echo "     （那行由 FAY_URL 控制，dev 档位已设成 http://${DH_LAN_IP:-127.0.0.1}:5000 —— 音频地址要是对端真能取到的那个 IP，不能是 0.0.0.0；见 patches/fay/0007 与 README「跨机流量」）"
       echo "  麦克风：H5 的 ws://<页面同源>/funasr-ws 由外壳转发进 funasr，不需要单独开端口。"
-      echo "  注意 getUserMedia 只在 https 或 localhost 是安全上下文 —— 用 http://${BIND_ADDR}:5173 打开时，"
+      echo "  代价：管理口 13306 / 16379 与应用口一起出去了，能不能进去只看口令 —— dev 用完 ./run.sh down。"
+      echo "  复核开了哪些口： docker compose --env-file .env -f docker-compose.yml -f docker-compose.dev.yml config | grep -E 'host_ip: ' | sort -u"
+      echo "  注意 getUserMedia 只在 https 或 localhost 是安全上下文 —— 用 http://${DISP}:5173 打开时，"
       echo "        非 localhost 的页面上麦克风按钮必然失败，那是浏览器策略不是本栈故障（README「未覆盖能力」）。"
     fi
     echo "跑 ./run.sh smoke 做端到端验证；./run.sh test 跑全套功能测试"
@@ -404,7 +415,7 @@ case "${1:-up}" in
     # fay-lite 是 test profile 里的轻模型实例（qwen2.5:1.5b），只有它能在被其他
     # 服务占满显存的机器上秒级答完，用来判定「问答链路是否真的通」。
     $COMPOSE --profile test up -d --wait fay-lite 2>&1 | tail -3
-    ALL_GROUPS="backend-test backend-probe adapter-test probe-selftest frontend-test ws-relay-test asr-test probe-fay-lite ue-audit fay-probe probe-yueshen frontend-probe asr-probe"
+    ALL_GROUPS="backend-test backend-probe adapter-test probe-selftest frontend-test ws-relay-test asr-test probe-fay-lite ue-audit fay-probe probe-yueshen frontend-probe asr-probe kb-ingest"
     # 允许 ./run.sh test fay-probe 只跑一组：改探针时不必再等 20 分钟全套。
     # 变量名不能叫 GROUPS —— bash 的内置只读数组（当前用户的 gid），赋值会被吞掉。
     # 默认顺序把 probe-fay-lite 排在两个 9b 实例之前：ollama 是单条队列，
@@ -433,7 +444,12 @@ case "${1:-up}" in
     # 识别服务的线上协议与累计文本那条性质，都不加载 torch、不碰 ollama，两组都是秒级。
     # asr-probe 排在全套最末：它是唯一真的跑一次 CPU 推理的一组（paraformer-large 会
     # 从 ollama 那些 CPU 驻留权重嘴里抢核），所以它既不能排在问答组之前，也不该被它们排队。
-    DEFAULT_GROUPS="backend-test backend-probe adapter-test probe-selftest frontend-test ws-relay-test asr-test probe-fay-lite ue-audit fay-probe probe-yueshen frontend-probe asr-probe"
+    # kb-ingest 排在 asr-probe 之后、成为新的最末一组：它比 asr-probe 更贵 —— 每次都
+    # reset 重嵌入那 516 个片段（几分钟），还要把 qwen3-embedding 换进唯一那块 16GB 显存。
+    # 排在最后它谁也不抢，而且它跑完留下的正是真语料（probe-yueshen 在它前面把集合
+    # 换成了 3 段合成语料）。这条组名就是 compose 服务名 ./run.sh test kb-ingest；
+    # 单独调 top_k 用 ./run.sh kb --sweep 3,5,8，那条不占测试组的位。
+    DEFAULT_GROUPS="backend-test backend-probe adapter-test probe-selftest frontend-test ws-relay-test asr-test probe-fay-lite ue-audit fay-probe probe-yueshen frontend-probe asr-probe kb-ingest"
     TEST_GROUPS="$*"
     [ -n "$TEST_GROUPS" ] || TEST_GROUPS="$DEFAULT_GROUPS"
     for g in $TEST_GROUPS; do
@@ -592,7 +608,11 @@ case "${1:-up}" in
     use_profile
     # 不需要重建镜像：seed/kb_corpus 是运行期挂载，但挂载本身变了要 recreate 才生效。
     $COMPOSE up -d yueshen-rag
-    $COMPOSE run --rm kb-ingest "$@"
+    # 这里写全命令而不是 `$COMPOSE run --rm kb-ingest "$@"`：compose 的 run 把服务名
+    # 后面的参数当成**替换整条 command**，不是追加 —— 带参数时它会拿 "--sweep" 当可执行
+    # 文件（实测：exec: "--sweep": executable file not found in $PATH）。脚本自己的默认值
+    # 就是 compose 那条 command 里的 --base/--timeout 两个值，所以只写脚本名，参数交给默认。
+    $COMPOSE run --rm kb-ingest python /probe/kb_ingest.py "$@"
     ;;
   asr-seed)
     # 纯粹省一次下载：本机若跑过伙伴方那台 FunASR，它那个卷里已经下好了约 1.3GB 模型

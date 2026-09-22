@@ -57,7 +57,7 @@
         "args": [],
         "cwd": "",
         "env": {},
-        "autostart": false
+        "autostart": true
     },
     {
         "id": 5,

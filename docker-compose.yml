@@ -60,6 +60,40 @@ x-llm-timeouts: &llm-timeouts
   EMBEDDING_MAX_RETRIES: "1"
   STREAM_REPLY_IDLE_TIMEOUT: "480"
 
+# LLM / embedding 的端点与密钥。全部默认空 = 逐字用 overlay/fay/system.conf 里那份示例
+# 值（本机 ollama）。之所以走环境变量而不是改那份文件：端点是按机器变的事（小模型跑在
+# 本机还是远端另一台带得动大模型的机器上），而被跟踪的配置文件只能留「在这台机器上跑得
+# 起来」的示例 —— 上一轮把远端 26B 写进 system.conf，那 6 行机器拓扑就进了 git 历史。
+# 机制在 patches/fay/0009，模型名那两条在 0006。
+x-llm-endpoint: &llm-endpoint
+  FAY_GPT_BASE_URL: ${FAY_GPT_BASE_URL:-}
+  FAY_GPT_API_KEY: ${FAY_GPT_API_KEY:-}
+  FAY_BIG_MODEL_BASE_URL: ${FAY_BIG_MODEL_BASE_URL:-}
+  FAY_BIG_MODEL_API_KEY: ${FAY_BIG_MODEL_API_KEY:-}
+  # 这三条刻意由 yueshen-rag 那侧的 YUESHEN_EMBED_* 同一组键喂，而不是再开一套名字：
+  # Fay 写进仿生记忆的向量与知识库检索用的向量必须出自同一个模型、同一个端点，分叉的
+  # 症状是「检索永远命中不到刚灌进去的内容」，且不报错（本机踩过一次，见 EMBEDDING_TIMEOUT
+  # 上面 run #7 那段）。留空时两边各自回落默认，实测仍指向同一个宿主 ollama。
+  FAY_EMBEDDING_MODEL: ${YUESHEN_EMBED_MODEL:-}
+  FAY_EMBEDDING_BASE_URL: ${YUESHEN_EMBED_BASE_URL:-}
+  FAY_EMBEDDING_API_KEY: ${YUESHEN_EMBED_API_KEY:-}
+
+# lite 那份**刻意不跟主实例共用** &llm-endpoint。它存在的理由是「本机显存装得下的那个小模型
+# + 本机 ollama」，模型名由 FAY_LITE_MODEL_ENGINE 钉在本地；端点要是跟着主实例搬到远端，
+# 就等于拿 qwen2.5:1.5b 去问那台只有大模型的服务器 —— 探针会红在模型名上，而红的原因和它
+# 要证的「问答链路真的通」毫无关系（2026-09-22 实测：远端 /v1/models 只有
+# gemma-4-26b-a4b-nvfp4 一条）。真要让它也走远端，显式给 FAY_LITE_GPT_BASE_URL。
+x-llm-endpoint-lite: &llm-endpoint-lite
+  FAY_GPT_BASE_URL: ${FAY_LITE_GPT_BASE_URL:-http://host.docker.internal:11434/v1}
+  FAY_GPT_API_KEY: ${FAY_LITE_GPT_API_KEY:-ollama}
+  FAY_BIG_MODEL_BASE_URL: ${FAY_LITE_GPT_BASE_URL:-http://host.docker.internal:11434/v1}
+  FAY_BIG_MODEL_API_KEY: ${FAY_LITE_GPT_API_KEY:-ollama}
+  # embedding 那三条仍然与主实例同一组键：两个实例往同一张会话表旁边写的仿生记忆坐标
+  # 必须出自同一个模型、同一个端点，这一条不能"lite 化"。
+  FAY_EMBEDDING_MODEL: ${YUESHEN_EMBED_MODEL:-}
+  FAY_EMBEDDING_BASE_URL: ${YUESHEN_EMBED_BASE_URL:-}
+  FAY_EMBEDDING_API_KEY: ${YUESHEN_EMBED_API_KEY:-}
+
 # Fay 两实例（fay / fay-lite）共用同一份镜像、同一套对外端口，
 # 也就共用同一条就绪判据。只看 :5000 会过早放行：实测开机 :5000/:5010/:10002/
 # :10003 第 6 秒全 bind，而 :8765（MCP SSE）要等到第 24~61 秒 —— 它排在开机自检
@@ -103,11 +137,13 @@ services:
       - mysql-data:/var/lib/mysql
       - ./sql/init:/docker-entrypoint-initdb.d:ro
     ports:
-      # 这一条**故意不跟 BIND_ADDR**（其它应用面端口都跟）。dev 档位会把 BIND_ADDR
-      # 导成局域网地址，而 compose 的 ports 是按 host_ip+target 合并的 —— 覆盖不掉，
-      # 只会在 LAN 那条旁边再加一条。写死才是"只靠口令的数据库不进局域网"这条边界的
-      # 落地处：后端与 Fay 都在 compose 网络上按容器名连它，没有任何外部消费者。
-      - "127.0.0.1:${MYSQL_HOST_PORT:-13306}:3306"
+      # 跟 BIND_ADDR 走，**不再有"恒 loopback"这条例外**（2026-09-22 改的口径：dev 档位
+      # 直接绑 0.0.0.0，管理口与应用口一起出去）。收紧靠档位而不是这一行：prod 的
+      # BIND_ADDR 由 run.sh 钉死在 127.0.0.1（改成别的地址直接拒），所以这里的
+      # `${BIND_ADDR:-127.0.0.1}` 在 prod 下逐字等于原来的写死值。
+      # 代价写在这里，不粉饰：`./run.sh dev` 之后同网段的任何机器都敲得到 13306，
+      # 能不能进去只看 MYSQL_ROOT_PASSWORD 这一道口令 —— dev 用完 ./run.sh down。
+      - "${BIND_ADDR:-127.0.0.1}:${MYSQL_HOST_PORT:-13306}:3306"
     healthcheck:
       test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -uroot -p\"$$MYSQL_ROOT_PASSWORD\" --silent"]
       interval: 5s
@@ -123,9 +159,9 @@ services:
     volumes:
       - redis-data:/data
     ports:
-      # 同 mysql：不跟 BIND_ADDR，恒 loopback。Redis 这边连"库"的概念都没有，
-      # 一个 requirepass 就是全部，放到局域网等于把可写 KV 交给同网段的每台机器。
-      - "127.0.0.1:${REDIS_HOST_PORT:-16379}:6379"
+      # 同 mysql：不再恒 loopback，跟 BIND_ADDR 走，收紧交给档位。Redis 这边连"库"的
+      # 概念都没有，一个 requirepass 就是全部 —— dev 期间它是一个对同网段开放的可写 KV。
+      - "${BIND_ADDR:-127.0.0.1}:${REDIS_HOST_PORT:-16379}:6379"
     healthcheck:
       test: ["CMD-SHELL", "redis-cli -a \"$$REDIS_PASSWORD\" ping | grep -q PONG"]
       interval: 5s
@@ -154,7 +190,10 @@ services:
       # 嵌入模型走宿主 Ollama 的 OpenAI 兼容口，与 system.conf 里 embedding_* 同一套。
       # 模型名必须显式给：server.py 的默认值是 "embedding"，那是 Fay 自己 :5000 转发口
       # 上的别名，直连 ollama 时它认不出这个名字。
-      YUESHEN_EMBED_BASE_URL: http://host.docker.internal:11434/v1
+      # 这三个键同时也是上面 &llm-endpoint 里 FAY_EMBEDDING_* 的来源 —— 一组键喂两侧，
+      # 就是为了「写进库的向量」和「查询用的向量」不可能出自不同的模型或端点。
+      YUESHEN_EMBED_BASE_URL: ${YUESHEN_EMBED_BASE_URL:-http://host.docker.internal:11434/v1}
+      YUESHEN_EMBED_API_KEY: ${YUESHEN_EMBED_API_KEY:-sk-fay}
       YUESHEN_EMBED_MODEL: ${YUESHEN_EMBED_MODEL:-qwen3-embedding:0.6b}
       # 上游写死 30s（patches/0002 才可调）。本机换入 embedding 模型实测要 70s 以上，
       # 30s 撞上的表现是 ingest 返回 inserted:0 而不是报错，所以给到 3 倍余量。
@@ -193,11 +232,17 @@ services:
       # （读 system.conf，为空则自动探测本机 IP）。UE 在另一台电脑上时必须设成那台机器
       # 够得着的地址，见 patches/fay/0007 与 README「跨机流量」。
       FAY_URL: ${FAY_URL:-}
-      <<: *llm-timeouts
+      # 同一个 mapping 里不能写两个 `<<:`（YAML 1.1 的 merge 键重复即报错），所以并成列表。
+      <<: [*llm-timeouts, *llm-endpoint]
     volumes:
       - ./overlay/fay/system.conf:/app/system.conf:ro
       - ./overlay/fay/config.json:/app/config.json
       - ./overlay/fay/mcp_servers.json:/app/faymcp/data/mcp_servers.json
+      # prestart 注册表：让知识库在 LLM 推理之前就先跑一次 query_yueshen，
+      # 结果作为 <prestart> 上下文注入。和 mcp_servers.json 一样是**可写**挂载 ——
+      # faymcp/prestart_registry.py:61-69 在控制台改设置时会回写这个文件。
+      # 没有这一条，「知识库命中」只能靠模型自己决定调不调工具（它不调，就是 0 步）。
+      - ./overlay/fay/mcp_prestart_tools.json:/app/faymcp/data/mcp_prestart_tools.json
       - fay-memory:/app/memory
       - fay-cache:/app/cache_data
       - fay-logs:/app/logs
@@ -224,7 +269,11 @@ services:
       FAY_BASE_URL: http://fay:5000
       ADAPTER_PORT: "8010"
       ADAPTER_MAX_WAIT_SECONDS: ${ADAPTER_MAX_WAIT_SECONDS:-500}   # 必须 > Fay 的 STREAM_REPLY_IDLE_TIMEOUT(480)、< 后端 FAY_FORWARD_TIMEOUT_SECONDS
-      ADAPTER_SETTLE_SECONDS: ${ADAPTER_SETTLE_SECONDS:-2}
+      # 静默判停只是**没看到 patches/fay/0008 那个哨兵时**的退路（镜像没按新补丁重建才会走到），
+      # 而且要求此刻手里已经有正文 —— 只剩占位句时再等也不亏，交出去的一定是错的。
+      # 不能再当"响应速度"调：两阶段协议里「占位句 → 工具执行 → 正式回答」这段静默实测 3~30s，
+      # 上游那个 2s 会在这里把回答截成半句（见 adapter/server.py 模块头）。
+      ADAPTER_SETTLE_SECONDS: ${ADAPTER_SETTLE_SECONDS:-8}
       ADAPTER_USERNAME_PREFIX: ${ADAPTER_USERNAME_PREFIX:-elder_}
     volumes:
       - ./adapter:/adapter:ro
@@ -544,7 +593,8 @@ services:
     command: ["python", "main.py", "start"]
     environment:
       TZ: Asia/Shanghai
-      <<: *llm-timeouts
+      <<: [*llm-timeouts, *llm-endpoint-lite]
+      # 显式键优先于上面 merge 进来的同名词，这个次序不要反。
       FAY_GPT_MODEL_ENGINE: ${FAY_LITE_MODEL_ENGINE:-qwen2.5:1.5b}
       FAY_BIG_MODEL_ENGINE: ${FAY_LITE_MODEL_ENGINE:-qwen2.5:1.5b}
     volumes:
@@ -553,6 +603,10 @@ services:
       - ./overlay/fay/system.conf:/app/system.conf:ro
       - ./overlay/fay-lite/config.json:/app/config.json
       - ./overlay/fay-lite/mcp_servers.json:/app/faymcp/data/mcp_servers.json
+      # 与 dh-fay 同一套 prestart 配置（lite 那份 mcp_servers.json 里 yueshen 也是 id=4）。
+      # 探针 probe-fay-lite 判的是「问答链路真的通」，它也必须走同一条知识库路径，
+      # 否则绿的是另一条代码路径。
+      - ./overlay/fay-lite/mcp_prestart_tools.json:/app/faymcp/data/mcp_prestart_tools.json
       - fay-lite-memory:/app/memory
       - fay-lite-cache:/app/cache_data
       - fay-lite-logs:/app/logs
@@ -575,8 +629,10 @@ services:
       # 探针的 check_llm_host 要直连「被测实例真正在用的那个模型」量下限耗时；
       # system.conf 里写的是 9b，lite 实例靠补丁换成 1.5b，所以这个开关两边都得给。
       FAY_GPT_MODEL_ENGINE: ${FAY_LITE_MODEL_ENGINE:-qwen2.5:1.5b}
-      # 与被测实例同一份超时预算，否则 check_embedding 量的不是容器真正会走的那条路
-      <<: *llm-timeouts
+      # 与被测实例同一份超时预算，否则 check_embedding 量的不是容器真正会走的那条路。
+      # 端点同理，而且必须用 lite 那一份锚点：探针要量的就是「lite 实际在用哪个端点」，
+      # 挂主实例的 &llm-endpoint 会在主实例搬去远端时，让探针去量一个实例根本没在用的端点。
+      <<: [*llm-timeouts, *llm-endpoint-lite]
     volumes:
       - ./probes:/probe:ro
       - ./overlay/fay/system.conf:/app/system.conf:ro
@@ -618,12 +674,20 @@ services:
 
   # ------------------------------------------------ 科普语料入库 + 检索抽测（./run.sh kb）
   # 与 probe-yueshen 的区别在那份脚本的 docstring 里：那组测链路，这组测数据。
-  # 走 profile "kb" 而不是 "test"：它会把向量库整个 reset 重嵌入（几百个片段、几分钟），
-  # 且没有新断言 —— 测试组该是每次都跑的体检，这一步是「语料变了才跑一次」的动作。
   # 只用标准库，所以不必借 dh-fay 那 1.1GB 镜像。
+  #
+  # 挂两个 profile："kb" 给 `./run.sh kb`（灌库动作，切片变了才跑），"test" 让它同时
+  # 是 `./run.sh test` 的判据 —— 改 top_k / 改切片 / 改 prestart 的人从此有人拦着
+  # （12 问 + 距离明细 + 反向对照）。代价讲明白：它每次都 reset 重嵌入 516 个片段，
+  # 几分钟，还要把 qwen3-embedding 换进那唯一 16GB 显存（换入实测 70s 起），
+  # 所以它在 run.sh 里排在**全套最后**，谁也不抢。
+  # 为什么不做成「只查不灌」的轻量判据：probe-yueshen 会 `ingest_yueshen(reset=True)`
+  # 把整个集合换成镜像里那 3 段合成语料（probes/yueshen_probe.py:202，它那步的条数
+  # 对账必须靠 reset 才成立），于是一条排在它后面、只读现有向量的 KB 判据会永远红。
+  # 这块向量库只有一个集合，谁碰都躲不开，所以判据必须自带灌库。
   kb-ingest:
     <<: [*host-gateway]
-    profiles: ["kb"]
+    profiles: ["kb", "test"]
     image: docker.m.daocloud.io/python:3.12-slim
     container_name: dh-kb-ingest
     restart: "no"

@@ -16,8 +16,20 @@
 * Fay 的回答有两层增长：一句话新增一行（core/fay_core.py:1229
   `add_content('fay','speak',text,...)`），同一流式行又会被反复覆写
   （core/fay_core.py:1336-1339 `accumulated_text = existing_content[3] + text`
-  → `content_db.update_content`）。所以「有没有新行」不足以判断说完，
-  必须把行数和每行长度一起当作增长信号，等一段时间毫无变化再拼接。
+  → `content_db.update_content`）。所以「有没有新行」不足以判断说完。
+* **收工判据用的是哨兵，不是静默。** 上游的 `_<isfirst>` / `_<isend>` 标记在
+  core/stream_manager.py:332-335 就被 replace 掉了，进不了 T_Msg.content；而单模型模式
+  （llm/nlp_cognitive_stream.py `_is_single_model_mode()`）的工具循环是同步跑的，
+  `/api/execution-status` 全程 idle —— 容器外面原本没有任何信号能区分「两阶段协议正在
+  执行工具」和「这句就是最后一句」。只靠静默会在占位句写完、工具还在跑的那 3~30 秒里
+  误判成说完，返回「占位句 + 半句」。patches/fay/0008 补了这个哨兵（`<dh-end>`，
+  写在这一轮回答的正文末尾），看到它就立刻收工；
+  没看到（镜像没按新补丁重建）才退回静默判定。
+* 库里那一行是**原文**，不是给用户看的文本。core/fay_core.py:1410-1437 的 think 剥离
+  只作用于发给数字人/WS 的那份，`/api/get-msg` 返回的 `content` 里留着
+  `<think>…</think>`、`<prestart>…</prestart>`（prestart 工具结果）和占位句
+  「我来帮你查一下，稍等…」（llm/nlp_cognitive_stream.py 的 `_on_tool_detected` /
+  `_submit_tool_execution`）。所以返回前必须过一遍 `_clean()`。
 * 用户名即 Fay 的会话/记忆主键（core/fay_core.py:836 首次交互自动建 member），
   默认 `elder_<user_id>`，从而复用 Fay 的 isolate_by_user 能力。
 * 只用标准库，镜像即 python:3.12-slim，不引入任何依赖。
@@ -30,13 +42,18 @@
                             FAY_FORWARD_TIMEOUT_SECONDS 520，反了会把 Fay 的正常
                             慢响应报成后端自己的错。理由见 containerd/.env.example。
   ADAPTER_POLL_INTERVAL     默认 0.6
-  ADAPTER_SETTLE_SECONDS    默认 2.0（多久没有新行/新字就算说完）
+  ADAPTER_SETTLE_SECONDS    默认 8.0 —— **只在没看到哨兵、且此刻手里已经有正文可交时**才用
+                            （未重建镜像的退化路径）。两阶段协议里「占位句 → 工具执行 →
+                            正式回答」这段静默实测 3~30s，2s 必被截成半句，所以这个兜底值
+                            不能再当"响应速度"调；而只有占位句时收工交出去的一定是错的，
+                            那种情况一直等到 MAX_WAIT（真链路实测：正文有 17.8s 才来的）。
   ADAPTER_USERNAME_PREFIX   默认 elder_
 """
 from __future__ import annotations
 
 import json
 import os
+import re
 import time
 import urllib.error
 import urllib.parse
@@ -48,10 +65,34 @@ FAY_BASE_URL = os.environ.get("FAY_BASE_URL", "http://fay:5000").rstrip("/")
 PORT = int(os.environ.get("ADAPTER_PORT", "8010"))
 MAX_WAIT = float(os.environ.get("ADAPTER_MAX_WAIT_SECONDS", "60"))
 POLL_INTERVAL = float(os.environ.get("ADAPTER_POLL_INTERVAL", "0.6"))
-SETTLE = float(os.environ.get("ADAPTER_SETTLE_SECONDS", "2.0"))
+SETTLE = float(os.environ.get("ADAPTER_SETTLE_SECONDS", "8.0"))
 USERNAME_PREFIX = os.environ.get("ADAPTER_USERNAME_PREFIX", "elder_")
 
 HTTP_TIMEOUT = 8.0
+
+# patches/fay/0008 落在正文末尾的结束哨兵。
+END_SENTINEL = "<dh-end>"
+# 上游在两阶段协议的执行期前推送的过渡语，会和正式回答写进同一行（见模块 docstring）。
+FILLER_SENTENCES = ("我来帮你查一下，稍等…",)
+
+# 正则照抄上游自己清洗历史时用的那两条（llm/nlp_cognitive_stream.py
+# 的 _remove_prestart_from_text / _remove_think_from_text），不另立一套语义。
+_PRESTART_RE = re.compile(r"<prestart[^>]*>[\s\S]*?</prestart>", re.IGNORECASE)
+_THINK_RE = re.compile(r"<think>[\s\S]*?</think>", re.IGNORECASE)
+_THINK_TAG_RE = re.compile(r"</?think>", re.IGNORECASE)
+
+
+def _clean(text: str) -> str:
+    text = _PRESTART_RE.sub("", text)
+    text = _THINK_RE.sub("", text)
+    text = _THINK_TAG_RE.sub("", text)
+    text = text.replace(END_SENTINEL, "")
+    stripped = text.lstrip()
+    for filler in FILLER_SENTENCES:
+        if stripped.startswith(filler):
+            stripped = stripped[len(filler):].lstrip()
+            break
+    return stripped.strip()
 
 
 def _post_form(path: str, payload: dict) -> dict:
@@ -132,11 +173,22 @@ def answer(username: str, text: str) -> tuple[str | None, str | None]:
             collected = fresh
             signature = current
             last_growth = time.monotonic()
-        elif collected and time.monotonic() - last_growth >= SETTLE:
-            break
+        if any(END_SENTINEL in text for text in fresh.values()):
+            break  # 哨兵：这一轮说完了。真信号，不再猜静默
+        if collected and time.monotonic() - last_growth >= SETTLE:
+            # 静默退路还要求「此刻手里已经有正文可交」。只剩占位句 / prestart 时交出去
+            # 也是错的，而继续等没有代价 —— 上界由 MAX_WAIT 兜着。真回答可以迟到很久：
+            # 远端 26B 实测有一轮 17.8s 才把整段正文写完，若按「有行就算说过话」在这里
+            # break，那一轮就成了「本轮没有给出正文」。
+            if _clean("".join(collected[k] for k in sorted(collected))):
+                break  # 只有镜像没按 patches/fay/0008 重建时才会走到这条退路
     if not collected:
         return None, f"等待 Fay 回答超时（{MAX_WAIT:.0f}s，用户名 {username}）"
-    joined = "".join(collected[k] for k in sorted(collected))
+    joined = _clean("".join(collected[k] for k in sorted(collected)))
+    if not joined:
+        # 只剩占位句 / think / prestart，没有可给用户的话。回错误而不是回一段噪声，
+        # 让 service 的 ok=False 分支（app/services/fay_gateway.py:57-63）接管。
+        return None, f"Fay 本轮没有给出正文（用户名 {username}）"
     return joined, None
 
 
