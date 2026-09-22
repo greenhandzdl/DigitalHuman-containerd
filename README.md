@@ -137,9 +137,10 @@ cd containerd      # 本目录（仓库里唯一有可执行入口的地方）
 ./run.sh up        # 构建 + 起栈（首次约 3~6 分钟，pip 走阿里云镜像、npm 走 npmmirror）
 ./run.sh dev       # 同一套东西，但叠上 docker-compose.dev.yml：应用面端口放开、DEBUG=true
 ./run.sh smoke     # 端到端：后端 → adapter → Fay → Ollama → 落库
-./run.sh test      # 十三组测试件：backend-test · backend-probe · adapter-test · probe-selftest
+./run.sh test      # 十四组测试件：backend-test · backend-probe · adapter-test · probe-selftest
                    #            · frontend-test · ws-relay-test · asr-test · probe-fay-lite
-                   #            · ue-audit · fay-probe · probe-yueshen · frontend-probe · asr-probe
+                   #            · ue-audit · fay-probe · probe-yueshen · frontend-probe
+                   #            · asr-probe · kb-ingest
 ./run.sh test fay-probe   # 只跑其中一组（改探针时不用等全套）
 ./run.sh audit     # 核账：四个上游仓库是否仍然零改动、与上游不分叉（非零退出即可当断言）
 ./run.sh upstream  # 跟上上游：fetch xszyou/Fay，报落后几条，并把每份 fay 补丁对 upstream/main 干跑预检
@@ -200,51 +201,65 @@ compose 只把前三个
 
 1. `run.sh` 里那串 `$COMPOSE` 叠不叠 `docker-compose.dev.yml`
    （所有子命令都用同一个变量，所以各处不用改）；
-2. `dev` 下 `BIND_ADDR` 落到**探测出来的局域网地址**（`ip route get 1.1.1.1` 的源地址），
-   而不是 `0.0.0.0`。
+2. `dev` 下 `BIND_ADDR` 落到 **`0.0.0.0`** —— 本机每个地址都收，换网卡或加一条 tailscale
+   都不必重起（2026-09-22 改的口径；原先是绑"探测出来的局域网地址"，另配一个
+   `DH_EXTRA_BIND` 显式第二口，那是绕路，见下面「dev 追加什么」）。
+   局域网地址仍然要探测，但它只喂两处**给人看**的值：banner 里那几条
+   `http://<地址>:端口` 的链接（绑 0.0.0.0 时不能把 `http://0.0.0.0:5173` 交给用户），
+   和 Fay 的 `FAY_URL`（音频地址必须是对端真能取到的那个 IP，写 0.0.0.0 等于把 UE 引向它自己）。
 
 ### prod 的硬闸
 
 ```
 $ DH_ENV=prod BIND_ADDR=0.0.0.0 ./run.sh up
-[run] DH_ENV=prod 不接受 BIND_ADDR=0.0.0.0 —— 那会把管理台与无鉴权接口发布到外部。
-      要给别的机器连就用 ./run.sh dev（它绑到探测出的局域网 IP，不是 0.0.0.0）。
+[run] DH_ENV=prod 不接受 BIND_ADDR=0.0.0.0 —— 那会把管理台、无鉴权接口与数据库发布到外部。
+      要给别的机器连就用 ./run.sh dev（那个档位按设计就是绑 0.0.0.0 全开）。
 $ echo $?
 1
 ```
 
 不做「提醒之后继续」而直接退出，是因为这类暴露最常见的成因就是有人临时改过一次 `.env`
 然后忘了改回来 —— 而 `:5000` 一离开 loopback，同时出去的是 **Fay 的 Web 管理台**和它的
-**无鉴权 OpenAI 兼容 façade**（`POST /v1/chat/completions`，见 `fay/gui/flask_server.py:775`）。
+**无鉴权 OpenAI 兼容 façade**（`POST /v1/chat/completions`，见 `fay/gui/flask_server.py:775`），
+而自从管理口也跟随 `BIND_ADDR`，这条闸现在还是 `13306` / `16379` 不出本机的**唯一**保证。
 闸在 `use_profile` 里，跑在任何 docker 命令之前。
 
 ### dev 追加什么
 
-`docker-compose.dev.yml` 只放开**应用面**：`frontend` 5173、`backend` 8000、`adapter` 8010、
-`fay` 5000/10002/10003 + 内网口 5010/8765/10001 + 音频桥 `${FAY_BRIDGE_PORT:-10199}:9001`、
-`yueshen-rag` 8766、`funasr` 10095，并给后端 `DEBUG: "true"`、给 Fay
-`FAY_URL: http://${DH_LAN_IP}:5000`。
+`docker-compose.dev.yml` 追加的是 prod 根本不发布的内部口：`fay` 的 5010 / 8765 / 10001
++ 音频桥 `${FAY_BRIDGE_PORT:-10199}:9001`、`yueshen-rag` 8766、`funasr` 10095，
+并给后端 `DEBUG: "true"`、给 Fay `FAY_URL: http://${DH_LAN_IP}:5000`。
+地址不在这份文件里决定 —— 应用面那几条（`frontend` 5173、`backend` 8000、`adapter` 8010、
+`fay` 5000/10002/10003）写在基础文件里、由 `BIND_ADDR` 定地址，这份文件只是把同一批
+端口**连清单一起重写一遍**（为什么必须整份重写见下面第二条合并语义），于是 dev 与 prod
+差的只是"多了几条"和"绑在哪"。
 
-- **`mysql` / `redis` 即使在 dev 也恒 `127.0.0.1`**。它们没有任何外部消费者，
-  而「只靠一个口令的数据库/可写 KV 进局域网」是这类栈最常见的泄漏面。
-  这一条写在**基础文件**里而不是覆盖文件里 —— compose 的 `ports:` 是按
-  `host_ip` + `target` 合并的，覆盖层换个 `host_ip` 只会**多加一条**而不是改掉那条，
-  想收紧只能在源头写死。这是本轮踩实的一条合并语义。
+- **`mysql` / `redis` 与应用口一样吃 `BIND_ADDR`**，dev 下 `13306` / `16379` 也对同网段开放。
+  这是明确定的口径，不是漏了例外（原先这两条在基础文件里写死 `127.0.0.1`，2026-09-22 撤掉）。
+  收紧的手段是**档位**而不是给两个服务开特例：prod 的 `BIND_ADDR` 被 `run.sh` 钉在 loopback，
+  改成别的地址直接拒（上面那条闸），所以"数据库不出本机"在 prod 下照样成立 ——
+  实现从"这一行写死"换成了"这一档压根不给外部地址"。dev 期间的代价照实写：
+  同网段的任何机器都敲得到 13306，能不能进去只看 `MYSQL_ROOT_PASSWORD` 一道口令。
+  这一条里留下的教训是**合并语义**：覆盖层换个 `host_ip` 是**多加一条**而不是改掉那条，
+  所以端口地址只能在它所在的那一份文件里改 —— 这也是这两条今天写在基础文件、
+  而不在 dev 文件里的原因（dev 文件里根本没有它们）。
 
-  两档的渲染结果（`docker compose ... config`，把 `BIND_ADDR` 设成本机局域网 IP 192.168.0.2 问的，
-  不是运行期截图 —— 它测的是 compose 的合并语义，与栈起没起无关）：
+  两档的渲染结果（`docker compose ... config`：prod 那列不导出 `BIND_ADDR`、由 `.env` 给
+  `127.0.0.1`；dev 那列就是 `run.sh` 在 dev 下导出的 `0.0.0.0`。它测的是 compose 的合并语义，
+  与栈起没起无关 —— 起来之后的 `docker ps` / `ss -ltn` 各看过一次，就在下面那段）：
 
   | 服务 | prod（基础文件） | dev（叠 `docker-compose.dev.yml`） |
   |---|---|---|
-  | `frontend` / `backend` / `adapter` | `192.168.0.2:5173/8000/8010`（各一条） | 同左，端口不变 |
+  | `frontend` / `backend` / `adapter` | `127.0.0.1:5173/8000/8010`（各一条） | 同端口，地址换成 `0.0.0.0` |
   | `fay` | 5000 / 10002 / 10003 | 追加 5010 / 8765 / 10001 / `10199->9001` |
-  | `funasr` | **`(no published ports)`** | `192.168.0.2:10095` |
-  | `yueshen-rag` | **`(no published ports)`** | `192.168.0.2:8766` |
-  | `mysql` / `redis` | `127.0.0.1:13306` / `127.0.0.1:16379` | **与 prod 一字不差** |
+  | `funasr` | **`(no published ports)`** | `0.0.0.0:10095` |
+  | `yueshen-rag` | **`(no published ports)`** | `0.0.0.0:8766` |
+  | `mysql` / `redis` | `127.0.0.1:13306` / `127.0.0.1:16379` | `0.0.0.0:13306` / `0.0.0.0:16379` |
 
-  值得看的是两件事：dev 每个服务仍然**只有一条**（没有因为 `host_ip` 变了就多出一条 loopback，
-  这正是"每个被碰的服务重写完整 `ports:` 清单"买来的结果），以及 prod 那一列里 `BIND_ADDR`
-  一旦被改成局域网地址，应用面端口就真的跟着出去了 —— 所以闸必须存在，见上面那条。
+  值得看的是两件事：dev 每个服务仍然**只有一条**（没有因为 `host_ip` 变了就多出一条
+  loopback，这正是"每个被碰的服务重写完整 `ports:` 清单"买来的结果），以及整张表里
+  **地址只有一个来源** —— 14 条端口没有一条把 `host_ip` 写死，所以 `BIND_ADDR` 就是唯一的
+  开关，prod 那道闸也就真的管得住包括数据库在内的每一个口。
 - **`DEBUG` 不是 `DH_ENV` 的隐式含义，而是 dev 显式写出来的一个值**，因为后端只在
   `DEBUG=true` 时挂载 `POST /api/v1/auth/dev-login`，而 H5 前端**根本没有登录这一步**
   （身份由外壳替设备铸）。`DEBUG=false` 起 dev 档位的现象是：页面打得开、每一发问答都 502，
@@ -252,12 +267,21 @@ $ echo $?
   `probes/frontend_test.py` 判据 18 钉着，不用靠人记得这段文字。
 - 每个被 dev 碰到的服务都**重写完整的 `ports:` 清单**，这样「同标识覆盖」和「异标识追加」
   两种合并语义下结果一样 —— 不必去猜 compose 实现到底按哪种处理。
+- **dev 没有"只开某一个地址"这一档**：`BIND_ADDR` 在 dev 下就是 `0.0.0.0`，本机每张网卡
+  （局域网、tailscale、以后新插的）一起收；换网卡、加一条 VPN 都不必重起，也不必知道
+  本机现在有哪些地址。这里曾经有过一套 `DH_EXTRA_BIND` + `docker-compose.dev.extra.yml`
+  的"第二个绑定口"（2026-09-22 撤掉）：那份文件与 `docker-compose.dev.yml` 同形、只差一个
+  `host_ip`，六个服务的端口清单要人肉跟着另一份改，而它买到的只是"少开一张网卡"——
+  在一个按设计就全开的档位里没有价值。**要收紧就回 prod，中间态不做。**
+  剩下的唯一一条地址纪律是：**prod 不接受外部 `BIND_ADDR`**（上面那个硬闸），
+  所以"全开"这个姿态在仓库里只能由 `./run.sh dev` 触发，改一行 `.env` 改不出来。
 
 ### 跨机：UE 在另一台电脑上
 
 真正影响正确性的只有两件：**进得来** 和 **取到可达的音频地址**。
 
-- 进得来 → 端口绑到局域网地址（上面那条），UE 里填 `ws://<本机 LAN IP>:10002`。
+- 进得来 → dev 档位绑 `0.0.0.0`，本机哪个地址都收，UE 里填 `ws://<本机任一地址>:10002`
+  就行（以前这里是"把 `BIND_ADDR` 换成局域网地址"，2026-09-22 起 dev 不再需要挑地址）。
 - 音频地址 → Fay 回给 UE 的音频 URL 是拼 `fay_url` 得来的，而 `overlay/fay/system.conf:58`
   钉的是 `http://127.0.0.1:5000` —— 换台机器 UE 就取不到文件。
   `patches/fay/0007-fay-url-env-overridable-CRLF-source.patch` 把这一行放开成
@@ -275,17 +299,21 @@ $ echo $?
 `./run.sh dev` 起来后会把这三行直接打印出来（含本机实际 LAN 地址与容器里生效的 `fay_url`），
 免得每次都回来查文档。
 
-上面那张表是**渲染出来的**（compose 会怎么写）。两档真正跑起来之后 `ss -ltn` 各看过一次，
-数字对得上，而且 prod 那一列有个容易看错的细节：
+上面那张表是**渲染出来的**（compose 会怎么写）。两档真正跑起来之后各看过一次，数字对得上，
+而且 prod 那一列有个容易看错的细节：
 
 ```
-prod（./run.sh up）  127.0.0.1:5173 8000 8010 5000 10002 10003 13306 16379 —— 共 8 条，全在 loopback
+prod（./run.sh up，不导出 BIND_ADDR，由 .env 给 127.0.0.1）
+                     127.0.0.1:5173 8000 8010 5000 10002 10003 13306 16379 —— 共 8 条，全在 loopback
                      10095 / 8766 / 5010 / 10001 / 10199 一条都没有（`docker ps` 里它们只是
                      `8765/tcp` 这种"未发布"形态）
-dev （./run.sh dev） 应用面那六个口改绑 192.168.0.2（`mysql`/`redis` 那两条仍留在 loopback，
-                     见上面第一条），另加 10095 / 8766 / 5010 / 8765 / 10001 / 10199。
-                     `ss -ltn` 里真看过的是 `192.168.0.2:5173` 与 `:10095` 这两条（其余按
-                     上面那张渲染表算，别把"compose 会这么写"当成"实测过"）；
+dev （./run.sh dev，run.sh 把 BIND_ADDR 导成 0.0.0.0）
+                     上面那 8 条一条不少、地址全换成 0.0.0.0（**含 13306 / 16379**），
+                     再加 10095 / 8766 / 5010 / 8765 / 10001 / 10199 —— 共 14 条。
+                     `docker ps` 与 `ss -ltn` 两侧都真看过：14 条清一色 `0.0.0.0`，
+                     13306 / 16379 在 `ss -ltn` 里也是 `0.0.0.0:`；从本机 tailscale 地址
+                     和从 127.0.0.1 各打一次 `:5173/api/health` 都是 200 —— 绑 0.0.0.0
+                     覆盖回环，所以探针那批按 127.0.0.1 连的判据一条都不受影响。
                      从宿主真打 ws://192.168.0.2:10095/ 与经外壳的 ws://192.168.0.2:5173/funasr-ws
                      各识别出同一句 final（1.5s / 1.2s，见「FunASR：麦克风这条链」末）
 ```
@@ -500,6 +528,13 @@ Fay 实例 `fay-lite` 兜住：同一个镜像、同一套补丁、同一份 `sy
 真的取回 wav（#21 469970 字节 / #23 385298 字节 / #24 544058 字节 / #27 328146 字节），
 以及 MCP 那一整组不打 LLM 的确定性判据（含 prestart 那三档；剩下 2 条 SKIP 是无头白名单里的
 `window capture` 与本机没起的 FunASR，`yueshen rag` 这一轮已经是两条正面 PASS，见规矩 4）。
+**2026-09-22 打开 `autostart` + 配好 prestart 之后复跑：42 条里 40 PASS / 2 SKIP / 0 FAIL**。
+少的那一条是 `MCP 现场连接离线服务器 yueshen rag` —— yueshen 现在开机就在 online 池里，探针不必
+再替它现场连（正是这轮要的效果），`MCP 工具清单 server_id=4` 那条仍在。同一次复跑里
+`MCP 预启动工具注销后清单回到空` **红了第一次**：它假设探针登记前清单是空的，而 overlay 那份配置让
+实例一开机就带着 `(4, query_yueshen)`，探针登记的却是 id=6 上的另一个工具。判据已改成「回到登记前
+那一份」（`MCP 预启动工具注销后清单回到登记前`）—— 配置是配置、残留是残留，而注册/注销共用一次
+**整表回写**，误删会顺着 bind-mount 写进宿主那份 JSON 等着被提交，所以这条等式要比「我那条没了」更严。
 
 一个一直咬人的坑：v4.8.1 这份源码里 `utils/api_embedding_service.py`、
 `gui/flask_server.py`、`fay_booter.py`、`utils/config_util.py`、`main.py`（还带 BOM）都是
@@ -567,7 +602,7 @@ RUN for p in /tmp/patches/*.patch; do patch -p1 -d /app --silent < "$p"; done
 ```
 
 补丁用 `diff -ruN a b` 生成（`--- a/... +++ b/...`），所以 `-p1` 正好落到 `/app`。
-目前 10 份：fay 6 + service 2 + yueshen_rag 2。
+目前 13 份：fay 9 + service 2 + yueshen_rag 2。
 
 > **2026-09-21 基线变更**：Fay 侧仍是 6 份，但这 6 份的内容整套换掉了 —— `fay/` 子模块的远端从
 > `chuan114514/-Helpful-Listener-Fay-AI-`（把源码整份导入、与上游无共同历史，导入点 `45b44e9`）
@@ -595,6 +630,9 @@ RUN for p in /tmp/patches/*.patch; do patch -p1 -d /app --silent < "$p"; done
 | `patches/fay/0004-remote-audio-listener-thread-race-CRLF-source.patch` | `fay_booter.py` 的远程音频监听线程：`__init__` 先 `thread.start()` 后赋 `deviceConnector`，而 `run()` 第一句就读它。`xszyou/Fay@74b49ae` 把 `except: pass`（1 秒后重试、能自愈）改成「记日志 + `__running=False`」，这个竞态于是变成「监听线程一上线就退」+「关掉刚 accept 的 socket」，客户端表现为 connect 之后立刻 ConnectionReset。补丁把赋值挪到 start 之前，见「远程音频输入」一节 |
 | `patches/fay/0005-graceful-stop-no-longer-reports-as-crash-CRLF-source.patch` | `docker stop` 一个健康的 Fay 容器会拿到 **exit=1** —— 一次正常的停止被记成崩溃，`restart: on-failure` 下还会把该停的实例重新拉起。`stopAll()` 串行 join 吃光 5 秒清理预算后走 `os._exit(1)`，改成 `os._exit(0)`。见「优雅停止」一节 |
 | `patches/fay/0006-model-engine-env-overridable-CRLF-source.patch` | `utils/config_util.py` 读完配置后允许 `FAY_GPT_MODEL_ENGINE` / `FAY_BIG_MODEL_ENGINE` 覆盖模型名，给 `fay-lite` 留一条换轻模型的路（不必为它单独写一份只读 system.conf）。不设变量时与上游一字不差 |
+| `patches/fay/0007-fay-url-env-overridable-CRLF-source.patch` | 同一份 `config_util.py` 里把 `fay_url` 开成 `FAY_URL`。它是 Fay 回给数字人的那段音频的 URL 前缀：system.conf 钉死 `http://127.0.0.1:5000` 时，跑在**另一台机器**上的 UE 会按这个地址去取自己的 `127.0.0.1`，永远取不到 wav；而上游那段"为空则自动探测本机 IP"在容器里探到的是容器地址，同样不对。见「跨机流量」|
+| `patches/fay/0008-stream-end-sentinel-CRLF-source.patch` | 给每轮回答在 `T_Msg.content` 末尾落一个 `<dh-end>` 结束哨兵。**没有它容器外面就没有可靠的"说完了"信号**：`_<isend>` 标记在 `core/stream_manager.py:332-335` 进 Interact 之前就被 replace 掉了、`content_db.add_content` 也不存标记，而单模型模式下工具循环是同步跑的，`/api/execution-status` 全程 idle。于是 adapter 只能靠静默判定收尾 —— 两阶段协议的占位句写完之后正好静默 3~30s（工具在执行），2 秒阈值必然在那里截断，用户拿到的是"占位句 + 半句"。哨兵恒写，认不认由 adapter 侧决定（见 `adapter/server.py` 的 `END_SENTINEL`）|
+| `patches/fay/0009-llm-endpoint-env-overridable-CRLF-source.patch` | 把 LLM 与 embedding 的**端点和密钥**（`FAY_GPT_BASE_URL` / `FAY_GPT_API_KEY` / `FAY_BIG_MODEL_BASE_URL` / `FAY_BIG_MODEL_API_KEY` / `FAY_EMBEDDING_*`）开成环境变量，补上 0006 只开了模型名的那半边。理由不是"方便"而是**归属**：`overlay/fay/system.conf` 被 git 跟踪，只能留"在这台机器上跑得起来"的示例值，而"小模型跑本机 ollama 还是跑远端那台带得动 26B 的机器"是按机器变的事 —— 写进它就是把它钉进历史。embedding 那三条单独开、不蹭 LLM 那组，是因为上游在 `embedding_base_url` 留空时**直接复用 `gpt_base_url`**：换掉 LLM 的那一刻嵌入请求也跟着搬走，而新机未必装了这个嵌入模型；写进库的坐标与查询用的坐标一分叉，症状就是"检索永远命中不到刚灌进去的内容"，且不报错 |
 | `patches/yueshen_rag/0001-sse-transport-env-switch.patch` | 上游 `mcp_servers/yueshen_rag/server.py` 只有 stdio transport，容器里没人在 stdin 那头写、Fay 永远连不上。加一条 `YUESHEN_TRANSPORT=sse` 分支（裸 ASGI `(scope,receive,send)` 可调用对象，形状照已被容器验过的 `fay/faymcp/mcp_server.py:538`），让 Fay 用 `mcp_servers.json` 的 ip 直连 `http://<容器名>:8766/sse`；默认仍 stdio，不设变量行为一字不变（见「yueshen 知识库」一节）|
 | `patches/yueshen_rag/0002-embedding-timeout-env.patch` | 上游把 embedding 请求超时写死 30s（`_call_api timeout=30`）。本机显存只够一个模型，ollama 换入嵌入模型实测 72.9s，30s 撞上的表现是 `requests.ReadTimeout` 被 `upsert_chunks` 的 except 吞掉、静默跳过该 chunk，ingest 返回 `success:true / inserted:0`。开成 `YUESHEN_EMBED_TIMEOUT`，默认仍 30 |
 
@@ -660,6 +698,9 @@ fay/.git/config
 `--fuzz=0` 是故意的：能靠容差糊过去的补丁在真实合并里通常已经贴错了位置。有贴不上的
 就非零退出，可以当 CI 断言。当前状态实测（2026-09-21 23:42）：落后 1 条（`d49f476 修复websocket与uvicorn
 版本不兼容问题`）、领先 3 条，**7 份补丁全部可贴**（第 7 份是本轮为跨机加的 `FAY_URL` 覆盖）。
+2026-09-22 06:39 复跑同一段循环，**9 份全部可贴**（第 8、9 份是本轮加的结束哨兵与 LLM 端点覆盖）。
+这一次 `fetch` 仍然没连上（TLS 断，见下），所以落后/领先两个数还是上一次的，只有补丁判定是实时跑的
+—— 而它正是 `behind=0` 时会被 `run.sh` 提前 `exit` 跳过的那一段，所以本轮是照它的逻辑手跑一遍。
 顺带一条佐证 —— 上游那条修复加的就是
 `uvicorn<0.35`，与 `overlay/fay/requirements-docker.txt` 里那条判断一字不差
 （上游 `requirements.txt` 仍然留着裸 `mcp`，所以 `mcp>=1.2,<2` 那根钉还是我们的事）。
@@ -719,6 +760,15 @@ fay/.git/config
 但**那 600s 是拿不到的**：探针的请求先进外壳，外壳在 90s 就替它做了决定。run #32 里
 这一条两次撞在同一处（`90.4s` / `90.3s`，msg 都是 `后端 POST /chat/sessions/N/messages 不可达：timed out`），
 所以 86.5s 那次是擦着上限过的，不是"浏览器之外还有一大段余量"—— 外壳这 90s 才是真正的墙。
+
+**2026-09-22 换上远端那台 26B 之后（`FAY_GPT_BASE_URL` / `FAY_BIG_MODEL_BASE_URL` 走 `.env`，
+`overlay/fay/system.conf` 仍是本机 ollama 的示例值），这面墙从"必然撞"变回"偶尔撞"**：H5
+`http://192.168.0.2:5173/` 连发的实测是 **5.6s / 9.4s / 17.8s / 18.2s** 各拿到一段干净正文
+（`我来帮你查一下，稍等…`、`<prestart>`、`<think>…共 0 步…</think>` 都不再出现在回包里，
+血压那一问还给回语料里的原阈值：诊室 <120/<80、正常高值 120–139 或 80–89、高血压 ≥140/90、
+家庭自测 135/85），**另有一轮 90.1s 撞在外壳那 90s 上**。也就是说：9b 时代"答得比 30s 慢"是
+结构问题，26B 时代它退化成了尾部延迟问题 —— 同一面墙，撞不撞看这一问运气，所以那 90s 仍然不该
+被当成"够用的预算"。
 之所以要放到 500/520：这台机器的显存被别人占着（见上一节），9b 只有 6% 权重进显存时
 一句话要 172~301s，500s 是"够等到但不至于挂死"的位置。显存充裕时同一句话是
 **冷启动 39~40s、暖态 4.8s、长回复 18s**，所以这套预算在好机器上只是等得早停而已。
@@ -878,11 +928,12 @@ SKIP 记，理由写"dev 路由没挂载"，不去猜。
 
 ## 实测通过的链路
 
-`./run.sh test` **现在十三组**（run #12 时是七组，`backend-probe` 在那之后加的，它自己的
+`./run.sh test` **现在十四组**（run #12 时是七组，`backend-probe` 在那之后加的，它自己的
 数字见下表与「后端活体探针」一节；`probe-yueshen` 是那一轮新加的第九组，见
 「yueshen 知识库」一节；`probe-origin-fay` 随参照实例一起撤了；run #31 加 `frontend-test`
 与 `frontend-probe` 两组、run #32 加 `ws-relay-test` / `asr-test` / `asr-probe` 三组，
-见「CareEcho H5 前端」与「FunASR：麦克风这条链」两节）。下面 run #27 / #28
+见「CareEcho H5 前端」与「FunASR：麦克风这条链」两节；2026-09-22 加 `kb-ingest` 第十四组 ——
+知识库那 12 问从「一次性脚本」升成计分判据，见「yueshen 知识库」一节的 recall@k 表）。下面 run #27 / #28
 两张表记的都是**当时九组**的数字。旧基线上最近一次完整运行是 **run #27**（2026-09-21 02:13 起，
 `[test] 全部通过`）。它是第一次把 `probe-yueshen` 组、以及 0002 补丁（服药漏扫时钟冻结）
 和探针的 120s 排空重问一起放进完整一轮 —— 前两件各治一个 run #25 暴露的红，这一轮两者
@@ -1003,7 +1054,7 @@ run #14 上 `test_human_queue_flow` 红了，根因是上游 conftest 不清表�
 | MCP 工具清单 | `tools` → `['add','echo','now','ping','upper']`；知识库 → **8 个** `kb_*`；日程 5 个；logseq 9 个 |
 | MCP 工具真调用 | `ping` → `text='pong'`；`kb_list_sources` → 4045 字、`count=8`；`get_schedules` → 2 条真实日程 |
 | MCP SSE `:8765/sse` | `event: endpoint` + `session_id=…`（验 `uvicorn<0.35`+`websockets~=10.4` 钉法） |
-| MCP 预启动（prestart）三档 | 注册进 `:5010` 且 runnable 清单看得到 → 一句普通问答后 **`:10003` 的 `panelReply` 里出现 `<prestart keep="true">` 包着的 `kb_list_sources` 真实输出** → 注销后清单回到空 |
+| MCP 预启动（prestart）三档 | 注册进 `:5010` 且 runnable 清单看得到 → 一句普通问答后 **`:10003` 的 `panelReply` 里出现 `<prestart keep="true">` 包着的 `kb_list_sources` 真实输出** → 注销后清单回到**登记前那一份**。不是"回到空"：overlay 里那条 `(4, query_yueshen)` 是配置，探针登记的是 id=6 上另一个工具，而注册/注销共用一次整表回写 —— 要求全空就会把配置当成残留摘掉，顺著 bind-mount 写进宿主的 JSON |
 | 远程音频输入口 TCP `:10001` | 连得上、用户名注册成功（`probe_mic_…`），随后 16k 单声道 PCM 推 12s |
 | 远程 PCM 过 VAD | 通：12s 内收到 1 条 `log` 帧，内容 `['聆听中...']` —— recorder 真的判定"有人在说话" |
 | 远程音频的 ASR | **SKIP**：VAD 已过、识别结果为空，ASR 后端是宿主侧 `ws://host.docker.internal:10197`（`ASR_mode=funasr`），本机没起 FunASR，与容器化无关 |
@@ -1306,7 +1357,7 @@ name resolution]`（00:21:44）—— 这台机器的 DNS 出口到 00:2x 之后
 | 档 | 含义 | 探针判据 | 结论 |
 |---|---|---|---|
 | ① 管理面能调 | **我们**通过 `:5010` 的 HTTP 管理接口连服务器、列工具、真调用一次 | `MCP 管理面 /api/mcp/servers`、`MCP 工具清单`、`MCP stdio 示例工具真调用`、`MCP 知识库工具真调用`、`MCP 日程工具真调用` | PASS，与模型无关（三个实例同绿） |
-| ② 一轮对话顺带执行了工具 | 用户说一句自然语言，Fay **因为工具被配置成 prestart** 而在进程内执行它，结果进回答流 | `MCP 预启动工具注册与可运行清单`、`一轮对话真的执行了 MCP 工具（prestart 结果进回答流）`、`MCP 预启动工具注销后清单回到空` | PASS（run #20 首次，run #21 三个实例各现造一帧）；与模型无关，见下 |
+| ② 一轮对话顺带执行了工具 | 用户说一句自然语言，Fay **因为工具被配置成 prestart** 而在进程内执行它，结果进回答流 | `MCP 预启动工具注册与可运行清单`、`一轮对话真的执行了 MCP 工具（prestart 结果进回答流）`、`MCP 预启动工具注销后清单回到登记前` | PASS（run #20 首次，run #21 三个实例各现造一帧）；与模型无关，见下 |
 | ③ 模型自己决定调工具 | 模型读了工具清单，**主动**规划出「该调哪一发」再执行 | —— | **未证**，见下 |
 
 ②这条判据的可信度全在「**这条执行不经 :5010**」：注册 prestart 之后，探针只发一句
@@ -1498,11 +1549,29 @@ run #24 起探针把这条起落做成三条判据，三个实例上都是 PASS�
   （见「真实瓶颈是显存」），超时会落进 `upsert_chunks` 的 `except: 跳过这条 chunk`
   （`server.py:363`），于是 `ingest_yueshen` 返回 `success: true, inserted: 0` ——
   一句错都不报。
-- `overlay/{fay,fay-lite}/mcp_servers.json`：两份都只把 id=4 从
-  `stdio` + `command=python` 换成 `sse` + `ip=http://yueshen-rag:8766/sse`，
-  `autostart` 维持原样。必须是**可写**挂载且**每实例一份**：
+- `overlay/{fay,fay-lite}/mcp_servers.json`：两份都把 id=4 从
+  `stdio` + `command=python` 换成 `sse` + `ip=http://yueshen-rag:8766/sse`，**并且
+  `autostart` 从 `false` 改成 `true`** —— 这一半是"知识库到底有没有被用上"的分水岭，
+  见下面那条。必须是**可写**挂载且**每实例一份**：
   `faymcp/mcp_service.py:111-137` 的 `save_mcp_servers` 是整文件重写，
   三台实例的 fork/上游差异本来就在别的服务上，共用一份会互相盖掉。
+- **`autostart: true` + `overlay/{fay,fay-lite}/mcp_prestart_tools.json` 这两件事缺一不可**，
+  它们是"回答里到底有没有知识库"的机制根因。链路是：
+  `nlp_cognitive_stream.py:2710 get_mcp_tools()` → `faymcp/tool_registry.py:166`
+  只收 `available && enabled` 的工具，而 `faymcp/runtime_bridge.py:69` 要求
+  `server.get("status") == "online"` —— `autostart: false` 时 Fay 开机不连它，
+  `query_yueshen` 就**根本不在工具清单里**，规划器走到"未知工具"分支直接 break
+  （`execution_manager.py:488-492`），`tool_results` 空，于是流里打出 `共 0 步`。
+  用户看到的现象是"答得很快，但答的是模型自己的常识，不是那 14 份科普"。
+  光开 `autostart` 只是把工具**放进清单**，模不模型调它是概率事件；
+  `mcp_prestart_tools.json` 让 `query_yueshen` 在**拼 prompt 之前**必跑一次，结果作为
+  `<prestart>` 上下文注入。这份注册表会被运行时回写（`prestart_registry.py:61-69`），
+  所以挂载与 `mcp_servers.json` 一样是**可写**的。`include_history: false` 是刻意的：
+  它决定这条结果发的是 `<prestart>` 还是 `<prestart keep="true">`
+  （`nlp_cognitive_stream.py:1786-1790`），只有前者会被
+  `_remove_prestart_from_text`(:331-353) 在后续轮次清掉 —— 否则知识库原文会当成长期记忆
+  反复喂给模型。形状与 `{{question}}` 占位符照上游自己的推荐写法
+  （`fay/mcp_servers/yueshen_rag/README.md:32`、`fay/docs/Fay数字人MCP知识库配置指南.md:132,246`）。
 - `images/yueshen_rag.Dockerfile` + compose 的 `yueshen-rag`：不发布宿主端口，
   Fay 在 compose 网络里按容器名打过去。`YUESHEN_AUTO_INGEST=0` —— 开机即扫描会对语料
   发一串 embedding，而那一刻宿主显存多半正压着 9b；入库由探针真调用触发。
@@ -1570,6 +1639,34 @@ bind-mount 挂成 `/app/corpus/kb`，不打进镜像层，有两个原因：27 M
 （`server.py:363`），ingest 照样返回 `success:true` —— 0002 补丁治的就是它在 30s 超时下把整批跳光而
 `inserted:0`。所以 `probes/kb_ingest.py` 在入库之外还必须真问一遍；那 12 问的期望词各自只出现在该去的
 那份文件里，它们同时是**切片质量**的验收：合成语料那种「段落里有个标记词」测不出表格摊平得好不好，真实问法测得出。
+
+**2026-09-22 06:44 的 recall@k 择优**（`./run.sh kb --sweep 3,5,8`，同一套 12 问、同一份 576 向量库）：
+
+| k | 3 | 5 | 8 |
+|---|---|---|---|
+| recall@k | **12/12** | 12/12 | 12/12 |
+
+三个旋钮里这轮只动了结论能支撑的那一个：
+
+- **`top_k` 取 3，不取 5。** 表是平的 —— k=3 已经把 12 问全捞回，多注入的两条只是让
+  prompt 变长、模型更可能整段抄原文而不是答问题。所以
+  `overlay/{fay,fay-lite}/mcp_prestart_tools.json` 的 `params.top_k` 钉在 3；
+  判据饱和之前不该靠加大 k 换"看起来更准"。
+- **距离度量维持 L2、不加阈值。** 上游建 collection 没传 `hnsw:space`，所以是默认 L2，
+  且 `query` 不做任何阈值过滤（空库才返回空）。开 cosine + 阈值是
+  `patches/yueshen_rag/0003` 的活，触发条件是「top-3 里混进无关片段导致 MISS」——
+  这轮 12/12 没有 MISS，**所以那份补丁不打**，别让一次没有证据的改动进补丁表。
+  留一手可判断据：这轮的 L2 距离实测量程是 0.367（最紧的「康复训练有哪些禁忌情况？」）
+  到 1.008（「人上了年纪肌肉…」第 8 名），真要做阈值，落在 0.55 附近才切得开
+  "期望那份"与"顺带回来的那份"，且必须先有一批 MISS 来验它切掉的是噪声不是答案。
+- **切片粒度这轮不动。** `--max-chars 900` + 服务端二次切 600/120 是 1609 行那笔对账的
+  前提（516 片段 → 575 chunk），而 12 问的 recall 在 k=3 就饱和了：**换成 900/150 再跑
+  一遍也不会让 12/12 变成 13/12**，这把尺子量不出差别。要动它得先加更难的金标问题
+  （跨片段、需要上下文拼接才答得对的那种），否则比较没有读数。
+
+这条「按数据择优」本身有反向对照守着：`--sweep` 末尾那条 PASS 会临时把某条金标的期望词
+换成一个语料里确实不存在的串，要求这一档**必须变红**；它红了才说明 12/12 是检索给的，
+不是判据写松了。
 
 **BuildKit 的 pip 缓存挂载这次单独量了值，也记了为什么 Fay/service 故意不给**。给
 `yueshen_rag.Dockerfile` 的 `pip install` 层加 `--mount=type=cache,target=/root/.cache/pip`
