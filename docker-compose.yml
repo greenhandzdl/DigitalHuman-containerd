@@ -703,6 +703,33 @@ services:
       yueshen-rag:
         condition: service_started
 
+  # ------------------------------------------------ 知识库的业务判据（./run.sh kbq）
+  # 上面那组走 :5010 管理面直调工具，证明的是「链路通、数据进得去」；这一组走
+  # /api/send + /api/get-msg，取的是那一问的原始回帧 —— 也就是真实业务里用户能拿到
+  # 的唯一东西。判据是「知识库的话有没有被注入、模型有没有用它回答」，那两条在
+  # probes/kb_fay_probe.py 的 docstring 里。
+  #
+  # "kb" 是它的实际归属（`./run.sh kbq` 走这个 profile）；"test" 挂上只为让
+  # `./run.sh test kb-fay` 那一串组名走得通（组循环写死了 `--profile test`）。
+  # **它不在 DEFAULT_GROUPS 里**，常态全套不会跑到它。理由是代价：一组要发两整轮问答
+  # （正常轮 + 摘掉 prestart 注册的对照轮），每轮都过一遍大模型。远端 26B 12s 一发，本机
+  # 9b 权重只进 6% 显存时 172~301s，挂进常态清单就等于让 `./run.sh test` 在低配机器上必然
+  # 卡在一条与回归无关的判据上。人发起用 `./run.sh kbq`。
+  kb-fay:
+    <<: [*host-gateway]
+    profiles: ["kb", "test"]
+    image: docker.m.daocloud.io/python:3.12-slim
+    container_name: dh-kb-fay
+    restart: "no"
+    volumes:
+      - ./probes:/probe:ro
+    command: ["python", "/probe/kb_fay_probe.py", "--base", "http://fay:5000", "--timeout", "520"]
+    depends_on:
+      fay:
+        condition: service_healthy
+      yueshen-rag:
+        condition: service_started
+
   # ue/ 是 11GB 的 UE 工程：没有引擎本体、依赖 Marketplace 授权插件，无法在 Linux
   # 容器里"跑起来"。但它并非与容器无关 —— 这个只读挂载的体检容器给出可复核的事实
   # （有无 Source 模块、插件平台分布、是否引用 10002 数字人协议），

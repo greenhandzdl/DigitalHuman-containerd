@@ -9,7 +9,8 @@
 #   ./run.sh test <组>  只跑指定测试件（backend-test / backend-probe / adapter-test /
 #                      probe-selftest / frontend-test / ws-relay-test / asr-test /
 #                      probe-fay-lite / ue-audit / fay-probe / probe-yueshen /
-#                      frontend-probe / asr-probe），改探针时不用等全套十几分钟
+#                      frontend-probe / asr-probe / kb-fay），改探针时不用等全套十几分钟。
+#                      kb-fay 能点名跑，但不在常态清单里（一轮问答一组的代价，见下）
 #   ./run.sh build     只构建镜像
 #   ./run.sh smoke     打通链路冒烟测试：后端 → adapter → Fay → Ollama → 回库
 #   ./run.sh asr-seed  本机若已有伙伴方那个 FunASR 模型缓存卷，直接拷过来（省 1.3GB 下载）
@@ -19,6 +20,10 @@
 #   ./run.sh kbslice [包] 把项目方语料包（默认 ../uploads/老年康养通用科普.zip）切成
 #                      seed/kb_corpus/ 里的语料文件
 #   ./run.sh kb        科普语料入库 + 拿 12 条真实问法抽测检索（切片变了或换库后跑一次）
+#   ./run.sh kbq [问] [期望词]
+#                      知识库的业务判据：从 Fay 的业务口问一句话（默认「血压的正常参考值
+#                      是多少？」），取那一问的原始回帧判注入与引用；换问法时不给期望词则
+#                      「片段含词/正文用上了」两条按 SKIP 处理，只判注入这条路通不通
 #   ./run.sh logs [s]  看日志（s 可为 fay/backend/adapter/frontend/funasr/mysql/redis）
 #   ./run.sh ps|down|reset
 set -euo pipefail
@@ -415,7 +420,7 @@ case "${1:-up}" in
     # fay-lite 是 test profile 里的轻模型实例（qwen2.5:1.5b），只有它能在被其他
     # 服务占满显存的机器上秒级答完，用来判定「问答链路是否真的通」。
     $COMPOSE --profile test up -d --wait fay-lite 2>&1 | tail -3
-    ALL_GROUPS="backend-test backend-probe adapter-test probe-selftest frontend-test ws-relay-test asr-test probe-fay-lite ue-audit fay-probe probe-yueshen frontend-probe asr-probe kb-ingest"
+    ALL_GROUPS="backend-test backend-probe adapter-test probe-selftest frontend-test ws-relay-test asr-test probe-fay-lite ue-audit fay-probe probe-yueshen frontend-probe asr-probe kb-ingest kb-fay"
     # 允许 ./run.sh test fay-probe 只跑一组：改探针时不必再等 20 分钟全套。
     # 变量名不能叫 GROUPS —— bash 的内置只读数组（当前用户的 gid），赋值会被吞掉。
     # 默认顺序把 probe-fay-lite 排在两个 9b 实例之前：ollama 是单条队列，
@@ -449,6 +454,10 @@ case "${1:-up}" in
     # 排在最后它谁也不抢，而且它跑完留下的正是真语料（probe-yueshen 在它前面把集合
     # 换成了 3 段合成语料）。这条组名就是 compose 服务名 ./run.sh test kb-ingest；
     # 单独调 top_k 用 ./run.sh kb --sweep 3,5,8，那条不占测试组的位。
+    # kb-fay 只进 ALL_GROUPS、**不进 DEFAULT_GROUPS**：它一组要发两整轮问答（正常轮 +
+    # 把 query_yueshen 的 prestart 注册摘掉再问一轮的对照轮），本机 9b 那一轮实测 172~301s，挂进常态
+    # 清单等于让 `./run.sh test` 在低配机器上必然卡出一条与回归无关的红。列进 ALL_GROUPS
+    # 是为了让它能被点名（改 Fay 的 prestart/注入这条链时值得跑），日常入口是 ./run.sh kbq。
     DEFAULT_GROUPS="backend-test backend-probe adapter-test probe-selftest frontend-test ws-relay-test asr-test probe-fay-lite ue-audit fay-probe probe-yueshen frontend-probe asr-probe kb-ingest"
     TEST_GROUPS="$*"
     [ -n "$TEST_GROUPS" ] || TEST_GROUPS="$DEFAULT_GROUPS"
@@ -614,6 +623,32 @@ case "${1:-up}" in
     # 就是 compose 那条 command 里的 --base/--timeout 两个值，所以只写脚本名，参数交给默认。
     $COMPOSE run --rm kb-ingest python /probe/kb_ingest.py "$@"
     ;;
+  kbq)
+    # 知识库的**业务**判据：不直调工具，而是从 Fay 的业务口问一句话、取那一问的原始回帧，
+    # 判「这一问有没有真的驱动 query_yueshen、检索回来的话有没有被用进回答」。为什么必须
+    # 这样测：`kb` 那组走 :5010 管理面，它红了只能说明链路断，说明不了业务里用户在听谁说话。
+    # 判据细节与代价在 probes/kb_fay_probe.py 的 docstring 里。
+    #   ./run.sh kbq                      默认那一问 + 默认期望词（135/85），7 条全判
+    #   ./run.sh kbq <问题> [期望词]        换问法；不给期望词时「含词/用上了」两条记 SKIP
+    shift
+    ensure_env
+    use_profile
+    # 这一组不灌库、不重嵌入，但必须等 fay 过健康检查：判据读的是 :5010 的 prestart 清单，
+    # 而那份清单要 Fay 的 MCP 管理面起来才读得到。yueshen-rag 只 service_started 就够 ——
+    # 它没起的话第 2 条会红，而那正是这条判据想告诉你的事，不该由探针先去把它扶起来。
+    $COMPOSE up -d --wait fay yueshen-rag 2>&1 | tail -3
+    ask=${1:-}; want=${2:-}
+    if [ -z "$ask" ]; then
+      $COMPOSE run --rm kb-fay python /probe/kb_fay_probe.py
+    else
+      $COMPOSE run --rm kb-fay python /probe/kb_fay_probe.py --ask "$ask" --want "$want"
+    fi
+    # 6b 那条对照会把 query_yueshen 的 prestart 注册摘掉，问一轮再按摘之前读到的那份参数
+    # 注册回去。正常退出（含 Ctrl-C）都走 finally 恢复；只有 `docker compose kill` 掉这个
+    # 探针容器才会把注册留在摘掉的状态 —— 那份配置写在挂载进去的
+    # faymcp/data/mcp_prestart_tools.json 里，症状是之后每一轮都没有知识库注入。
+    # 恢复：管理台 :5010 里给这台工具重新勾上预启动，或直接改那个 JSON 后重启 dh-fay。
+    ;;
   asr-seed)
     # 纯粹省一次下载：本机若跑过伙伴方那台 FunASR，它那个卷里已经下好了约 1.3GB 模型
     # （布局就是 MODELSCOPE_CACHE 期待的 models/<组>--<名>/snapshots/<revision>/）。
@@ -661,5 +696,5 @@ case "${1:-up}" in
   logs)    shift; use_profile; $COMPOSE logs -f --tail=120 ${1:-} ;;
   down)    shift; use_profile; $COMPOSE down ${1:-} ;;
   reset)   shift; use_profile; echo "[run] 将删除全部卷（DB/记忆/日志），5 秒内 Ctrl-C 取消"; sleep 5; $COMPOSE down -v ${1:-} ;;
-  *)       echo "用法: $0 {up|build|test|smoke|audit|upstream|kbslice|kb|ps|logs [svc]|down|reset}" >&2; exit 1 ;;
+  *)       echo "用法: $0 {up|build|test|smoke|audit|upstream|kbslice|kb|kbq|ps|logs [svc]|down|reset}" >&2; exit 1 ;;
 esac

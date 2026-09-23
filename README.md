@@ -17,12 +17,13 @@
 containerd/
 ├── docker-compose.yml          常驻 8 个服务：mysql / redis / fay / yueshen-rag
 │                               / adapter / backend / frontend / funasr；另有 profiles:["test"]
-│                               的 fay-lite（测试用轻模型 Fay）+ 13 个一次性测试件，
-│                               和 profiles:["kb"] 的 kb-ingest（外部语料入库，见下）
+│                               的 fay-lite（测试用轻模型 Fay）+ 15 个一次性测试件，其中
+│                               kb-ingest（外部语料入库）与 kb-fay（业务侧那一问的知识库判据，
+│                               见下）同时挂在 profiles:["kb"] 上
 ├── docker-compose.dev.yml      ★ dev 档位叠加层：放开应用面端口 + DEBUG=true + FAY_URL
 │                               （只在 ./run.sh dev 时被叠上，见「dev / prod 档位」）
 ├── run.sh                      up · dev · build · test · smoke · audit · upstream · logs
-│                               · kbslice · kb · asr-seed · ps · down · reset
+│                               · kbslice · kb · kbq · asr-seed · ps · down · reset
 ├── .env.example                模板；run.sh 首次执行会复制成 .env 并填随机密钥（DH_ENV 也在里面）
 ├── images/
 │   ├── fay.Dockerfile          Fay 镜像（唯一一份 Fay 源码 ../fay；原先靠 ARG FAY_SRC
@@ -48,6 +49,8 @@ containerd/
 │                               · backend_probe.py（后端活体探针：路由/迁移/schema/鉴权/写路径/调度器）
 │                               · yueshen_probe.py（chromadb 那条链路：嵌入出口/清单/入库/检索/stats 一致性）
 │                               · kb_ingest.py（外部语料入库 + 12 问真实问法抽测，`./run.sh kb`）
+│                               · kb_fay_probe.py（业务侧：从 /api/send 问一句，判那一行的
+│                               │               注入块与正文，`./run.sh kbq`）
 │                               · frontend_test.py（前端外壳契约：假后端 + 19 条判据 + 负面自检）
 │                               · frontend_probe.py（真栈：从外壳那一口穿到 backend→adapter→Fay→ollama）
 │                               · ws_relay_test.py（外壳的 WS 转发契约：手造掩码帧 + 假上游）
@@ -95,8 +98,9 @@ flowchart TB
     T4["frontend-probe · asr-probe（抢 CPU / 打 ollama 的排最后）"]
   end
 
-  subgraph KBP["profile: kb（./run.sh kb）"]
+  subgraph KBP["profile: kb（./run.sh kb / kbq）"]
     KI["kb-ingest → yueshen-rag"]
+    KF["kb-fay → fay /api/send"]
   end
 
   BRO -->|"HTTP + WS 同源"| FE
@@ -143,10 +147,14 @@ cd containerd      # 本目录（仓库里唯一有可执行入口的地方）
                    #            · ue-audit · fay-probe · probe-yueshen · frontend-probe
                    #            · asr-probe · kb-ingest
 ./run.sh test fay-probe   # 只跑其中一组（改探针时不用等全套）
+./run.sh test kb-fay      # 第十四组之外还能点名的第十五组：它一组要发两整轮问答，所以不在
+                   #        常态清单里，日常入口是下面的 ./run.sh kbq（见「业务侧」那一节）
 ./run.sh audit     # 核账：四个上游仓库是否仍然零改动、与上游不分叉（非零退出即可当断言）
 ./run.sh upstream  # 跟上上游：fetch xszyou/Fay，报落后几条，并把每份 fay 补丁对 upstream/main 干跑预检
 ./run.sh kbslice   # 把 uploads/ 里那包 .docx 切片到 seed/kb_corpus/（换语料时才需要跑）
 ./run.sh kb        # 切片入库 + 12 问真实问法抽测（要求每问在 top3 命中自己的出处）
+./run.sh kbq       # 从业务口问一句，判那一问的原始回帧里知识库有没有被注入、有没有被用上
+                   # 换问法：./run.sh kbq <问题> [期望词]（不给期望词则「含词」那两条记 SKIP）
 ./run.sh asr-seed  # 本机若已有别处下好的 FunASR 模型缓存卷，拷进本栈的卷（省 1.3GB 下载）
 ./run.sh logs fay  # 单独看某个服务（fay/backend/adapter/frontend/funasr/mysql/redis）
 ```
@@ -587,6 +595,15 @@ volumes:
 
 改 `overlay/` 下的文件 → `docker compose restart fay`，**不需要重新 build**。
 只有当上游源码本身更新（`git pull`）时才需要 `./run.sh build`。
+
+可写挂载的三份（`config.json` / `mcp_servers.json` / `mcp_prestart_tools.json`）跑完任何
+一轮测试在 `git status` 里都是脏的，**但"提交前 checkout 回去"这条默认不适用于它们**：
+先读 diff 的语义，再决定留还是撤。三种脏是三件事 —— `mcp_servers.json` 只有
+`connection_time` 在漂（纯时间戳，checkout 掉没问题）；`mcp_prestart_tools.json` 只少一个行尾
+换行（Fay 的 `json.dump` 不写，而注册内容必须与摘注册之前那份一致 —— 这一份正是 `./run.sh kbq`
+第 7 条判据回读过的东西，撤掉它等于抹掉判据留下的证据）；`config.json` 里转义噪声与**真状态**
+混在同一份文件（`\uXXXX` 那套与一句"运行期把 `record.enabled` 翻成了 true"看上去都是脏，
+只有后者撤了会改行为）。成因与实测见 run #28 末段那条 2026-09-23 修正。
 
 必须提供 `system.conf` 的原因：上游从 v4.8.1 起就没提交过 `system.conf`（只留
 `system.conf.bak` 模板），fork 的 `ce900d8` 又把它加进了 `.gitignore`，而上游默认启动流程走的远程配置中心
@@ -1148,6 +1165,13 @@ QA 链的正面证据由 lite 那组给。**这不是换基线换来的回归**�
 `git checkout -- overlay/<实例>/mcp_servers.json` 即可，纯时间戳漂移。
 （**run #30 之后"下一轮白重建一次"这半句失效了**：那道闸的输入清单改成只点名
 `overlay/**/requirements*.txt`，见 run #30 那节；`git status` 必脏照旧，`checkout --` 仍是正确动作。）
+`config.json` 那份回写值得单说一句，因为它让"纯漂移"这个判断不能凭 diff 行数下：Fay 用
+`json.dump` 默认口径写回，中文全变成 `\uXXXX` 转义、行尾换行也没了，26 行的 diff 解码回来
+与种子一字不差 —— 但同一份文件里可能夹着**真状态**：`record.enabled` 就被运行期翻成了 `true`
+（**不是探针干的** —— `grep -rn record probes/` 只命中读源码注释那几行，是管理台/配置面板那侧写的）。
+所以 `checkout --` 之前先读 diff 的**语义**而不是形状。三份可写挂载各自的脏法、以及为什么
+上面那句"`checkout --` 仍是正确动作"从 2026-09-23 起只对 `mcp_servers.json` 无条件成立，
+见上面「不改上游代码的三种手段」那一节。
 
 ### run #29：撤掉参照实例之后的第一轮八组（2026-09-21 17:24~17:45）
 
@@ -1583,6 +1607,9 @@ run #24 起探针把这条起落做成三条判据，三个实例上都是 PASS�
   `_remove_prestart_from_text`(:331-353) 在后续轮次清掉 —— 否则知识库原文会当成长期记忆
   反复喂给模型。形状与 `{{question}}` 占位符照上游自己的推荐写法
   （`fay/mcp_servers/yueshen_rag/README.md:32`、`fay/docs/Fay数字人MCP知识库配置指南.md:132,246`）。
+  这份注册现在有一条业务判据守着：`./run.sh kbq`，见下面「业务侧」那一节 —— 它顺带量出
+  一件事：**工具的「禁用」开关掐不断这条注入路**（预启动调用带 `skip_enabled_check=True`，
+  runnable 清单取快照时 `include_disabled=True`），能掐断的只有摘注册。
 - `images/yueshen_rag.Dockerfile` + compose 的 `yueshen-rag`：不发布宿主端口，
   Fay 在 compose 网络里按容器名打过去。`YUESHEN_AUTO_INGEST=0` —— 开机即扫描会对语料
   发一串 embedding，而那一刻宿主显存多半正压着 9b；入库由探针真调用触发。
@@ -1690,6 +1717,51 @@ chromadb 23.3 MB 那个 wheel 约 1067s；缓存挂载命中后同一层重放�
 补上，绕开「requirements 是这一层唯一输入」这个干净假设。所以只给全新、还在反复调 requirements 的
 yueshen 层用，成熟镜像维持不带。另一个坑：同一 Dockerfile 并发跑两次 build 会把这条本就慢的链路
 带宽对半劈、两次都更慢 —— 一次建、盯到底。
+
+### 业务侧：那一问里知识库到底有没有被用上（`./run.sh kbq`）
+
+上面两组都不回答业务问题。`probe-yueshen` 验链路（6 条，走 :5010 直调工具），`kb` 验数据
+（12 问的 recall@k，也是直调 `query_yueshen`）—— 两者红了只能说明「库和路没问题」，说明不了
+真实那一轮里用户在听谁说话。而业务读的是 Fay 那一行回答。所以第三组
+`probes/kb_fay_probe.py` 走 `/api/send` + 轮询 `/api/get-msg`，**只看那一问的原始回帧**，
+判七件事（打出来十行，第 3、4 条各拆成硬软两条）：注入这条路是 prestart 注册驱动的 →
+这一问真的驱动了它（回帧里 `<prestart>` 块的 `query=` 逐字等于问句）→ 注入回来的是带
+`〔文件·章节〕` 出处标记、且含期望词的语料片段 → 这一问真的答出来了 → 回帧以 `<dh-end>`
+收尾 → 两问反向对照（假词不许命中；把注册摘掉再问一轮，注入块必须消失）→ 按摘之前读到的
+那份参数把注册恢复回去并回读确认。2026-09-23 首次跑通：**10/10**，远端 26B 单轮 8.1s；
+同日按同一条问法复跑 **9/10 + 1 SKIP**，SKIP 的正是下面第三条那条软证据 —— 同一行两次跑出
+两种颜色，但都不是红，这正是那条要的设计。
+
+三处实测把设计改了，都值得留在文档里，因为它们都不是读源码能读出来的：
+
+- **观测点只能是 `/api/get-msg`。** `<prestart>` 在 Fay 有三个出口，两个明写剥掉：:10002
+  数字人侧 `core/fay_core.py:2535 __remove_prestart_tags`，GUI 侧
+  `gui/flask_server.py:1275`/`:1407` 那两条 `re.sub`（管的是 `/v1/chat/completions`）。
+  只有落库那一行是原文。
+- **工具的「禁用」掐不断这条路，只有摘注册掐得断。** 第一次跑按 `…/tools/<tool>/toggle`
+  `{"enabled":false}` 做对照，结果对照轮里注入块照旧。读了源码才明白为什么：预启动执行走
+  `llm/nlp_cognitive_stream.py:457 call_tool(..., skip_enabled_check=True)`，把
+  `faymcp/mcp_service.py:400` 那句启用检查整个跳过；而 `runtime_bridge.list_runnable_prestart_tools()`
+  取快照传的是 `include_disabled=True`，那份清单**根本不看启用位**。所以对照改成
+  `POST /api/mcp/servers/4/tools/query_yueshen/prestart {"enabled":false}`（摘注册），
+  对照轮立刻变干净：那一轮正文没有注入块，模型答的是它自己的常识血压数字 —— 与上面
+  `autostart` 那段讲的机制正好对上。**顺带一条运维事实：临时停掉知识库注入，去管理台禁用工具是没用的。**
+- **正文复不复现知识库那个词，不是判据。** 同一问、同一份注入、同一个 `top_k=3`，连跑三次：
+  只有第二次正文里写了「135/85」，第一次和第三次答的都是它自己的通用血压常识（「收缩压小于
+  120、舒张压小于 80…120–139/80–89、≥140/90」，一个 135 都没提），可那两轮话说得完完整整。
+  复现率 1/3 —— 把它判红等于把采样脾气写进 CI，一周里总会随机红几天，所以它单列一行只报不判
+  （不复现记 SKIP，不记 FAIL）。第三次跑就是这行的现场证据：注入块里明明白白有那句
+  「家庭自测血压的高血压诊断标准为 ≥ 135/85 mmHg」，正文 165 字里一个 135 也没有，探针照样
+  给出退出码 0。注入块那侧仍然硬判 —— 那是工具输出的原文，中间没有采样。
+- 收工时机同理：那一轮模型可能中途改走去调工具，实测正文先停在「我来帮你查一下，稍等…」，
+  **76.5s 之后**才补完剩下的回答和 `<dh-end>`。所以这一组的静默兜底是 180s（`--quiet`），
+  不是 adapter 那个 8s；照 8s 判，红的是探针的耐心。
+
+代价与为什么它不在常态清单里：一组要发两整轮问答，每轮都过大模型（本机 9b 权重只进 6% 显存
+时同一句话 172~301s），而且它要临时摘掉一份**会持久化**的注册（写在挂载进去的
+`overlay/fay/mcp_prestart_tools.json`，恢复放在 `finally` 且第 7 条回读）。所以列进
+`ALL_GROUPS` 供点名（`./run.sh test kb-fay`），但不进 `DEFAULT_GROUPS`，日常入口
+`./run.sh kbq [问题] [期望词]` —— 换问法时不给期望词，两条「含期望词」的判据记 SKIP，其余照判。
 
 ## 远程音频输入：无声卡也能测（TCP 10001）
 
@@ -2165,7 +2237,12 @@ UE 自己按 BOM 定字符集，读得懂，所以判据必须先认 BOM。实�
   但 `RecorderListener.get_stream()` 第一件事是每 0.1s 轮询 `record.enabled`，
   所以它永远停在轮询上，连 `pyaudio.PyAudio()` 都不会执行 ——
   容器日志里找不到那句 `请检查设备是否有误`（实测两份 Fay 都没有），因为那是
-  `get_stream()` 返回之后才会走到的分支。要真用麦克风得给容器加 `--device /dev/snd`。
+  `get_stream()` 返回之后才会走到的分支。
+  **那句"实测都没有"只在前提交态成立，2026-09-23 补一个反例**：`overlay/fay/config.json`
+  工作区里被运行期翻成了 `record.enabled: true`（不是探针干的，`grep -rn record probes/` 只有读
+  源码注释那一类；是管理台/面板那侧写的），于是 `dh-fay` 开机就走了那条分支，日志两行
+  `请检查录音设备是否有误，再重新启动!`（14:29:15 `[User]`、14:29:25 `[系统]`，之后不再刷 ——
+  它试两次就放弃，不是每 0.1s 刷一条）。要真用麦克风得给容器加 `--device /dev/snd`。
   **但同一行代码也否证了「所以语音输入整条测不了」**：`core/recorder.py:251` 的
   `if not record['enabled'] and not self.is_remote(): continue` 对远程设备免检，
   所以 TCP 10001 那条音频输入路在无声卡容器里照样能跑 —— 判据、实测数字和为此打的
