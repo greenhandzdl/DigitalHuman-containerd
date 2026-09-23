@@ -13,7 +13,10 @@ name: digitalhuman
 #     首跑复制（tools/gen_overlay.py）。挂载路径本身没变，但新克隆得先跑过一次 run.sh。
 #   * 后端与 Fay 的契约不同形（后端 POST /api/chat，Fay 只有异步 /api/send + /api/get-msg
 #     轮询），由 adapter 服务在中间转换，两边源码保持原样。
-#   * 所有 AI 能力走宿主机 Ollama：extra_hosts 用 host-gateway 拿到 host.docker.internal。
+#   * AI 能力全在栈外，而且是**两台**服务：对话模型由一个 OpenAI 兼容的本地推理服务提供
+#     （本机 :11432），向量嵌入由宿主 Ollama 提供（:11434）。两者都从 extra_hosts 的
+#     host-gateway 进，端点与模型名各自独立可换 —— 见 x-llm-endpoint 与
+#     containerd/README.md「AI 端点落在哪里：对话与嵌入是两台服务」。
 #   * UE5 不进 compose —— 实测该仓库 10.06GB / 17383 文件，EngineAssociation 5.1 但
 #     不含引擎本体，11 个启用插件里 5 个要 Epic  Marketplace 授权，11 个模块带 Source/
 #     却全树零个预编译二进制，且端点级引用 10002 协议为 0 处。数字见 containerd/README.md
@@ -21,7 +24,8 @@ name: digitalhuman
 # ---------------------------------------------------------------------------
 
 # 两条到宿主机/局域网的名字映射，全栈统一：
-#   host.docker.internal —— 宿主 Ollama（LLM/嵌入）从这里进。
+#   host.docker.internal —— 宿主机的 AI 服务从这里进（嵌入 = Ollama :11434；对话端点
+#                            写在 .env，可以是这台机器的另一个地址或另一台机器）。
 #   dh-host / ue-host    —— 本栈那台机器的局域网地址、与跑 UE5.1 编辑器的那台 Windows。
 #                            UE 实际在另一台电脑上（实测：它只往 :10002 拨进来，Fay 从不外拨），
 #                            所以这两个名字目前只是给「将来要外拨 UE」的地方留的稳定入口，
@@ -40,8 +44,9 @@ x-restart: &restart
 # （llm/execution_manager.py 小模型 60s/1 次重试、utils/api_embedding_service.py
 # 60s/2 次重试），containerd/patches/ 把它们开成环境变量后才可调。
 #
-# 为什么要调：本机 16GB 显存被其他常驻服务占到 15.2GB，ollama 只能在
-# qwen3.5:9b 与 qwen3-embedding:0.6b 之间反复换入换出，实测一次 embedding
+# 为什么要调：那张 16GB 卡从来不是全给本栈的 —— 量过的那几轮里，栈外的对话推理服务
+# 自己就占 10.5GB 以上（2026-09-23 实测 10742 MiB / 16376 MiB），剩下的显存要在
+# 对话模型与 qwen3-embedding:0.6b 之间反复换入换出，实测一次 embedding
 # 请求就要 >60s → 必然超时 → 整条请求重发 3 遍 = 180s，把问答链路的预算吃光
 # （一句话回答反而等不到）。所以：LLM 给足时间且不再重试，embedding 快速失败，
 # 让它落到 gpt_structure.py:294 上游自带的「本地模拟向量」兜底路子上。
@@ -65,9 +70,10 @@ x-llm-timeouts: &llm-timeouts
   STREAM_REPLY_IDLE_TIMEOUT: "480"
 
 # LLM / embedding 的端点与密钥。全部默认空 = 逐字用 overlay/fay/system.conf 里那份示例
-# 值（本机 ollama）。之所以走环境变量而不是改那份文件：端点是按机器变的事（小模型跑在
-# 本机还是远端另一台带得动大模型的机器上），而被跟踪的配置文件只能留「在这台机器上跑得
-# 起来」的示例 —— 上一轮把远端 26B 写进 system.conf，那 6 行机器拓扑就进了 git 历史。
+# 值（宿主 ollama）。之所以走环境变量而不是改那份文件：端点是按机器变的事（对话模型由
+# 哪个服务回答、它在哪台机器哪个口上），而被跟踪的配置文件只能留「在这台机器上跑得
+# 起来」的示例 —— 上一轮把那台 26B 的端点写进 system.conf，那 6 行机器拓扑就进了 git 历史。
+# 本机现在的样子：对话 = :11432 那台 26B（栈外的本地服务），嵌入 = :11434 的 ollama。
 # 机制在 patches/fay/0009，模型名那两条在 0006。
 x-llm-endpoint: &llm-endpoint
   FAY_GPT_BASE_URL: ${FAY_GPT_BASE_URL:-}
@@ -90,10 +96,10 @@ x-llm-endpoint: &llm-endpoint
   FAY_EMBEDDING_API_KEY: ${YUESHEN_EMBED_API_KEY:-}
 
 # lite 那份**刻意不跟主实例共用** &llm-endpoint。它存在的理由是「本机显存装得下的那个小模型
-# + 本机 ollama」，模型名由 FAY_LITE_MODEL_ENGINE 钉在本地；端点要是跟着主实例搬到远端，
-# 就等于拿 qwen2.5:1.5b 去问那台只有大模型的服务器 —— 探针会红在模型名上，而红的原因和它
-# 要证的「问答链路真的通」毫无关系（2026-09-22 实测：远端 /v1/models 只有
-# gemma-4-26b-a4b-nvfp4 一条）。真要让它也走远端，显式给 FAY_LITE_GPT_BASE_URL。
+# + 宿主 ollama」，模型名由 FAY_LITE_MODEL_ENGINE 钉在本地；端点要是跟着主实例搬走，
+# 就等于拿 qwen2.5:1.5b 去问一台只有大模型的服务 —— 探针会红在模型名上，而红的原因和它
+# 要证的「问答链路真的通」毫无关系（2026-09-22 实测：主实例那个端点的 /v1/models 只有
+# gemma-4-26b-a4b-nvfp4 一条）。真要让它也跟着搬，显式给 FAY_LITE_GPT_BASE_URL。
 x-llm-endpoint-lite: &llm-endpoint-lite
   FAY_GPT_BASE_URL: ${FAY_LITE_GPT_BASE_URL:-http://host.docker.internal:11434/v1}
   FAY_GPT_API_KEY: ${FAY_LITE_GPT_API_KEY:-ollama}
@@ -427,8 +433,9 @@ services:
   # 一帧帧推到页面同源的 ws://<host>/funasr-ws，外壳按上面那张常量表转发进来，
   # 回去的是 {"text","is_final"}。协议逐字段照前端来，伙伴方代码一个字不改。
   #
-  # 这是本栈第二个不走宿主 Ollama 的 AI 依赖（第一个是魔珐 Xmov 的云 TTS，在我们代码之外）：
-  # ollama 的 /api/chat 只收 text + images，没有音频输入口，模型清单里也没有 paraformer。
+  # 本栈的 AI 依赖里，语音识别这处既不由宿主 Ollama、也不由那个对话端点服务（另一处是
+  # 浏览器里的魔珐 Xmov 云 TTS，在我们代码之外）：ollama 的 /api/chat 只收 text + images，
+  # 没有音频输入口，模型清单里也没有 paraformer。
   # 值得记下来的是它与 Fay 自己那条 ASR 链不是一回事：overlay/fay/system.conf 里
   # local_asr_ip/local_asr_port 指的是 host.docker.internal:10197，那套方言是
   # 「裸文本回复 + {"vad_need":…}」，与前端要的 {"text","is_final"} 不兼容
@@ -456,7 +463,7 @@ services:
       # asr/server.py 里读，这里透出来是为了不改镜像就能调。
       FUNASR_MAX_SECONDS: ${FUNASR_MAX_SECONDS:-60}
       FUNASR_MAX_INFLIGHT: ${FUNASR_MAX_INFLIGHT:-2}
-      # torch 不设这个就会吃满 16 核，而本机 CPU 还要给 ollama 那些不驻留显存的权重用。
+      # torch 不设这个就会吃满 16 核，而本机 CPU 还要留给那些没全进显存的模型权重。
       FUNASR_TORCH_THREADS: ${FUNASR_TORCH_THREADS:-4}
     volumes:
       # 挂在 MODELSCOPE_CACHE 上（镜像里 = /models）。这一卷决定「首次要不要下 1.3GB」：
@@ -577,7 +584,10 @@ services:
       # 探针进程自己也要 import 被测容器那份 api_embedding_service（判仿生记忆的向量
       # 真伪），不给这三个变量它就退回上游默认 60s×3 次 —— 实测那条判据因此花了
       # 183.2s 才落回伪向量，既白烧三倍墙钟，量的又不是容器真正在用的预算。
-      <<: *llm-timeouts
+      # 端点那组键同理必须挂上：探针量的「直连 LLM 下限耗时」得是被测实例真在用的那个
+      # 端点与那个模型名。只挂 timeouts 时它读的是 system.conf 里那两份示例值（宿主
+      # ollama + qwen3.5:9b），而 .env 早把对话搬走了 —— 于是这条证据量的不是这台机器的事。
+      <<: [*llm-timeouts, *llm-endpoint]
     volumes:
       - ./probes:/probe:ro
       # 探针里 check_tts 会 import utils.config_util 走真实 TTS 分支，
@@ -591,8 +601,8 @@ services:
         condition: service_healthy
   # ------------------------------------------------ 轻模型实例：把问答链路真正跑通一次
   # fay 用的是 system.conf 里配好的 qwen3.5:9b，这是用户的真实配置，
-  # 不该为了跑测试去改。但这台机器 16GB 显存被其他常驻服务占掉 15.2GB，
-  # ollama /api/ps 实测 size_vram=387029401 / size=6149206178 —— 只有 6% 权重进显存，
+  # 不该为了跑测试去改。但量那几轮时这张 16GB 卡只剩 0.8GB 能给 9b（占走的主体是栈外那台
+  # 对话推理服务），ollama /api/ps 实测 size_vram=387029401 / size=6149206178 —— 6% 进显存，
   # 于是规划器一次要 165~240s，问答质量根本没法在测试里判定。
   # 所以再起一个只在 test profile 下的实例：同一个镜像、同一份 system.conf，
   # 只靠 containerd/patches/fay/0006-model-engine-env-overridable-CRLF-source.patch 放开的
@@ -646,7 +656,7 @@ services:
       FAY_GPT_MODEL_ENGINE: ${FAY_LITE_MODEL_ENGINE:-qwen2.5:1.5b}
       # 与被测实例同一份超时预算，否则 check_embedding 量的不是容器真正会走的那条路。
       # 端点同理，而且必须用 lite 那一份锚点：探针要量的就是「lite 实际在用哪个端点」，
-      # 挂主实例的 &llm-endpoint 会在主实例搬去远端时，让探针去量一个实例根本没在用的端点。
+      # 挂主实例的 &llm-endpoint 会在主实例端点搬走时，让探针去量一个实例根本没在用的端点。
       <<: [*llm-timeouts, *llm-endpoint-lite]
     volumes:
       - ./probes:/probe:ro
@@ -820,7 +830,7 @@ services:
       - ./probes:/probe:ro
 
   # 真栈冒烟：拿前端实际会发的那个请求形状，从外壳打进去穿完整条链
-  # （外壳 → backend → adapter → Fay → 宿主 ollama）。一条判据的开销全在最后那一问，
+  # （外壳 → backend → adapter → Fay → 对话端点）。一条判据的开销全在最后那一问，
   # 本机 9b 冷启动实测 172~301s，所以它排在全套最后，理由与 probe-yueshen 相同。
   frontend-probe:
     <<: [*host-gateway]

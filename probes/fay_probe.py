@@ -59,14 +59,15 @@
   证据，然后是确定性的 MCP（6，不打 LLM）、语音输入（9，不打 LLM 也不等回复）与
   决策面谈（10，只验镜像能不能在容器里拉起子服务），
   最后才轮到依赖显存里那个模型的问答 / WS /
-  音频判据，向量真伪（8）排在最末（它和问答抢同一个 ollama 出口）。
+  音频判据，向量真伪（8）排在最末（它和问答争同一张卡的显存，而嵌入出口还要换入模型）。
   这样机器被别的容器占满时，能判的结论已经全部落袋，不会一起变红。
 
 用法：python probe.py [--base http://fay:5000] [--timeout 90] [--max-timeout 420]
 退出码 = 失败的检查项数（0 表示全绿）。
 
 三态而不是两态：PASS / FAIL / SKIP。SKIP 只用于「这台机器的显存不够，这条判不了」，
-且必须同时给出客观证据（ollama /api/ps 的权重驻留显存比例 + 直连 LLM 的下限耗时）。
+且必须同时给出客观证据（直连 LLM 的下限耗时；端点提供 `/api/ps` 时再加一份权重驻留显存比例
+—— 那是 ollama 才有的口，换成别的 OpenAI 兼容服务就取不到，取不到不等于坏）。
 判得过就必须判，不能用 SKIP 掩盖故障；问答链路的真实通不通由轻模型实例兜住
 （compose 里的 fay-lite，见 README「真实瓶颈是显存」）。
 """
@@ -203,13 +204,14 @@ def openai_post(chat_url: str, payload: dict, timeout: float) -> tuple[float, st
 
 
 def check_llm_host(base: str, timeout: float) -> None:
-    """量一次「绕过 Fay 全部业务逻辑、直连 system.conf 里配的 LLM 出口」的下限耗时。
+    """量一次「绕过 Fay 全部业务逻辑、直连 `.env` 覆盖之后真正在用的那个对话端点」的下限耗时。
 
     作用是把环境问题从功能问题里摘出去：Fay 的一次问答 = 直连下限 × 规划器链路倍数。
     直连本身就要几十上百秒时，Fay 侧的超时兜底是结果，不是容器集成出来的故障，
     于是后面几条耗时类判据降级为 SKIP（见 latency_verdict）。
-    证据取 ollama /api/ps 的 size_vram/size：权重有多少真进了显存，比例低就是
-    其余部分在 CPU 上跑（实测本机 qwen3.5:9b 只有 387MB/6.1GB = 6% 进显存）。
+    就绪与否由**那一发直连请求本身**决定；`/api/ps` 的 `size_vram/size` 只是解释耗时的
+    附加证据，取不到不判红 —— 端点可以被 `.env` 换成任意 OpenAI 兼容服务（本机现在就是
+    把对话换到栈外的推理服务上），那样的服务没有 `/api/ps`（实测 404），而它回得很快。
     """
     global DEGRADED_LLM_HOST
     chat_url = origin = None
@@ -233,18 +235,23 @@ def check_llm_host(base: str, timeout: float) -> None:
                "messages": [{"role": "user", "content": "只回一个字：好"}]}
 
     def residency():
-        """(驻留比例|None, 说明, 错误|None)。权重有多少真进了显存，是问答耗时的唯一解释变量。"""
+        """(驻留比例|None, 说明)。权重有多少真进了显存，是问答耗时的唯一解释变量。
+
+        返回的 frac 为 None 表示**这条证据本轮取不到**：端点不是 ollama（没有 `/api/ps`）
+        或模型压根没常驻。取不到不等于坏，所以这里不再往上抛错误串 —— 判红与否由
+        直连那一发的结果决定，这一条只进 detail。
+        """
         try:
             with urllib.request.urlopen(origin + "/api/ps", timeout=10) as resp:
                 loaded = json.loads(resp.read().decode())["models"]
         except Exception as exc:
-            return None, "", f"{origin}/api/ps {exc!r}"
+            return None, f"驻留比例未知（{origin}/api/ps {type(exc).__name__}；这个口只有 ollama 有）"
         row = next((m for m in loaded if str(m.get("name", "")).startswith(model or "")), None)
         if not row or not row.get("size"):
-            return None, "模型未常驻(首次请求要先换入)", None
+            return None, "模型未常驻(首次请求要先换入)"
         frac = float(row.get("size_vram") or 0) / float(row["size"])
         return frac, (f"{model} 权重驻留显存 {frac:.0%}"
-                      f"（{row.get('size_vram', 0) / 1e6:.0f}/{row['size'] / 1e6:.0f}MB）"), None
+                      f"（{row.get('size_vram', 0) / 1e6:.0f}/{row['size'] / 1e6:.0f}MB）")
 
     # 最多量两发。第二发只为一种情况存在：第一发很慢或没成，**并且**目标模型压根没在
     # 显存里 —— 那可能只是首次换入的一次性成本（实测 1.5b 冷换入 72.9s，换入后同一发
@@ -265,10 +272,7 @@ def check_llm_host(base: str, timeout: float) -> None:
             err = repr(exc)
             err_kind = ("timeout" if isinstance(exc, TimeoutError)
                         or "timed out" in str(exc).lower() else "error")
-        gpu_frac, frac_txt, rerr = residency()
-        if rerr:
-            record(False, name, rerr)
-            return
+        gpu_frac, frac_txt = residency()
         if attempt == 1:
             warm = ok and elapsed is not None and elapsed <= 30 and (gpu_frac is None or gpu_frac >= 0.5)
             timed_out = err_kind == "timeout"
@@ -584,7 +588,7 @@ async def _prestart_session(host: str, user: str, base: str, budget: float) -> t
 
     不能复用 check_ws：它等的是「一句话说完」，而 prestart 那一整句是在模型开始
     生成之前就被写进流里的（force_first），看到就该走人 —— 多等的每一秒都是在
-    烧本机 ollama 的排队，而那台机器同时还挂着别的实例。
+    烧本机那个对话端点的排队，而同一张卡上还挂着别的推理（包括别的 Fay 实例）。
 
     异常只带回来、不在这里记判据：这条判据的名字由调用方独占记录，两边都记会出现
     两行同名结果（一行异常、一行「没收到帧」），读日志的人分不清哪行才算数。
@@ -1441,12 +1445,12 @@ def main() -> int:
     # genagents 包能不能在容器里拉起一个子服务"，不需要等显存。
     check_genagents_interview(args.base, host)
 
-    # 问答链路的耗时几乎全部花在本地 Ollama 上，而 llama-server 是整机共享的：
+    # 问答链路的耗时几乎全部花在栈外那个对话端点上，而它的推理进程是整机共享的：
     # 实测同一句「用一句话介绍你自己」在空闲机器上 4.8s、在 16 核被压满时 >90s。
     # 固定 90s 会把「机器忙」误判成「Fay 坏了」，所以先量一次基线再定预算：
     # 基线问的就是「只回一个字」= 这条链路能给的最短回答，WS 那几问要的是一句话，
     # 实测约 2~4 倍，故取 4 倍，上下各夹一次。
-    # 第一条的预算还按直连实测（DIRECT_LLM_SECONDS）夹一道：绕过 Fay 打 Ollama 都要
+    # 第一条的预算还按直连实测（DIRECT_LLM_SECONDS）夹一道：绕过 Fay 直连 LLM 出口都要
     # 39s 的机器上，等到 max_timeout 才失败只是白烧墙钟时间（run #3 实测：直连 39.1s，
     # 后面每条问答都撞满 600s 客户端超时）。
     # 降级态反而把这一条放宽到 8 倍：基线这一问走的是与被测容器完全同一条管线，
@@ -1501,7 +1505,8 @@ def main() -> int:
             summarize_frames(frames, port, output, note)
             if port == 10002 and output:
                 check_audio_url(frames, args.base)
-    # 放在最后：它和问答共用同一个 ollama 出口，早跑会来抢本就紧张的显存排队，
+    # 放在最后：问答走对话端点、它走 ollama 的嵌入端点，但抢的是同一张卡的显存，
+    # 而嵌入模型换入要几十秒 —— 早跑会来挤本就紧张的排队，
     # 而这条判据本身不产出问答链路需要的东西。
     check_embedding()
 

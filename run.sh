@@ -12,7 +12,7 @@
 #                      frontend-probe / asr-probe / kb-fay），改探针时不用等全套十几分钟。
 #                      kb-fay 能点名跑，但不在常态清单里（一轮问答一组的代价，见下）
 #   ./run.sh build     只构建镜像
-#   ./run.sh smoke     打通链路冒烟测试：后端 → adapter → Fay → Ollama → 回库
+#   ./run.sh smoke     打通链路冒烟测试：后端 → adapter → Fay → 对话端点（.env 里那个）→ 回库
 #   ./run.sh asr-seed  本机若已有伙伴方那个 FunASR 模型缓存卷，直接拷过来（省 1.3GB 下载）
 #   ./run.sh audit     核账：fay/service/ue/frontend 四个仓库必须零改动、与上游不分叉，并列出 containerd 侧产物
 #   ./run.sh upstream  跟上上游：fetch xszyou/Fay，报 fork 落后/领先几条，
@@ -152,7 +152,13 @@ wait_fay_agent() { # wait_fay_agent <cid> <deadline_sec> —— 等 Fay 的「�
   echo "[run] 就绪：fay 代理实例（等待 $((SECONDS - t0))s）"
 }
 
-llm_residency() { # 宿主机 Ollama 上每个模型的显存驻留比例（问答耗时的唯一解释变量）
+ai_endpoints() { # smoke 前把两类 AI 能力的真实落点打出来：对话端点是什么、嵌入宿主忙不忙
+  # 两类能力是两台服务，所以分两行。对话那一行只报 `.env` 里覆盖后的落点（**绝不碰
+  # FAY_GPT_API_KEY**）；留空时回落 overlay/fay/system.conf 里那份示例，那是宿主 ollama。
+  local chat_base="${FAY_GPT_BASE_URL:-}"
+  [ -n "$chat_base" ] || chat_base="（.env 未覆盖 → 回落 system.conf 的 http://host.docker.internal:11434/v1）"
+  printf '  对话端点: %s\n            模型 %s\n' "$chat_base" \
+    "${FAY_GPT_MODEL_ENGINE:-（未覆盖 → 回落 system.conf 里的模型名）}"
   local port="${OLLAMA_PORT:-11434}"
   local out
   out=$(curl -fsS --max-time 3 "http://127.0.0.1:${port}/api/ps" 2>/dev/null |
@@ -161,21 +167,23 @@ import os, sys, json
 try:
     models = json.load(sys.stdin).get("models", [])
 except Exception:
-    print("  LLM 宿主 :%s 不可达 —— 第 5 步一定会失败，先起 ollama" % os.environ["OLLAMA_PS_PORT"])
+    print("  嵌入宿主 ollama :%s 不可达 —— 对话不经过它，问答类判据照样可能过；"
+          "代价是仿生记忆与知识库检索静默退化成模拟向量（不报错）" % os.environ["OLLAMA_PS_PORT"])
     raise SystemExit(0)
-if not models:
-    print("  LLM 宿主: 没有已加载模型，首个请求要先换入（可能几分钟）")
+print("  嵌入宿主 ollama :%s" % os.environ["OLLAMA_PS_PORT"]
+      + ("（没有已加载模型，首个嵌入请求要先换入，实测 70s 起）" if not models else ""))
 for m in models:
     name = m.get("name")
     size = float(m.get("size") or 0)
     vram = float(m.get("size_vram") or 0)
     if size <= 0:
-        print("  LLM 宿主: %s（size 未知）" % name)
+        print("           %s（size 未知）" % name)
         continue
     frac = vram / size * 100.0
-    print("  LLM 宿主: %s 驻留显存 %.0f%%（%.0f/%.0fMB）" % (name, frac, vram / 1e6, size / 1e6))
+    print("           %s 驻留显存 %.0f%%（%.0f/%.0fMB）" % (name, frac, vram / 1e6, size / 1e6))
     if frac < 50:
-        print("           → 大半权重在内存里，问答是分钟级；要秒级请换小模型或腾显存")
+        print("           → 大半权重在内存里，那一发是分钟级；显存只够放一个模型，"
+              "和对话服务抢的就是这一格")
 ' 2>/dev/null) || true
   [ -n "$out" ] && printf '%s\n' "$out"
 }
@@ -184,11 +192,12 @@ smoke() {
   set -u
   source .env
   local base="http://$(probe_host):${BACKEND_PORT:-8000}"
-  # 先把 LLM 宿主的真实状态打出来：这条链路的耗时几乎全在宿主机 Ollama 上，
-  # 权重有没有驻留显存决定这一发是 3 秒还是 300 秒。少了这句，第 5 步慢下来
-  # 会被读成「后端或 Fay 坏了」——本机实测 15.2GB 显存被别的常驻服务占走，
-  # qwen3.5:9b 只有 6.3% 进显存，一句话要 172~301s（fork 的规划器链路 >600s）。
-  llm_residency
+  # 先把两类 AI 端点的真实落点打出来：这条链路的耗时几乎全在模型那一发上，而对话与嵌入
+  # 是两台服务。少了这句，第 6 步慢下来会被读成「后端或 Fay 坏了」。历史上那句是：对话还
+  # 落在宿主 ollama 时，15.2GB 显存被别人占走、qwen3.5:9b 只有 6.3% 进显存，一句话要
+  # 172~301s（fork 的规划器链路 >600s）；现在对话打的是 .env 里那个端点，量出来的数在下面
+  # 这一行输出里，别拿上面那组历史数字当今天的基线。
+  ai_endpoints
   # 注意：health 路由挂在 api_v1_prefix 下，真实路径是 /api/v1/health（见 app/api/router.py:25）
   echo "[smoke] 1/6 后端健康检查"
   curl -fsS "$base/api/v1/health" && echo
@@ -214,7 +223,7 @@ smoke() {
   # 自己有本地磁盘，容器把那块磁盘换成了具名卷。卷漏挂或名字写错时数据落进容器的可写层，
   # restart 后照样读得到（还是同一个容器），但 `up -d` 重建实例就全丢 —— 所以既看
   # Mounts 的结构，也真的 restart 一次把同一条行读回来。
-  # 挑 fay 下手：产品真正服务的就是它，而且第 6 步紧接着走后端→adapter→fay→ollama，
+  # 挑 fay 下手：产品真正服务的就是它，而且第 6 步紧接着走后端→adapter→fay→对话端点，
   # 重启完接不回来当场就红。原先这步用 origin-fay 参照实例（没人 depends_on 它），
   # 那个实例已随「fork 是上游直接后代、代码逐字节相同」撤掉了。
   local cid mounts marker="smoke-persist-$$"
@@ -261,9 +270,10 @@ raise SystemExit("restart 之后读不到那一行：/app/memory 没有真正持
   printf '%s' "$persist_py" | docker exec -i "$cid" python - verify "$marker" \
     || { echo "[smoke] 持久化：重启后读不回来，卷没挂对" >&2; return 1; }
 
-  echo "[smoke] 6/6 发一句话（走 Fay + 宿主机 Ollama）"
-  echo "        耗时几乎全在 LLM：模型全驻显存时暖态 3~20s；上面那行驻留比例低，"
-  echo "        这一发就是分钟级（本机实测 172~301s）。上限 SMOKE_MAX_TIME=${SMOKE_MAX_TIME:-600}s"
+  echo "[smoke] 6/6 发一句话（走 Fay + .env 里那个对话端点）"
+  echo "        耗时几乎全在对话那一发，而且一问可能是好几发（fork 的规划器链路）。"
+  echo "        上面那行「驻留显存」说的是嵌入宿主，它低不代表这一发慢；那组"
+  echo "        172~301s 量自对话还落在 ollama 上的几轮。上限 SMOKE_MAX_TIME=${SMOKE_MAX_TIME:-600}s"
   curl -fsS --max-time "${SMOKE_MAX_TIME:-600}" -X POST "$base/api/v1/chat/sessions/$sid/messages" \
     -H "Authorization: Bearer $token" -H 'Content-Type: application/json' \
     -d '{"content":"你好，用一句话说说你能为康复期的老人做什么。","content_type":"text"}' |
@@ -277,15 +287,17 @@ print("  tier          =", (d.get("tier_classification") or {}).get("response_ti
 print("  回复          =", (am.get("content") or "(空)")[:160])
 sys.exit(0 if d.get("fay_forwarded") and (am.get("content") or "").strip() else 1)
 ' || {
-    # 区分「链路坏了」和「这台机器的显存不够」：前者要查，后者不是这条栈的缺陷。
-    # 与 LLM 无关的那几段（后端→adapter→Fay 的 HTTP/WS/MCP/TTS）由 ./run.sh test
+    # 区分「链路坏了」和「这台机器带不动那个模型」：前者要查，后者不是这条栈的缺陷。
+    # 与对话端点无关的那几段（后端→adapter→Fay 的 HTTP/WS/MCP/TTS）由 ./run.sh test
     # 里的探针确定性判掉，其中轻模型实例 fay-lite 专门证明问答链路本身是通的。
-    echo "[smoke] 第 6 步没拿到非空回复。若上面那行驻留显存 < 50%，这是显存不够、"
-    echo "        模型在 CPU 上推，不是链路坏：跑 ./run.sh test 看 fay-lite 那组，"
-    echo "        或把 overlay/fay/system.conf 的 gpt_model_engine 换成能装进剩余显存的模型" >&2
+    echo "[smoke] 第 6 步没拿到非空回复。先看上面那行对话端点是谁：" >&2
+    echo "        它是宿主 ollama 且驻留比例低 → 显存不够、模型在 CPU 上推，不是链路坏，" >&2
+    echo "        跑 ./run.sh test 看 fay-lite 那组，或把模型换成能装进剩余显存的；" >&2
+    echo "        它是别的服务 → 用 ./run.sh env 核对 FAY_GPT_BASE_URL 与 FAY_GPT_MODEL_ENGINE，" >&2
+    echo "        再用 curl {base}/v1/chat/completions 直连量一发，把环境问题与功能问题分开。" >&2
     return 1
   }
-  echo "[smoke] 全链路通过：后端 → adapter → Fay → Ollama → 落库"
+  echo "[smoke] 全链路通过：后端 → adapter → Fay → 对话端点 → 落库"
 }
 
 case "${1:-up}" in
@@ -430,40 +442,44 @@ case "${1:-up}" in
     ALL_GROUPS="backend-test backend-probe adapter-test probe-selftest frontend-test ws-relay-test asr-test probe-fay-lite ue-audit fay-probe probe-yueshen frontend-probe asr-probe kb-ingest kb-fay"
     # 允许 ./run.sh test fay-probe 只跑一组：改探针时不必再等 20 分钟全套。
     # 变量名不能叫 GROUPS —— bash 的内置只读数组（当前用户的 gid），赋值会被吞掉。
-    # 默认顺序把 probe-fay-lite 排在两个 9b 实例之前：ollama 是单条队列，
-    # 9b 那两组「客户端超时」不等于「服务端停止生成」，探针不等了模型还在推，
-    # 于是排在后面的 lite 只能排队。run #5 里 lite 的直连探测就是这么被挤到
-    # 180s 超时的（qwen2.5:1.5b 暖态本来 0.2s 答完）。lite 是唯一能给出
-    # 「问答链路真的通」正面证据的一组，必须先拿。
+    # 默认顺序把 probe-fay-lite 排在主实例那两组问答之前。两条理由现在都还在：
+    # 一问在 fork 里会触发多次嵌入请求，而嵌入宿主 ollama 是单条队列（对话端点搬到栈外
+    # 之后这一条没跟着搬）；并且问答组的「客户端超时」不等于「服务端停止生成」，探针不
+    # 等了模型还在推，于是排在后面的 lite 只能排队。run #5 里 lite 的直连探测就是这么被
+    # 挤到 180s 超时的（qwen2.5:1.5b 暖态本来 0.2s 答完，那一轮对话还在 ollama 上）。
+    # lite 是唯一能给出「问答链路真的通」正面证据的一组，必须先拿。
     # adapter-test 紧跟其后：它量的是本目录自己写的适配器（containerd/adapter），
-    # 全程打假 Fay、不碰 ollama，几秒跑完。把「我们自己有没有写坏」和「机器忙不忙」
+    # 全程打假 Fay、不碰任何模型端点，几秒跑完。把「我们自己有没有写坏」和「机器忙不忙」
     # 这两件事分开，前者不该被后者的抖动掩盖。
     # probe-selftest 排在它后面，同一个道理：它量的是探针自己的「收工时机」
-    # （probes/ws_timing_test.py），假 Fay 出帧、不碰 ollama，也是几十秒。
+    # （probes/ws_timing_test.py），假 Fay 出帧、不碰任何模型端点，也是几十秒。
     # backend-probe 紧跟 backend-test：同一条理由 —— 它量的是这个正在应答 HTTP 的
-    # 进程 + 业务库的真实 schema，也不碰 ollama，十一条判据几秒钟。
+    # 进程 + 业务库的真实 schema，也不碰任何模型端点，十一条判据几秒钟。
     # probe-yueshen 排在全套最后，为的是显存而不是逻辑：它要打宿主 ollama 的**嵌入**模型
     # 才能把语料灌进 chromadb，而这台机器显存只够放一个模型，换入换出实测 70s 起。
     # 放在三组问答之前，等于我们自己制造一次模型换出、把问答判据挤成超时（那红的是
     # 排队，不是被测对象）。它自己第一发就是奔着「量嵌入出口 + 顺手把模型预热进显存」
     # 去的，所以这条链路的耗时证据仍然取得到。
     # frontend-test 挨着 probe-selftest：同一个位置逻辑 —— 它量的是本目录自己写的外壳
-    # （containerd/frontend/carecho_web.py）与构建产物，假后端起在同容器里，不碰 ollama，
-    # 17 条判据秒级。frontend-probe 排在后面：它那一问要穿完整条链（本机 9b 实测
-    # 172~301s），是唯一还会新增一次问答开销的一组，排在谁后面都不影响谁的判据。
+    # （containerd/frontend/carecho_web.py）与构建产物，假后端起在同容器里，不碰任何模型
+    # 端点，17 条判据秒级。frontend-probe 排在后面：它那一问要穿完整条链（对话还落在
+    # ollama 时本机 9b 实测 172~301s），是唯一还会新增一次问答开销的一组，排在谁后面都
+    # 不影响谁的判据。
     # ws-relay-test / asr-test 紧跟 frontend-test：同一条理由的 ASR 版 —— 前者量的是外壳
     # 里那段 WS 转发（假上游起在同容器里，stdlib 手搓帧），后者用 ASR_FAKE_MODEL=1 量
-    # 识别服务的线上协议与累计文本那条性质，都不加载 torch、不碰 ollama，两组都是秒级。
-    # asr-probe 排在全套最末：它是唯一真的跑一次 CPU 推理的一组（paraformer-large 会
-    # 从 ollama 那些 CPU 驻留权重嘴里抢核），所以它既不能排在问答组之前，也不该被它们排队。
+    # 识别服务的线上协议与累计文本那条性质，都不加载 torch、不碰任何模型端点，两组都是秒级。
+    # asr-probe 排在全套最末：它是唯一真的跑一次 CPU 推理的一组（paraformer-large 会从
+    # 宿主上那些没驻留显存的模型权重嘴里抢核），所以它既不能排在问答组之前，也不该被它们排队。
     # kb-ingest 排在 asr-probe 之后、成为新的最末一组：它比 asr-probe 更贵 —— 每次都
     # reset 重嵌入那 516 个片段（几分钟），还要把 qwen3-embedding 换进唯一那块 16GB 显存。
     # 排在最后它谁也不抢，而且它跑完留下的正是真语料（probe-yueshen 在它前面把集合
     # 换成了 3 段合成语料）。这条组名就是 compose 服务名 ./run.sh test kb-ingest；
     # 单独调 top_k 用 ./run.sh kb --sweep 3,5,8，那条不占测试组的位。
     # kb-fay 只进 ALL_GROUPS、**不进 DEFAULT_GROUPS**：它一组要发两整轮问答（正常轮 +
-    # 把 query_yueshen 的 prestart 注册摘掉再问一轮的对照轮），本机 9b 那一轮实测 172~301s，挂进常态
-    # 清单等于让 `./run.sh test` 在低配机器上必然卡出一条与回归无关的红。列进 ALL_GROUPS
+    # 把 query_yueshen 的 prestart 注册摘掉再问一轮的对照轮）。挂进常态清单等于让
+    # `./run.sh test` 在问答端点慢的机器上必然卡出一条与回归无关的红 —— 那三组问答还
+    # 在宿主 ollama 上时实测一轮 172~301s；端点搬到栈外那台 26B 之后 kbq 单发只要 8.1s，
+    # 但这一组仍是全套里唯一要发两整轮的一组，判据本身也不随快慢改变。列进 ALL_GROUPS
     # 是为了让它能被点名（改 Fay 的 prestart/注入这条链时值得跑），日常入口是 ./run.sh kbq。
     DEFAULT_GROUPS="backend-test backend-probe adapter-test probe-selftest frontend-test ws-relay-test asr-test probe-fay-lite ue-audit fay-probe probe-yueshen frontend-probe asr-probe kb-ingest"
     TEST_GROUPS="$*"

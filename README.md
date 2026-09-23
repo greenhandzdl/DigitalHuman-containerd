@@ -15,6 +15,9 @@
 
 ```
 containerd/
+├── README.md                   本文：怎么配、怎么起、边界在哪
+├── AGENTS.md                   ★ 分工的另一半：决策为什么这么做、每次失败怎么排出来的、
+│                               这台机器的私有环境前提。想部署不必读，想改配置/判据/补丁必须先读
 ├── docker-compose.yml          常驻 8 个服务：mysql / redis / fay / yueshen-rag
 │                               / adapter / backend / frontend / funasr；另有 profiles:["test"]
 │                               的 fay-lite（测试用轻模型 Fay）+ 15 个一次性测试件，其中
@@ -58,7 +61,7 @@ containerd/
 │                               · kb_fay_probe.py（业务侧：从 /api/send 问一句，判那一行的
 │                               │               注入块与正文，`./run.sh kbq`）
 │                               · frontend_test.py（前端外壳契约：假后端 + 19 条判据 + 负面自检）
-│                               · frontend_probe.py（真栈：从外壳那一口穿到 backend→adapter→Fay→ollama）
+│                               · frontend_probe.py（真栈：从外壳那一口穿到 backend→adapter→Fay→对话端点）
 │                               · ws_relay_test.py（外壳的 WS 转发契约：手造掩码帧 + 假上游）
 │                               · wsutil.py（RFC 6455 握手与帧的最小构造器，上面那组与 asr_* 共用）
 │                               · asr_test.py（FunASR 协议自测：假模型、不加载 torch）
@@ -76,13 +79,30 @@ containerd/
 └── _audit/                     ue-audit 的 JSON 报告落这里（README 的数字对着它复核）
 ```
 
+## 这两份文档的分工
+
+本文只留**照着能敲的东西**：拓扑、配置口径、档位、判据清单。另外三类内容整体挪到了
+**[`AGENTS.md`](AGENTS.md)**（2026-09-23 挪完之后 1228 行），因为它们对部署没用、对改动却是必须的：
+
+| 那里放了什么 | 对应小节 |
+|---|---|
+| 一次决策的来龙去脉（为什么长成这样、被什么否证过） | 「这一条命令是被一次真事逼出来的」、「真实瓶颈是显存，不是代码」、「远程音频那两个缺陷：`patches/fay/0004` 的来历」、「依赖层为什么不能直接用 `fay/requirements.txt`」、「pip 缓存挂载只给还在改 requirements 的那一层」、「知识库那三个旋钮」、「决策面谈 `:5001`」、「优雅停止」 |
+| 每一轮完整实测的原始记录 | run #27 ~ run #32 各节（含每组判据的通过数与耗时） |
+| 单次故障的排查过程（现象 → 排除 → 定位） | 「`:10002` 上的空回复」、「外部 TTS 出口不通和容器 audio 推送坏了是两件事」、「密钥不给全，产物里连 ID 都会消失」、「13 条判据全绿的那晚，手机仍一个字都识别不出来：426」、「Fay 会调工具这句话，探针只敢证到中间那一档」 |
+| 判据为什么会假红、以及怎么证明它不只会绿 | 「测试库跨轮存活」、「只在午夜红的上游用例」、「后端活体探针的七次变异验证」、「探针的收工时机与收尾文案」 |
+| 这台机器的私有环境（上面所有数字的前提） | 「与既有宿主服务的隔离」，含宿主机 git 配置里的遗留凭据 |
+
+那条挪走的「配置这一层」事故复盘也在那儿 —— 所以 `./run.sh env` 这条命令为什么存在、
+它防的是哪一种错，写在 `AGENTS.md`「这一条命令是被一次真事逼出来的」一节。
+
 ## 服务拓扑
 
 ```mermaid
 flowchart TB
   BRO["浏览器 / 手机"]
   UEX["UE 5.1（另一台机器）"]
-  OLL["宿主 Ollama :11434<br/>对话 + 嵌入"]
+  OLL["宿主 Ollama :11434<br/>嵌入（+ 仓库示例值里的对话）"]
+  INF["栈外的对话服务 :11432<br/>OpenAI 兼容 · 26B"]
 
   subgraph PROD["常驻：docker compose up（prod 档位）"]
     FE["dh-frontend<br/>:5173 同源外壳"]
@@ -103,7 +123,7 @@ flowchart TB
     T1["backend-test · backend-probe · adapter-test · probe-selftest"]
     T2["frontend-test · ws-relay-test · asr-test"]
     T3["fay-lite + probe-fay-lite · ue-audit · fay-probe · probe-yueshen"]
-    T4["frontend-probe · asr-probe（抢 CPU / 打 ollama 的排最后）"]
+    T4["frontend-probe · asr-probe（抢 CPU / 要打栈外推理的排最后）"]
   end
 
   subgraph KBP["profile: kb（./run.sh kb / kbq）"]
@@ -115,8 +135,10 @@ flowchart TB
   FE --> BK
   FE -->|"/funasr-ws 转发"| FS
   BK --> AP --> FY
-  FY --> OLL
-  YS --> OLL
+  FY -->|"对话 /chat/completions"| INF
+  FY -.->|"未设 .env 时对话也落回它"| OLL
+  FY -->|"仿生记忆 embedding"| OLL
+  YS -->|"/v1/embeddings"| OLL
   FY --> YS
   BK --> MY
   BK --> RE
@@ -149,7 +171,7 @@ README.md`，它离线扫所有 ```` ```mermaid ```` 块并给出结论。为什
 cd containerd      # 本目录（仓库里唯一有可执行入口的地方）
 ./run.sh up        # 构建 + 起栈（首次约 3~6 分钟，pip 走阿里云镜像、npm 走 npmmirror）
 ./run.sh dev       # 同一套东西，但叠上 docker-compose.dev.yml：应用面端口放开、DEBUG=true
-./run.sh smoke     # 端到端：后端 → adapter → Fay → Ollama → 落库
+./run.sh smoke     # 端到端：后端 → adapter → Fay → 对话端点 → 落库
 ./run.sh test      # 十四组测试件：backend-test · backend-probe · adapter-test · probe-selftest
                    #            · frontend-test · ws-relay-test · asr-test · probe-fay-lite
                    #            · ue-audit · fay-probe · probe-yueshen · frontend-probe
@@ -206,7 +228,7 @@ compose 的健康判据没跟着改成这条：它在容器里跑，读不到自
 容器内实测已监听的端口：5000 / 10002 / 10003 / 10001(远程音频 TCP) / 9001(音频桥)
 / 5010(MCP 管理) / 8765(MCP SSE)。**5001(genagents 决策面谈) 不在常态清单里 —— 它是按需拉起的**：
 `POST :5000/api/start-genagents` 才起、`POST :5001/api/shutdown` 就关，
-这条起落两向 run #24 起已是探针里的判据（见「决策面谈 `:5001`」一节）。
+这条起落两向 run #24 起已是探针里的判据（见 `AGENTS.md`「决策面谈 `:5001`」一节）。
 compose 只把前三个
 （5000 / 10002 / 10003）发布到宿主机，其余留在容器网络里。
 
@@ -232,32 +254,6 @@ Fay 时改叫 `FAY_EMBEDDING_MODEL`（一组键喂两侧是故意的，见 compo
 
 第二栏是"想改但找不到那一行"的出口：compose 读了它、`.env` 没写，于是走 `${VAR:-默认}`
 里那个默认值 —— 要改就得**新增**一行，而不是去改一个名字看着像、其实没接上的键。
-
-### 这一条命令是被一次真事逼出来的（2026-09-23）
-
-切到远端那台 26B 时往 `.env` 写了：
-
-```
-FAY_GPT_MODEL_ENGINE=gemma-4-26b-a4b-nvfp4
-FAY_BIG_MODEL_ENGINE=gemma-4-26b-a4b-nvfp4
-```
-
-而 `docker exec dh-fay env | grep MODEL_ENGINE` **一条都没有**，`docker exec dh-fay python -c
-"from utils import config_util as c; c.load_config(); print(c.gpt_model_engine)"` 印出来的是
-`system.conf` 里的 `qwen3.5:9b`。原因是 `x-llm-endpoint` 那个锚点只透传了
-patches/fay/0009 放开的端点与密钥，漏了 0006 放开的模型名两条 —— lite 实例反而有
-（`FAY_LITE_MODEL_ENGINE` 单独写在它自己那段里），所以这个洞只有主实例会踩。
-
-它为什么没被发现：**远端不校验 `model` 字段**。同一台远端 `/v1/models` 实测只返回
-`['gemma-4-26b-a4b-nvfp4']` 一条，请求里写 `qwen3.5:9b` 它照答，于是"配的模型名"和
-"真正在答的那个模型"这两件事一直没对上过账面，而 `kbq` / `smoke` 全绿。换一台严格一点的
-OpenAI 兼容服务端（vLLM 默认就校验），症状立刻变成每一发 500 —— 那才是这个洞真正的代价。
-
-修法就是把两条键补进锚点，默认值仍是空：补丁写的是
-`os.environ.get('FAY_GPT_MODEL_ENGINE') or 原值`，空串走 `or` 分支，所以
-**不设这两条时逐字等于改之前**（回落 `system.conf`），新克隆的行为一点没动。
-复跑 `./run.sh kbq` 仍是 9/10 + 1 SKIP、退出码 0、8.1s 一发 —— 这一问的注入与正文与换名之前
-同构，因为对端本来就只有一个模型。
 
 ### 于是定了三条纪律
 
@@ -448,249 +444,39 @@ dev （./run.sh dev，run.sh 把 BIND_ADDR 导成 0.0.0.0）
 浏览器的规则，不是本栈的缺陷。要么走 https（伙伴方那个小程序壳还额外要求备案域名），
 要么用 `adb reverse` / USB 调试把 5173 转成 localhost。
 
-## 为什么 AI 走宿主机 Ollama
+## AI 端点落在哪里：对话与嵌入是两台服务
 
-`overlay/fay/system.conf` 把小模型、大模型、embedding 三组配置全部指向
-`http://host.docker.internal:11434/v1`（compose 里 `extra_hosts: host-gateway`）。
-不填任何云端 API key，也不依赖那个已经不可达的远程配置中心。
-后端侧不需要接 LLM：`app/services/tier_engine_service.py:94` 的分级分类是
-读库里的规则表做的，纯 SQL，所以整条链路上只有 Fay 一个 AI 消费者。
+`overlay/fay/system.conf` 那份示例值把小模型、大模型、embedding 三组配置全指向
+`http://host.docker.internal:11434/v1`（compose 里 `extra_hosts: host-gateway`）：
+不填任何云端 API key，也不依赖那个已经不可达的远程配置中心。**那是仓库里的默认，不是本机
+现在的样子** —— 本机把对话与嵌入拆成了两台服务，而这两件事各自独立可换：
 
-当前选定的模型（改完 `docker compose restart fay` 即生效，不用重新 build）：
-
-| 角色 | 模型 | 说明 |
+| | 本机现在的落点 | 什么都不设时（= system.conf 的示例值） |
 |---|---|---|
-| 小模型（日常对话） | `qwen3.5:9b` | 权重 6.6GB。**标称 16GB 显存装得下，但这台机器装不下** —— `nvidia-smi` 有 15.2GB 被本机其他常驻服务占走，实测只有 6.3% 权重进了显存（下一节全部数字都是这个前提）。换 27b 更糟：`qwen3.8:27b` 要 17.7GB 权重，还会溢出到内存/CPU；留空则 Fay 自动降级为单模型 |
-| 大模型（复杂推理） | `qwen3.5:9b` | 故意与小模型同名，避免一次问答在两个模型间换入换出 |
-| Embedding（记忆检索） | `qwen3-embedding:0.6b` | 609MB，走 `/v1/embeddings`；启动时预热实测 dim=1024。它一加载就会把对话模型挤出显存，所以每轮问答要 8 次 embedding 的链路在这台机器上特别贵 |
+| 对话（小模型 + 大模型） | `.env` 里 `FAY_GPT_BASE_URL` / `FAY_BIG_MODEL_BASE_URL` 指栈外的本地推理服务（`http://<本机地址>:11432/v1`），模型 `gemma-4-26b-a4b-nvfp4`（26B MoE，nvfp4 量化） | 宿主 ollama `qwen3.5:9b` |
+| 嵌入（仿生记忆 + 知识库） | 宿主 ollama `qwen3-embedding:0.6b`（`:11434/v1`，`YUESHEN_EMBED_*`） | 同一个 |
+| 测试用的轻实例 `fay-lite` | 宿主 ollama `qwen2.5:1.5b` —— **刻意不跟主实例共用端点**，理由写在 `docker-compose.yml` 的 `x-llm-endpoint-lite` 那段 | 同一个 |
 
-模型名除了写死在 `overlay/fay/system.conf` 里，还可以用环境变量盖：
-`FAY_GPT_MODEL_ENGINE` / `FAY_BIG_MODEL_ENGINE`（补丁 `patches/fay/0006`，
-不打补丁 = 原行为）。compose 里的 `fay-lite` 就靠它跑 `qwen2.5:1.5b`，
-不用为测试再造一份 system.conf。
+三条纪律：
 
-`yueshen-rag` 的嵌入模型（`YUESHEN_EMBED_MODEL`）**故意指向上表同一个
-`qwen3-embedding:0.6b`**，不是第二个嵌入器：这台机器一次只装得下一个模型，
-多一个型号就多一次换入换出。
+- **端点与模型名都是 `.env` 里的事**，compose 靠锚点 `x-llm-endpoint` 透传；机制在
+  `patches/fay/0009`（端点与密钥）与 `patches/fay/0006`（模型名）。被跟踪的 `system.conf`
+  只留示例值，否则那几行机器拓扑就进了 git 历史。**只设端点不设模型名是不够的** ——
+  对端可能不校验 `model` 字段照答，那时你以为换了模型、其实发的还是 `qwen3.5:9b`
+  （踩过一次，见 `AGENTS.md`「这一条命令是被一次真事逼出来的」）。
+- 换完 `docker compose restart fay` 就生效，不用重新 build；两条都留空 = 逐字回落 system.conf。
+- 后端侧不接 LLM：`app/services/tier_engine_service.py:94` 的分级分类是读库里的规则表做的，
+  纯 SQL，所以整条链路上只有 Fay 一个对话消费者（yueshen-rag 只消费嵌入）。
 
-## 真实瓶颈是显存，不是代码（为此打的补丁）
+显存这一层要写清楚，因为它是这台机器所有耗时数字的前提：**这张 16GB 卡从来不是全给本栈的**。
+2026-09-23 实测那台对话服务自己就占 `10742 MiB`，ollama 只剩下半截，所以嵌入模型每次都要
+换入（实测 72.9s，`EMBEDDING_TIMEOUT` / `YUESHEN_EMBED_TIMEOUT` 都是按这个最坏值给的）。
+「慢在哪、就绪怎么判、探针因此分成三态」的完整推演在 `AGENTS.md`「真实瓶颈是显存」一节。
 
-探针有一阵子反复出现同一类失败：HTTP 问答 90s 拿不到一个字、`:10002` 收不到
-`Data.Key=text`、`/v1/chat/completions` 精确地在 **180.0s** 返回空 `content`。
-查下来根因在这台机器的显存上，与容器封装无关：
-
-| 测到的事实 | 数字 |
-|---|---|
-| GPU | RTX 4080 SUPER 16GB，`nvidia-smi` 显示 **15.2GB 已被本机其他常驻服务占走** |
-| `ollama ps` | `qwen3.5:9b` 标着 `94%/6% CPU/GPU` —— 实际是 CPU 在推 |
-| `ollama /api/ps` 的字节账 | `size_vram=387029401` / `size=6149206178` = **只有 6.3% 权重进了显存** |
-| 直连 Ollama 一发 | 只生成 8 个 token 用了 **51.4s**（另一轮实测 39.1s） |
-| Fay 容器日志 | `请求超时 (尝试 N/3): ...port=11434... Read timed out. (read timeout=60)` 成串 |
-| 一轮问答触发的 embedding 请求 | **8 次**（日志 `发送 embedding 请求` 计数） |
-
-同一个模型、同一份 `system.conf`，两个实例的表现却不一样 —— 这是把「容器封装坏了」
-排除掉的关键一条对照：
-
-| 实例 | 模型 | 一句话问答 |
-|---|---|---|
-| `origin-fay`（上游 v4.8.1） | qwen3.5:9b | 出真回复，**172.1s / 301.2s** |
-| `fay`（fork） | qwen3.5:9b | **>600s** 仍拿不到字，最后落进管线兜底语 |
-
-差额是 fork 自己加的那层规划器（`llm/nlp_cognitive_stream.py:3059` 的
-`_call_planner_llm`，走同一张图但多几发 LLM）。在显存够用的机器上是产品力的差别，
-在这台显存被占满的机器上是「一个数量级的墙钟时间」，与容器无关。
-
-> 这一行对照属于**旧基线**：那时的 `fay/` 是 `45b44e9` 那份源码导入，规划器那层是它自己加的。
-> 2026-09-21 起 fork 换成 `chuan918/Fay`（v4.8.1 的直接后代），Python 源码与上游逐字节相同，
-> 这张表量不出现在了 —— 现在两个实例的差别只有 config，不再有代码档。保留它是为了说明
-> 「墙钟时间可以差一个数量级而两处都不是容器的问题」这条判据的来历。
-
-放大链路写死在上游几个数字里 —— `utils/api_embedding_service.py:110` 是
-`timeout=60` + `max_retries=2`，`llm/execution_manager.py:203` 是小模型 `timeout=60`。
-显存不够 → 加载 609MB 的 embedding 模型就得把 6.6GB 的对话模型挤出去，下一轮再换回来 →
-一发 embedding 必然 >60s → 超时 → **整条请求重发 3 遍 = 180s** →
-正好撞上 `gui/flask_server.py:51` 的 `_STREAM_READ_IDLE_TIMEOUT = 180`，
-非流式问答于是「180s 内一个字都没等到」，按兜底分支返回空串。
-看起来像 Fay 坏了，实际是重试把时间预算吃光，而 180s 的空闲上限又小于
-LLM 自己的超时 —— 两条时间线本来就没对齐（实测 `/v1/chat/completions`
-精确地在 180.0s 返回，而同一发请求在 origin-fay 身上 172.1s 就出字了）。
-
-修复仍然不进 Fay 仓库：`containerd/patches/` 把这四个数字开成环境变量，
-compose 的 `x-llm-timeouts` 锚点给 `fay` / `fay-lite` 两个服务注入 ——
-
-| 环境变量 | 容器里的值 | 作用 | 补丁 |
-|---|---|---|---|
-| `LLM_REQUEST_TIMEOUT` / `LLM_REQUEST_MAX_RETRIES` | `420` / `0` | 真正的回答给足时间，且不再重发（重发只会让回答更晚） | `fay/0001` |
-| `EMBEDDING_TIMEOUT` / `EMBEDDING_MAX_RETRIES` | `90` / `1` | 仿生记忆检索那发 embedding 的预算。**这里吃过一次教训**：起初按「容器里不要死等」压成 `20` / `0`，run #7 否证了它 —— ollama 换入模型实测要 72.9s，20s 必然超时，除了静默落回 `simulation_engine/gpt_structure.py:294` 的模拟向量，还把开机线程堵在一串重试后面，`:8765` 拖到第 61 秒才 bind（见下面「就绪判据」）。90s 按实测最坏值给，换入完成后一发 embedding 只要 0.06s | `fay/0002` |
-| `STREAM_REPLY_IDLE_TIMEOUT` | `480` | 回复空闲上限必须 ≥ 上面那条 LLM 超时，否则「模型正在慢慢想」被判成「Fay 卡住」 | `fay/0003` |
-| `FAY_GPT_MODEL_ENGINE` / `FAY_BIG_MODEL_ENGINE` | 缺省不注入 | 换掉 `system.conf` 里的模型名，给显存不够的机器留一条「换个吃得下的小模型」的路（`fay-lite` 用这个跑 qwen2.5:1.5b） | `fay/0006` |
-
-补丁里未设置环境变量时的默认值与上游逐字一致（不打补丁 = 原行为）。
-显存被挤走时问答侧仍会慢到分钟级，那是环境而不是配置问题，探针按下面的三态处理。
-
-### 就绪判据：五个契约端口全监听，不是「`:5000` 能连就算起」
-
-两个 Fay 实例（`fay` / `fay-lite`）共用一份镜像，也共用 compose 里
-`x-fay-healthcheck` 这一个锚点：`5000`（Flask）、`5010`（MCP 管理面）、`8765`（MCP SSE）、
-`10002` / `10003`（两条 WS）全 bind 才算 healthy。原先那份只看 `:5000`，实测开机
-`:5000/:5010/:10002/:10003` 第 6 秒就全在听，`:8765` 要等到第 24~61 秒 ——
-`--wait` 于是提前放行，探针打进一个只起了一半的实例，run #7 的
-`MCP SSE 握手 ConnectionRefused`、`OpenAI 兼容层 超时`、`/api/send 空回复` 三条 FAIL
-全是这一个原因（同一轮里 WS 侧的问答、audio 帧、wav 取回反倒全绿，因为那几个口先起）。
-探针侧另加一道 `wait_port()`：握手前先等 `:8765` 监听，等不到才判 FAIL，
-详情里带上「等了几秒」—— 晚起是事实，不是故障，但不该由测试替它圆场。
-
-`x-fay-healthcheck` 的**实现方式**也改过一版，原因是它自己在污染容器日志。旧写法对
-五个口各做一遍 `socket.create_connection` 半开握手，而 `:10002`/`:10003` 是
-`websockets` 的 legacy server：一次只连不发的 TCP 探测会让它在 `websockets/legacy/server.py:230`
-打一对 `connection failed (400 Bad Request)` + `connection closed`。健康检查 `interval: 10s`
-× 每轮两条 WS 口 = 每个空闲实例每小时约 720 对这种纯自己制造的噪音，把基于日志取证的其他判据
-一起淹了。换成读 `/proc/net/tcp`+`/proc/net/tcp6` 的 LISTEN 表（`st == '0A'`，端口取本地地址
-hex 段），零字节打到业务端口就能判定五口全听；`:8765` 是 uvicorn、裸连不打日志，但为一致性
-一并走这张表。run #7 那条「`:8765` 到第 24~61 秒才起」的经验仍然守住 —— 五口全 LISTEN 才 healthy。
-换完实测：一个空闲实例 60s 内新增 `connection failed` 行为 `0`（此前是每 10s 一对）。
-
-这条判据在 **restart 场景**下被独立验证过一次（比开机更能说明问题）：
-`docker compose restart fay-lite` 5.9s 就返回，容器里 `:5000/:5010/:10002/:10003`
-立刻可连，而 `:8765` 与 `:10001` 在 **140s 之后仍未监听**（当时宿主被两组 9b 压满）。
-健康检查因此一直保持 `starting`，`--wait` 不肯放行 —— 这正是把它纳入判据的意义：
-宁可慢放行，也不放行一个半启动的实例去制造假红。同一轮里也顺手量到了另一件事：
-重启前后 `/api/get-msg` 都能读回同一条 `id=83` 的消息行，说明记忆确实落在
-`fay-memory` 具名卷里而不是容器的可写层（这条后来固化成 `./run.sh smoke` 的第 5 步，
-故意排在最后那次问答**之前**：它不依赖 LLM，就不该被显存不够连累）。
-
-还有一处 60s 是**故意不碰**的：`simulation_engine/gpt_structure.py:21` 那个
-`httpx.Timeout(60.0) + max_retries=1` 的 openai 客户端只服务 `ask_gpt` /
-`gpt4_vision`（写死 `model="gpt-4o"`），全仓 grep 不到问答链路上的调用方，
-`llm/nlp_cognitive_stream.py:50` 从这里只 import `get_text_embedding`，
-而那个函数走的是已开成环境变量的 `utils/api_embedding_service`。
-
-### 探针怎么判：PASS / FAIL / SKIP 三态 + 一条不依赖显存的功能路
-
-光把超时放宽会变成「等到天荒地老然后报个红」，测试就失去意义了。`probes/fay_probe.py`
-因此定了六条规矩（前四条管判定语义，第五条管时机，第六条管覆盖面）：
-
-**1) 兜底语不算回复。** run #2 里有一条被记成
-`PASS HTTP 问答链路 … 243.3s, 22 字: 抱歉，我的大脑暂时开了小差，请稍后再试一下。`
-——那是管线自己承认失败的兜底串（fork 里 `nlp_cognitive_stream.py:2258/2871/2945/3066`
-四处之一），不是回答。现在 `reply_verdict()` 先按 `PIPELINE_FALLBACKS` 三串过滤。
-
-**2) 环境不够就降级成 SKIP，但必须带客观证据。** `check_llm_host()` 先绕过 Fay
-直连 LLM 出口量一发下限耗时，并从 `ollama /api/ps` 读 `size_vram/size`；
-驻留不足 50% 或单发 >30s 才置 `DEGRADED_LLM_HOST`（阈值来自实测分布：1.5b 全权重
-进显存时暖态 0.2s，9b 6% 驻留时 39~240s）。此后耗时类判据走 `latency_verdict()`，
-真不过 = FAIL，只有拿着这条证据才允许 SKIP，退出码只数 FAIL。
-问答预算也不再一路抬到 `--max-timeout`：显存不足时按 `--timeout` 快速判掉
-（run #3 就是每条问答都撞满 600s 客户端超时，白烧墙钟时间）。**直连探测自己超时**
-也算证据而不是故障：run #5 的 origin-fay 那组，同一条日志里 `frac_txt` 已经写了
-「驻留显存 6%（387/6149MB）」，判据却报 FAIL —— 自相矛盾，现在这类超时进 SKIP 分支，
-只有连不上 / 4xx（= LLM 出口配错）才留 FAIL。
-
-**3) 下游判据不重复计账。** `audio` 帧的存在性、以及按 `HttpValue` 去 HTTP 取文件，
-都以「这轮真有了回复」为前提。run #5 里这两条被记成
-`FAIL …（Keys=['log','question']）`—— 一个字都没播，音频自然没有，它是同一条 LLM
-依赖的下游，不是独立的容器故障，所以走 `latency_verdict()`。反方向仍然硬失败：
-客户端声明 `Output=false` 却收到 audio 帧，那是服务端漏推，与模型无关。
-
-同一组判据还有第三种错法：**收工收早了**。run #10 里 `Output=true` 那条被判成
-FAIL（`Keys=['log','question','text']`，text 明明到了），而同一份代码在 run #9 是
-PASS —— 差别只在 audio 帧并不和 text 同时到（#10 里 text 到了、之后 6s 静默内什么都没来；
-#9/#11 里它在稍后被收到），而 `check_ws()` 收到 text 之后只等 6s 静默就收工。它的下游
-是「整句合成完才推」，这个节奏不是 6s 能盖住的。现在窗口按「这个会话还欠不欠 audio」
-分两档（`AUDIO_GRACE_SECONDS=45` / 6s），服务端中途关连接也不再丢弃已收到的帧。
-run #12 给了这条修复最想要的对照：lite 与 origin-fay 两个实例的 `Output=true` 会话
-都等到了 audio 帧并取回 wav（264642 / 563110 字节），而 `fay` 那一轮的会话根本没等到
-文字，于是它按 `--timeout` 就收工、没有多花那 45s —— 窗口只放宽给「确实还欠一帧」的会话，
-不给死掉的宿主。
-**判据自己也会写错**这件事不该只靠再跑 20 分钟全套去发现，所以它有一份不打 LLM、
-不看显存的时机自测：`probes/ws_timing_test.py`（七种时机各量一次，其中一条把窗口
-退回 6s 并断言"必须收不到"，防止这条判据变成摆设；另有三条量收尾那行的统计口径）。
-
-**4) 没执行到的判据不能算 PASS。** MCP 那组的 `ping` 在 `origin_fay` 上能不能调到，
-取决于它 `test/mcp_stdio_example.py` 的 `autostart=false` 之后那条「现场连接离线服务器
-tools」有没有成功 —— 在线的原本只有知识库。run #4 却把这条印成
-`PASS … —— 该实例在线的服务器里没有暴露 ping`。
-假绿比红更糟，改成 SKIP 并把原因写进详情。判据是「没执行到就 SKIP」，不是「环境不配合
-就默认通过」，所以它在 run #10 记 SKIP、在 run #12 记 PASS 都是这套语义的正常结果。
-
-**5) 量之前先确认「它真的起完了」。** 端口 bind ≠ 服务可用，这条是 run #7/#8 用两次
-误报换来的：`compose --wait` 只看健康检查，健康检查原先只摸 `:5000`，而 `:8765`
-（MCP SSE）要晚 5~40 秒、MCP 的「开机自连」又要再晚 1.6 秒。探针打早了就会得到
-`ConnectionRefused`（SSE 还没监听）和 `在线 无`（自连还没跑完）这种看着像故障的红。
-现在分两层堵：compose 侧健康检查要求五个契约端口全监听（`x-fay-healthcheck`），
-探针侧 `wait_port()` 等 `:8765`、`check_mcp_tools()` 先等 `autostart=true` 那几台
-在线再取快照（上限 90s，等不到才 FAIL）。等待本身算进详情，方便下次判断是不是又起慢了。
-
-**6) 只管得着容器化的判据也要有。** `check_console()` 取 `:5000` 根页面，再把页面里
-引用的每个 `/static/*` 逐个 GET，要求 200 且非空。三个 Fay 实例实测各 **22 个资源全过**。
-这条与上游功能无关（少拷一层目录、`.dockerignore` 排掉静态资源、镜像里 `web` 路径不对
-都会红），而问答链路对它完全无感 —— 容器化改坏的东西，得有一条判据专门盯着容器化。
-
-**测试件的顺序**也被这条链路咬过：ollama 是单条队列，而且**同一时刻只保留装得下的
-模型**。9b 占着 6GB 时，1.5b 第一次请求要先换出 9b 再换入自己 —— 实测 72.9s，
-换入后同一发请求 14.9s。更要命的是「探针客户端超时」不等于「服务端停止生成」，
-前面那两组 9b 的残留生成会一直堵着队列，于是 run #5 里 `probe-fay-lite` 的直连探测
-被挤到 180s 超时，唯一能给出正面证据的一组反而降级了。现在 `./run.sh test` 的默认
-顺序把不打 LLM 的四组排在前面、lite 排在两个 9b 实例之前（`backend-test →
-backend-probe → adapter-test → probe-selftest → probe-fay-lite → ue-audit →
-fay-probe → probe-yueshen`）。
-
-SKIP 只说明「这台机器判不了这一条」，所以问答链路的**真实功能**由 compose 里第三个
-Fay 实例 `fay-lite` 兜住：同一个镜像、同一套补丁、同一份 `system.conf`，只是模型换成
-装得进剩余显存的 `qwen2.5:1.5b`（`FAY_LITE_MODEL_ENGINE` 可改），不开宿主端口、
-有自己的一套 memory/cache/logs 卷和一份可写的 `overlay/fay-lite/config.json`
-（config.json 是人设可写状态，两个容器不能共用同一份）。它 43 条判据里 **41 PASS /
-2 SKIP / 0 FAIL**（run #21 首次 36/39，run #24 加上决策面谈那三条后 39/42，run #27 再因
-连上的 yueshen 加一条 `MCP 工具清单 server_id=4`、`yueshen rag` 退出白名单 SKIP 变两条 PASS，
-成 41/43），
-包含 `Data.Key=audio` 出帧、`HttpValue`
-真的取回 wav（#21 469970 字节 / #23 385298 字节 / #24 544058 字节 / #27 328146 字节），
-以及 MCP 那一整组不打 LLM 的确定性判据（含 prestart 那三档；剩下 2 条 SKIP 是无头白名单里的
-`window capture` 与本机没起的 FunASR，`yueshen rag` 这一轮已经是两条正面 PASS，见规矩 4）。
-**2026-09-22 打开 `autostart` + 配好 prestart 之后复跑：42 条里 40 PASS / 2 SKIP / 0 FAIL**。
-少的那一条是 `MCP 现场连接离线服务器 yueshen rag` —— yueshen 现在开机就在 online 池里，探针不必
-再替它现场连（正是这轮要的效果），`MCP 工具清单 server_id=4` 那条仍在。同一次复跑里
-`MCP 预启动工具注销后清单回到空` **红了第一次**：它假设探针登记前清单是空的，而 overlay 那份配置让
-实例一开机就带着 `(4, query_yueshen)`，探针登记的却是 id=6 上的另一个工具。判据已改成「回到登记前
-那一份」（`MCP 预启动工具注销后清单回到登记前`）—— 配置是配置、残留是残留，而注册/注销共用一次
-**整表回写**，误删会顺着 bind-mount 写进宿主那份 JSON 等着被提交，所以这条等式要比「我那条没了」更严。
-
-一个一直咬人的坑：v4.8.1 这份源码里 `utils/api_embedding_service.py`、
-`gui/flask_server.py`、`fay_booter.py`、`utils/config_util.py`、`main.py`（还带 BOM）都是
-**CRLF** 行尾，补丁必须在字节层对得上 —— GNU patch 2.8 没有 `--strip-trailing-cr`，
-`-l/--ignore-whitespace` 也不认 CR，用 LF 上下文生成的补丁一份都贴不上去（旧基线上那 5 份
-就是这么作废的）。补丁生成器因此必须按 **bytes** 捕获 `diff` 的输出，`text=True` 会走
-universal newlines 把 `\r` 吞掉，生成出的补丁再也贴不回 CRLF 仓库。
-另外 `max_tokens` 在这条链路上是有害的：qwen3.5 带思考段，实测 `max_tokens=16`
-时 68.8s 后 `content` 仍是空（直连 ollama 也一样，`eval_count=8` 全花在 reasoning）。
-
-
-## 依赖层为什么不能直接用 fay/requirements.txt
-
-镜像里的依赖清单是 `overlay/fay/requirements-docker.txt`（约 1.1GB 镜像），
-按启动链模块级 import 收窄，其中五处是**必须显式处理**的版本冲突：
-
-| 处理 | 原因 |
-|---|---|
-| 不装 `langchain` 伞包，只装 `langchain-core` + `langchain-openai` | 伞包会把 langgraph 解析到最新，而 `langgraph>=1.2.11` 依赖 `langgraph-sdk>=0.4.2`，后者才要求 `websockets>=14` —— 与上游 `websockets~=10.4` 冲突（`core/wsa_server.py:7` 用 `websockets.legacy`，`core/socket_bridge_service.py:44` 是两参数 handler） |
-| ~~`langgraph>=1.2,<1.2.11` + `langgraph-sdk<0.4`~~（**2026-09-21 起不装**） | 旧基线（`45b44e9` 那份导入）里 `llm/nlp_cognitive_stream.py:2556` 有一道 fork 自己加的门禁：不装 langgraph 就把 `tool_registry` 清空、日志 "workflow tools are disabled and the app will use direct LLM mode"，MCP 工具整条路是死的 —— 当时确实按上面那两行钉版本装上了（实测 `langgraph 1.2.2 + sdk 0.3.15`，`websockets` 保持 10.4）。换成 `chuan918/Fay` 之后全仓只剩 `requirements.txt:28` 那一行提到 langgraph、没有任何 `.py` import 它（`_LANGGRAPH_AVAILABLE` 也 grep 不到），门禁随旧代码一起没了，所以共用的一份清单里不再装 | 
-| 钉 `uvicorn<0.35` | `mcp` 带进来的 uvicorn 0.53 在 `protocols/websockets/auto.py` 直接 import `websockets.server.ServerProtocol`（10.4 没有），MCP SSE 8765 起不来；0.34.3 实测正常 |
-| 钉 `mcp>=1.2,<2`（两个 Fay 都钉，实测解析 1.30.0） | 上游 `requirements.txt:31` 是裸 `mcp`，如今解析到 2.2.0，而 2.x 把 `mcp.server.Server` 换成了高层 `MCPServer`，低层那套 `@server.list_tools()` / `@server.call_tool()` 注册装饰器没有了。两个仓库各有 6 个文件按 1.x 低层 API 写：`faymcp/mcp_server.py:26` + `mcp_servers/{logseq,schedule_manager,window_capture,yueshen_rag}/server.py` + `test/mcp_stdio_example.py`，2.x 下全是 `AttributeError: 'Server' object has no attribute 'list_tools'`。最后一台是 `faymcp/data/mcp_servers.json` 里 `autostart: true` 的「tools」，于是每次开机都白记一条「tools 连接失败」。钉回 1.x 后开机 `tools 已连接`、`/api/mcp/servers/1/tools` 出 5 个工具、`ping` 真回 `pong`。另一条佐证：这台机器开发者自己的 `fay/.venv` 装的就是 `mcp-1.6.0.dist-info` |
-| 补 `aliyun-python-sdk-core` | `main.py:86` 无条件 `from asr import ali_nls` → `asr/ali_nls.py:9` 需要 `aliyunsdkcore`，即使完全不用阿里云 ASR |
-
-不装 torch / sentence-transformers / chromadb / opencv / PyQt5 / pygame：
-它们在文字问答启动链上都不出现，装了镜像要涨数 GB。
-（chromadb 后来确有去处，但不是这份镜像 —— 见 `images/yueshen_rag.Dockerfile` 与
-下面「yueshen 知识库」那节，理由是它会把 `uvicorn[standard]` 的上界冲开。）
-
-构建上下文本身也要收窄（根目录 `.dockerignore`），但**排除必须按"到底哪一部分大"来切，
-不能整目录一刀切**：`fay/test/` 289MB 里 289MB 全是 `ovr_lipsync`（一个 Meta 的
-UE 唇形插件源码），那几个 `.py` 加起来才 300KB —— 而其中 `test/mcp_stdio_example.py`
-正是 `faymcp/data/mcp_servers.json` 里 `autostart: true` 那台 stdio 示例服务器要跑的
-文件。整个目录排掉，等于每次开机少一个 MCP 服务器 + 白记一条失败日志（这条排查了
-两轮才定位到，因为报错在容器里长得像"上游代码的问题"）。
-而且 `.dockerignore` 的语义是**目录一旦排除，就没法再按文件放回来**（`!fay/test/x.py`
-不生效），所以只能写成 `fay/test/ovr_lipsync` 这种精确路径。
+`yueshen-rag` 的嵌入模型（`YUESHEN_EMBED_MODEL`）**故意指向上表那一个 `qwen3-embedding:0.6b`**，
+不是第二个嵌入器：这台机器一次只装得下一个 ollama 模型，多一个型号就多一次换入换出。
+一组键同时喂 Fay 的仿生记忆（`FAY_EMBEDDING_*`）与知识库检索，就是为了两边的向量不可能
+出自不同的模型或端点 —— 分叉的症状是「检索永远命中不到刚灌进去的内容」，且不报错。
 
 ## 不改上游代码的三种手段
 
@@ -713,7 +499,7 @@ volumes:
 换行（Fay 的 `json.dump` 不写，而注册内容必须与摘注册之前那份一致 —— 这一份正是 `./run.sh kbq`
 第 7 条判据回读过的东西，撤掉它等于抹掉判据留下的证据）；`config.json` 里转义噪声与**真状态**
 混在同一份文件（`\uXXXX` 那套与一句"运行期把 `record.enabled` 翻成了 true"看上去都是脏，
-只有后者撤了会改行为）。成因与实测见 run #28 末段那条 2026-09-23 修正。
+只有后者撤了会改行为）。成因与实测见 `AGENTS.md` 里 run #28 那节末段那条 2026-09-23 修正。
 
 必须提供 `system.conf` 的原因：上游从 v4.8.1 起就没提交过 `system.conf`（只留
 `system.conf.bak` 模板），fork 的 `ce900d8` 又把它加进了 `.gitignore`，而上游默认启动流程走的远程配置中心
@@ -751,16 +537,16 @@ RUN for p in /tmp/patches/*.patch; do patch -p1 -d /app --silent < "$p"; done
 | 补丁 | 治什么 |
 |---|---|
 | `patches/service/0001-admin-consultation-events-via-chat-flow.patch` | 上游 `tests/test_admin_ops.py::test_admin_consultation_events` 调 `POST /elder/consultation/classify` 后期望在后台看到留痕，但该端点是**无状态判定**（`app/schemas/consultation.py` 里 `consultation_event_id` 的注释写明"聊天接口中返回"；`log_consultation_event` 只被 `chat_service.py:80` 调用）。补丁把它改走真正产生留痕的聊天链路，语义不变、断言变对 |
-| `patches/service/0002-medication-missed-scan-clock-frozen.patch` | 上游 `tests/test_medication_reminder.py::test_medication_missed_scan` 用 `now - 2h` 造"过去的提醒时刻"，但 `notification_service.slot_local_datetime` 把 `"HH:MM"` 钉到今天、`run_medication_missed_scan` 又跳过相对 `local_now + grace` 仍在未来的时刻 —— 容器本地钟走到 00:00~01:59 时该用例必红（run #25 在 02:0x 撞上）。补丁只在用例里 `monkeypatch` 冻结扫描钟 `_local_now` 到今天 12:00，语义与真实挂钟解耦，`TZ=Asia/Dhaka` 下打完 `1 passed`、原始文件同一 TZ `1 failed`（见「实测通过的链路」的 pytest 段）|
+| `patches/service/0002-medication-missed-scan-clock-frozen.patch` | 上游 `tests/test_medication_reminder.py::test_medication_missed_scan` 用 `now - 2h` 造"过去的提醒时刻"，但 `notification_service.slot_local_datetime` 把 `"HH:MM"` 钉到今天、`run_medication_missed_scan` 又跳过相对 `local_now + grace` 仍在未来的时刻 —— 容器本地钟走到 00:00~01:59 时该用例必红（run #25 在 02:0x 撞上）。补丁只在用例里 `monkeypatch` 冻结扫描钟 `_local_now` 到今天 12:00，语义与真实挂钟解耦，`TZ=Asia/Dhaka` 下打完 `1 passed`、原始文件同一 TZ `1 failed`（打法与"不用等午夜"的复现验证见 `AGENTS.md`「只在午夜红的上游用例」）|
 | `patches/fay/0001-llm-timeouts-env-configurable.patch` | `llm/execution_manager.py` 里写死的 LLM 请求超时/重试开成环境变量，默认值与上游一致（不设变量 = 原行为）。超时链那一节的前提就是这条 |
 | `patches/fay/0002-embedding-timeouts-env-configurable-CRLF-source.patch` | 同一件事的 embedding 半边（上游把 LLM 与 embedding 拆在不同文件，所以是两份补丁）：`api_embedding_service.py` 写死 60s + 2 次重试，本机显存不够时一发 embedding 就超 60s，三轮重试能把问答预算整个吃光。开成 `EMBEDDING_TIMEOUT` / `EMBEDDING_MAX_RETRIES`。源文件是 **CRLF**，补丁必须按字节生成 |
 | `patches/fay/0003-stream-reply-idle-timeout-env-configurable-CRLF-source.patch` | `gui/flask_server.py` 里 `_STREAM_READ_IDLE_TIMEOUT = 180` 开成 `STREAM_REPLY_IDLE_TIMEOUT`，让它能排到 LLM 超时之后（否则「模型正在慢慢想」被判成「Fay 卡住」，`/v1/chat/completions` 返回空 content）。同样是 CRLF 源 |
 | `patches/fay/0004-remote-audio-listener-thread-race-CRLF-source.patch` | `fay_booter.py` 的远程音频监听线程：`__init__` 先 `thread.start()` 后赋 `deviceConnector`，而 `run()` 第一句就读它。`xszyou/Fay@74b49ae` 把 `except: pass`（1 秒后重试、能自愈）改成「记日志 + `__running=False`」，这个竞态于是变成「监听线程一上线就退」+「关掉刚 accept 的 socket」，客户端表现为 connect 之后立刻 ConnectionReset。补丁把赋值挪到 start 之前，见「远程音频输入」一节 |
-| `patches/fay/0005-graceful-stop-no-longer-reports-as-crash-CRLF-source.patch` | `docker stop` 一个健康的 Fay 容器会拿到 **exit=1** —— 一次正常的停止被记成崩溃，`restart: on-failure` 下还会把该停的实例重新拉起。`stopAll()` 串行 join 吃光 5 秒清理预算后走 `os._exit(1)`，改成 `os._exit(0)`。见「优雅停止」一节 |
+| `patches/fay/0005-graceful-stop-no-longer-reports-as-crash-CRLF-source.patch` | `docker stop` 一个健康的 Fay 容器会拿到 **exit=1** —— 一次正常的停止被记成崩溃，`restart: on-failure` 下还会把该停的实例重新拉起。`stopAll()` 串行 join 吃光 5 秒清理预算后走 `os._exit(1)`，改成 `os._exit(0)`。见 `AGENTS.md`「优雅停止」一节 |
 | `patches/fay/0006-model-engine-env-overridable-CRLF-source.patch` | `utils/config_util.py` 读完配置后允许 `FAY_GPT_MODEL_ENGINE` / `FAY_BIG_MODEL_ENGINE` 覆盖模型名，给 `fay-lite` 留一条换轻模型的路（不必为它单独写一份只读 system.conf）。不设变量时与上游一字不差 |
 | `patches/fay/0007-fay-url-env-overridable-CRLF-source.patch` | 同一份 `config_util.py` 里把 `fay_url` 开成 `FAY_URL`。它是 Fay 回给数字人的那段音频的 URL 前缀：system.conf 钉死 `http://127.0.0.1:5000` 时，跑在**另一台机器**上的 UE 会按这个地址去取自己的 `127.0.0.1`，永远取不到 wav；而上游那段"为空则自动探测本机 IP"在容器里探到的是容器地址，同样不对。见「跨机流量」|
 | `patches/fay/0008-stream-end-sentinel-CRLF-source.patch` | 给每轮回答在 `T_Msg.content` 末尾落一个 `<dh-end>` 结束哨兵。**没有它容器外面就没有可靠的"说完了"信号**：`_<isend>` 标记在 `core/stream_manager.py:332-335` 进 Interact 之前就被 replace 掉了、`content_db.add_content` 也不存标记，而单模型模式下工具循环是同步跑的，`/api/execution-status` 全程 idle。于是 adapter 只能靠静默判定收尾 —— 两阶段协议的占位句写完之后正好静默 3~30s（工具在执行），2 秒阈值必然在那里截断，用户拿到的是"占位句 + 半句"。哨兵恒写，认不认由 adapter 侧决定（见 `adapter/server.py` 的 `END_SENTINEL`）|
-| `patches/fay/0009-llm-endpoint-env-overridable-CRLF-source.patch` | 把 LLM 与 embedding 的**端点和密钥**（`FAY_GPT_BASE_URL` / `FAY_GPT_API_KEY` / `FAY_BIG_MODEL_BASE_URL` / `FAY_BIG_MODEL_API_KEY` / `FAY_EMBEDDING_*`）开成环境变量，补上 0006 只开了模型名的那半边。理由不是"方便"而是**归属**：`overlay/fay/system.conf` 被 git 跟踪，只能留"在这台机器上跑得起来"的示例值，而"小模型跑本机 ollama 还是跑远端那台带得动 26B 的机器"是按机器变的事 —— 写进它就是把它钉进历史。embedding 那三条单独开、不蹭 LLM 那组，是因为上游在 `embedding_base_url` 留空时**直接复用 `gpt_base_url`**：换掉 LLM 的那一刻嵌入请求也跟着搬走，而新机未必装了这个嵌入模型；写进库的坐标与查询用的坐标一分叉，症状就是"检索永远命中不到刚灌进去的内容"，且不报错 |
+| `patches/fay/0009-llm-endpoint-env-overridable-CRLF-source.patch` | 把 LLM 与 embedding 的**端点和密钥**（`FAY_GPT_BASE_URL` / `FAY_GPT_API_KEY` / `FAY_BIG_MODEL_BASE_URL` / `FAY_BIG_MODEL_API_KEY` / `FAY_EMBEDDING_*`）开成环境变量，补上 0006 只开了模型名的那半边。理由不是"方便"而是**归属**：`overlay/fay/system.conf` 被 git 跟踪，只能留"在这台机器上跑得起来"的示例值，而"对话模型由哪个服务回答（宿主 ollama，还是另一台/另一个端口上带得动 26B 的推理服务）"是按机器变的事 —— 写进它就是把它钉进历史。embedding 那三条单独开、不蹭 LLM 那组，是因为上游在 `embedding_base_url` 留空时**直接复用 `gpt_base_url`**：换掉 LLM 的那一刻嵌入请求也跟着搬走，而新机未必装了这个嵌入模型；写进库的坐标与查询用的坐标一分叉，症状就是"检索永远命中不到刚灌进去的内容"，且不报错 |
 | `patches/yueshen_rag/0001-sse-transport-env-switch.patch` | 上游 `mcp_servers/yueshen_rag/server.py` 只有 stdio transport，容器里没人在 stdin 那头写、Fay 永远连不上。加一条 `YUESHEN_TRANSPORT=sse` 分支（裸 ASGI `(scope,receive,send)` 可调用对象，形状照已被容器验过的 `fay/faymcp/mcp_server.py:538`），让 Fay 用 `mcp_servers.json` 的 ip 直连 `http://<容器名>:8766/sse`；默认仍 stdio，不设变量行为一字不变（见「yueshen 知识库」一节）|
 | `patches/yueshen_rag/0002-embedding-timeout-env.patch` | 上游把 embedding 请求超时写死 30s（`_call_api timeout=30`）。本机显存只够一个模型，ollama 换入嵌入模型实测 72.9s，30s 撞上的表现是 `requests.ReadTimeout` 被 `upsert_chunks` 的 except 吞掉、静默跳过该 chunk，ingest 返回 `success:true / inserted:0`。开成 `YUESHEN_EMBED_TIMEOUT`，默认仍 30 |
 
@@ -776,7 +562,7 @@ RUN for p in /tmp/patches/*.patch; do patch -p1 -d /app --silent < "$p"; done
 `compose images` 拿 `REPOSITORY:TAG`，ID 交给 `docker image inspect` 按 tag 读（**不能**用
 `compose images -q`：那张表第一列是 CONTAINER，旧容器还在跑时它报的是容器用的镜像，
 run #29 因此把一次真实的 ID 变更印成「没变」）。overlay 那半边只点名 requirements 而不是
-整个目录，理由见 run #30 那节：`system.conf`/`config.json`/`mcp_servers.json` 是运行期挂载、
+整个目录，理由见 `AGENTS.md` 里 run #30 那节：`system.conf`/`config.json`/`mcp_servers.json` 是运行期挂载、
 Fay 自己会回写，算进输入等于每轮必空转重建一次。
 这道闸量的到底是 mtime，而 mtime 会骗人：只改 `images/service.Dockerfile` 的注释也会触发
 重建，可 BuildKit 全量命中缓存、镜像 ID 一字不差，内容其实什么都没变（本机 2026-09-19
@@ -885,11 +671,12 @@ fay/.git/config
 我们不改它们的项目，所以这份超时是**如实记录的既定事实**，不是调参能挪动的。
 `run.sh test` 的 `frontend-probe` 用 `--timeout 600` 从容器里打那一问（run #31 实测
 86.5s），量的就是「这条链在浏览器之外能不能通」，不与那 30s 混为一谈。
-但**那 600s 是拿不到的**：探针的请求先进外壳，外壳在 90s 就替它做了决定。run #32 里
-这一条两次撞在同一处（`90.4s` / `90.3s`，msg 都是 `后端 POST /chat/sessions/N/messages 不可达：timed out`），
-所以 86.5s 那次是擦着上限过的，不是"浏览器之外还有一大段余量"—— 外壳这 90s 才是真正的墙。
+但**那 600s 是拿不到的**：探针的请求先进外壳，外壳在 90s 就替它做了决定 —— 所以 86.5s
+那次是擦着上限过的，不是"浏览器之外还有一大段余量"，**外壳这 90s 才是真正的墙**。
+run #32 里这一条就是两次撞死在这 90s 上（重跑仍红，属于结构不是排队），数字在
+`AGENTS.md`「run #32」那节。
 
-**2026-09-22 换上远端那台 26B 之后（`FAY_GPT_BASE_URL` / `FAY_BIG_MODEL_BASE_URL` 走 `.env`，
+**2026-09-22 换上栈外那台 26B 之后（`FAY_GPT_BASE_URL` / `FAY_BIG_MODEL_BASE_URL` 走 `.env`，
 `overlay/fay/system.conf` 仍是本机 ollama 的示例值），这面墙从"必然撞"变回"偶尔撞"**：H5
 `http://192.168.x.x:5173/`（本机 LAN IP）连发的实测是 **5.6s / 9.4s / 17.8s / 18.2s** 各拿到一段干净正文
 （`我来帮你查一下，稍等…`、`<prestart>`、`<think>…共 0 步…</think>` 都不再出现在回包里，
@@ -897,7 +684,9 @@ fay/.git/config
 家庭自测 135/85），**另有一轮 90.1s 撞在外壳那 90s 上**。也就是说：9b 时代"答得比 30s 慢"是
 结构问题，26B 时代它退化成了尾部延迟问题 —— 同一面墙，撞不撞看这一问运气，所以那 90s 仍然不该
 被当成"够用的预算"。
-之所以要放到 500/520：这台机器的显存被别人占着（见上一节），9b 只有 6% 权重进显存时
+之所以要放到 500/520：这组预算定在对话还压在宿主 ollama 的时候（端点搬到栈外那台 26B
+之后它成了余量而不是必需，但没回头砍 —— 见 `AGENTS.md`「AI 端点的落点」）：那台机器的显存
+被别人占着（见上一节），9b 只有 6% 权重进显存时
 一句话要 172~301s，500s 是"够等到但不至于挂死"的位置。显存充裕时同一句话是
 **冷启动 39~40s、暖态 4.8s、长回复 18s**，所以这套预算在好机器上只是等得早停而已。
 上游失败时 adapter 回 502，让后端的 `ok=False` 分支正常置位
@@ -905,7 +694,7 @@ fay/.git/config
 
 ### adapter 自己的契约测试：`probes/adapter_test.py`
 
-前面所有判据都要经过真实的 Fay + ollama，也就是说它们**同时**在量"代码对不对"和
+前面所有判据都要经过真实的 Fay + 栈外那个对话端点，也就是说它们**同时**在量"代码对不对"和
 "这台机器忙不忙"。adapter 是本层自己写的第一份代码（第二份是 `frontend/carecho_web.py`，
 见后面「CareEcho H5 前端」一节），它自己的正确性不该被显存抖动掩盖，
 所以给它一组不打 LLM 的测试：容器里起一个假 Fay（同 `/api/send` + `/api/get-msg`
@@ -949,55 +738,26 @@ text 之后 18s 才到的 audio 帧必须收到 · **把窗口退回旧的 6s �
 后才到，收工判定不能被那帧空的骗到**（`IsFirst=1, IsEnd=1` 而 `Value=''` 是
 `fay_core.py:2946` 那个 `is_end` 守卫正常产出的结束标记，一个字都没播）。
 
-第六条就是 run #10 那次误报的形状：当时服务端一关连接，`check_ws` 走
-`except Exception` 把整段会话的帧全丢了，看起来像"一帧都没收到"。
-
-第七条是 run #20 的那次红：`answered` 原先用 `'"text"' in json.dumps(frame)` 判断
-"回答开始了没有"，而 `"text"` 这个串在帧里的 `Data.Key` 上恒真 —— 于是那帧空终止标记
-一到位就把 6 秒静默窗口武装起来，会话在 21:27:44 收工，同一发回答的句子 21:28:25 才落地。
-现在改看 `_has_substance()`（`panelReply` 非空，或 `Key=text` 的 `Value` 非空）。
-这条判据自己也验过反证：把 `_has_substance` 换回旧规则再跑，7 条里就是这第 7 条红
-（`6/7`，详情 `7.0s text帧=['']`），形状与 run #20 那次完全一致。
-
-第八到第十条量的不是时机，是**收尾那行的口径**。旧版不管几条 SKIP 都印成
-「N 项因本机 LLM 证据降级为 SKIP」，可 run #21 那三条一条都不是降级来的（两条无头
-白名单、一条本机没起的 FunASR）—— 这一句话替环境揽下了没发生过的嫌疑，读日志的人会
-以为这台机器还有显存问题。现在 `skip_tail()` 按详情里的 `ENV_SKIP_MARK` 把 SKIP 分成
-「LLM 证据降级」和「其余，成因逐条列在下面」两类分别计数；其中一条自测不手写记录，
-而是调 `latency_verdict()` 现造一条 —— 它测的是「谁负责写上这个标记」，以后改降级
-文案时漏掉标记，收尾会立刻少算并红在那条自测上，而不是悄悄把一条降级算成边界。
+第六条与第七条各钉的是一次历史上的真实误报（run #10 丢帧、run #20 被空终止帧骗早收工），
+第八到第十条量的是收尾那行 SKIP 文案的统计口径（run #21 的三条一条都不是降级来的）——
+那三次的排查过程在 `AGENTS.md`「探针的收工时机与收尾文案」。
 
 ### 测试库必须是空的：`tools/reset_test_db.py`
 
-run #14（2026-09-20 18:55）第一次抓到 `backend-test` 红：**38 passed / 1 failed**，
-红的是上游自己的 `tests/test_human_queue.py::test_human_queue_flow`（`assert False`，
-断的是"我刚排的那条队，志愿者在待接单列表里能看见"）。根因不在容器集成，也不在这条
-业务逻辑 —— 在**测试库跨轮存活**：
-
-  * `service/tests/conftest.py` 全文 81 行，**一句清表都没有**（没有 `DELETE`、没有
-    `TRUNCATE`、没有 `drop_all`），而每个 fixture 都用随机 openid 走 dev-login 新建用户
-    （`openid = f"pytest_{uuid4().hex[:12]}"`）。也就是说这套用例隐含假设"库是新建的"，
-    上游 CI 每次都是空库跑，所以它那边不会红。
-  * 本栈的 MySQL 数据在 `mysql-data` 卷上，测试库 `care_echo_rehab_test` 跟着一起跨轮存活。
-    攒到第 14 轮：631 个用户、50 多条 `pending` 排队行。
-  * 于是 `GET /volunteer/human-queue/pending` 露馅了：应用层是
-    `list_pending_queues(... limit=50)` + `ORDER BY priority DESC, enqueued_at ASC`，
-    本轮这条是 `medium`（priority 低）又最新，被历轮遗留的 pending 行挤到 50 名之外，
-    断言读不到自己刚写的 `id`。
-
-这是"跑一次绿"和"每轮都绿"的区别，也正是持久卷带来的新型假红。修在 containerd 侧，
-不碰上游一行测试代码：`backend-test` 的 command 现在是
+`backend-test` 的 command 是
 `reset_test_db.py && alembic upgrade head && import_reference_json && { seed_crisis_hotlines; pytest; }`
-—— 重置 → 迁移 → 灌参考语料这三步任一失败就**不跑 pytest**（跑在状态未知的库上，绿了也没
-意义），只有幂等的 `seed_crisis_hotlines` 允许失败后继续，整组退出码仍由 pytest 决定。
-脚本本身只干 `DROP DATABASE` + `CREATE DATABASE`（utf8mb4/`unicode_ci`，与 `sql/init` 一致），
-库名不能走 SQL 参数占位符，所以用了严格白名单 `^[a-z0-9_]{1,32}_test$`：业务库
-`care_echo_rehab` 不满足这个形状，脚本见到就退出 2 并说明原因（拿 `MYSQL_DB=care_echo_rehab`
-试过，确实拒了）。实测一次重置报 `丢掉 38 张表 / 约 2890 行残留`（`information_schema.table_rows`
-对 InnoDB 是估算值，这里只当量级看）。
+—— 每轮 pytest 前把 `care_echo_rehab_test` 重建一遍。重置 → 迁移 → 灌参考语料这三步任一
+失败就**不跑 pytest**（跑在状态未知的库上，绿了也没意义），只有幂等的
+`seed_crisis_hotlines` 允许失败后继续，整组退出码仍由 pytest 决定。脚本本身只干
+`DROP DATABASE` + `CREATE DATABASE`（utf8mb4/`unicode_ci`，与 `sql/init` 一致），库名不能走
+SQL 参数占位符，所以用了严格白名单 `^[a-z0-9_]{1,32}_test$`：业务库 `care_echo_rehab`
+不满足这个形状，脚本见到就退出 2 并说明原因。
 
-顺带把 `sql/init/01-create-test-database.sql` 的注释改了 —— 它原来写着"pytest 里的 fixture
-会建表/清表"，那句话不成立，留着就是下一个人踩同一个坑的理由。
+为什么要每轮重建：上游 conftest 不清表，那套用例隐含假设"库是新建的"，而本栈的测试库跟着
+数据卷跨轮存活 —— run #14 攒到第 14 轮时 `test_human_queue_flow` 就红了（631 个用户、50 多条
+遗留 `pending` 行把本轮那条挤出 `limit=50`）。完整复盘在
+`AGENTS.md`「测试库跨轮存活」。它不进镜像、每次跑完库都是新的，所以这 39 个用例从此与
+"这台机器上第几轮"无关。
 
 ### 后端活体探针：`probes/backend_probe.py`
 
@@ -1032,10 +792,8 @@ token 的实测形状**不是**全 401：`/health` 那 3 条公开路由照样 2
 INSERT、视图的 `LEFT JOIN elder_profile` 和视图自己的 `WHERE status='pending'` +
 `TIMESTAMPDIFF(MINUTE, enqueued_at, NOW())`；最后取消，并断言它**从视图里消失** —— 取消不是
 顺手清理，它是这条判据能红的第二个地方：视图要是把已取消的单也算成待接单，"读得回来"那一步
-照样 PASS。上游 `tests/test_human_queue.py::test_human_queue_flow` 断的差不多是同一条链，所以
-这条新增的不是功能覆盖，而是"同一条链换到真进程 + 业务库上再走一遍"：pytest 那侧跑在
-TestClient + 测试库，run #14 已经证明它会受测试库累积影响。写这条用的 openid 是固定的、
-写完必取消，业务库里不会一次比一次多攒出悬空 pending 行）·
+照样 PASS。它与上游 `test_human_queue_flow` 断的差不多是同一条链，新增的是"换到真进程 +
+业务库上再走一遍"，为什么这算两件事见 `AGENTS.md`「后端活体探针的七次变异验证」）·
 **定时任务调度器起得来**（在探针进程里真的 `start_scheduler()` 一遍再 shutdown：查的是
 镜像装没装 apscheduler、`reminder_timezone=Asia/Shanghai` 在这个镜像里解不解得开 ——
 没有 tzdata 时 `ZoneInfo` 直接抛，而这条链路只有容器化才可能弄坏；实测 4 个作业
@@ -1043,628 +801,59 @@ TestClient + 测试库，run #14 已经证明它会受测试库累积影响。�
 （`POST /dev/run-reminder-scan?scan_type=all`，吃药/漏服/随访/训练四个定时任务的本体，
 平时只在 cron 里跑，容器里从没被执行过也没人知道）· 排队超时扫描同理。
 
-实测 **11 PASS / 0 SKIP / 0 FAIL**，几秒钟，不碰 ollama（run #13 那组跑的是加调度器与
-鉴权判据之前的八条版本，十条版在 18:40 单独复跑确认，写路径这条是 19:10 加的，
-实测 `elder 写入 queue_id=4（priority=10）→ 志愿者从视图读回它，wait_minutes=0 由
-TIMESTAMPDIFF 现算 → 取消后视图里剩 1 条、不含它`）。它也会红 —— 七次变异验证：
-往 `/tmp/appcopy` 那份 `chat.py` 里加一条活服务没有的路由 → `FAIL 路由挂载完整性
-80/81 命中，缺 ['chat:/chat/probe-mutation-only']`；把 `BACKEND_URL` 指到没人监听的
-9999 → 第一条 FAIL、其余各自 SKIP（不是被短路成"没跑"）、退出码 1；
-把探针发出的 `Authorization` 换成垃圾 token → `FAIL 带鉴权重跑 GET 扫描 —— token 都签出来
-了却一条都没多走到 2xx（匿名 3 → elder 3，volunteer 3，admin 3）`；
-`REMINDER_TIMEZONE=Asia/NotAZone` → `FAIL 定时任务调度器起得来 —— ZoneInfoNotFoundError`，
-说明这条判据真的在解析镜像里的 tzdata，不是"调用没抛异常就算过"；`REMINDER_SCHEDULER_ENABLED=false` →
-那条判据 SKIP 并写明"这台没开调度器"，不假绿；把探针看到的 `GET /volunteer/home-summary`
-换成一个空列表（只骗读、不骗写）→ `FAIL 活体写路径 —— queue_id=5 写成功了，视图
-v_volunteer_queue_pending 里却没有它（读到 0 条：[]）`；把第一次 `cancel` 改成 500 →
-`FAIL 活体写路径 —— 读回没问题，但 POST /elder/human-queue/6/cancel → 500`，这两次变异
-之后再去读真视图，`pending_count` 都回到变异前的样子，说明 `finally` 里那次兜底取消真的
-跑了（悬在 pending 的行会让下一轮的 join 直接复用旧行，判据就从"我写的这条"变成"上轮遗留的
-那条"，红绿都不再可信）。
-`app/api/router.py` 里的 `dev` 路由是 `DEBUG` 才挂的，所以 DEBUG 关掉时最后两条按
-SKIP 记，理由写"dev 路由没挂载"，不去猜。
+实测 **11 PASS / 0 SKIP / 0 FAIL**，几秒钟，不碰任何模型端点。写路径那条的实测形状：
+`elder 写入 queue_id=4（priority=10）→ 志愿者从视图读回它，wait_minutes=0 由 TIMESTAMPDIFF
+现算 → 取消后视图里剩 1 条、不含它`。`app/api/router.py` 里的 `dev` 路由是 `DEBUG` 才挂的，
+所以 DEBUG 关掉时最后两条按 SKIP 记，理由写"dev 路由没挂载"，不去猜。
+十一条里有七条各自做过"故意改坏必须变红"的变异验证，逐条记录在
+`AGENTS.md`「后端活体探针的七次变异验证」。
 
 ## 实测通过的链路
 
-`./run.sh test` **现在十四组**（run #12 时是七组，`backend-probe` 在那之后加的，它自己的
-数字见下表与「后端活体探针」一节；`probe-yueshen` 是那一轮新加的第九组，见
-「yueshen 知识库」一节；`probe-origin-fay` 随参照实例一起撤了；run #31 加 `frontend-test`
-与 `frontend-probe` 两组、run #32 加 `ws-relay-test` / `asr-test` / `asr-probe` 三组，
-见「CareEcho H5 前端」与「FunASR：麦克风这条链」两节；2026-09-22 加 `kb-ingest` 第十四组 ——
-知识库那 12 问从「一次性脚本」升成计分判据，见「yueshen 知识库」一节的 recall@k 表）。下面 run #27 / #28
-两张表记的都是**当时九组**的数字。旧基线上最近一次完整运行是 **run #27**（2026-09-21 02:13 起，
-`[test] 全部通过`）。它是第一次把 `probe-yueshen` 组、以及 0002 补丁（服药漏扫时钟冻结）
-和探针的 120s 排空重问一起放进完整一轮 —— 前两件各治一个 run #25 暴露的红，这一轮两者
-都没再红，重试分支本轮也没触发（`重问` 全轮 0 次，见问答表下面那段）。
-与 #21/#23 一样，这一轮环境也不给退路：
-两个 9b 实例的权重都是 100% 驻留显存（`qwen3.5:9b 5490/5490MB`，直连 fay 侧 6.3s /
-origin 侧 9.4s），lite 侧 `qwen2.5:1.5b 1166/1166MB`、直连 1.1s，于是 `check_llm_host()`
-没有置 `DEGRADED_LLM_HOST` —— 所有耗时类判据这次都是**硬判**：过就是真过，不过就记红。
-下面这一整段连同它的表，都是**换基线之前**那一版 `dh-fay` 的数字（见「2026-09-21 基线变更」）；
-新基线上的第一轮完整九组是 **run #28**，撤掉参照实例之后的第一轮八组是 **run #29**，
-外部语料进库之后的第一轮是 **run #30**，接上 CareEcho H5 之后（十组）是 **run #31**，
-补上麦克风这条链之后（十三组）是 **run #32**（当前最新的一次完整运行，但它**不是全绿**：
-两条红 + 一处按环境收工，成因写在那一节里），几节都在本节末。
+`./run.sh test` 默认跑**十四组**（`kb-fay` 是第十五组，能点名但不在常态清单，理由见
+「业务侧」那节；逐组排在哪个位置的原因写在 `run.sh` 里 `ALL_GROUPS` 那段注释）。
+退出码只数 FAIL：**SKIP 不是被糊过去**，它是"这台机器这一条判不了"+ 印在详情里的原因。
+下表只说每组量什么、判据几条、以及全绿的时候是什么形状 —— 判据逐条的含义在对应小节里。
 
-| 组 | run #27 实测 |
-|---|---|
-| `backend-test` | **39 passed（2.76s）**（service 自带 pytest，跑在每轮重建的空测试库里，见「测试库必须是空的」） |
-| `backend-probe` | **11 PASS / 0 SKIP / 0 FAIL**（十一条，见上一节） |
-| `adapter-test` | **11/11**（本目录自己写的 adapter，全程假 Fay，不碰显存） |
-| `probe-selftest` | **[ws-timing] 10/10**（探针自己的收工时机自测，假 Fay WS 服务端，不碰显存也不出网）。第八到第十条是 run #21 之后补的收尾口径判据 |
-| `probe-fay-lite` | **41/43 通过 · 2 SKIP** —— 问答、MCP（含 yueshen rag 3 工具）、prestart、TTS、音频、决策面谈全部正面通过 |
-| `ue-audit` | **2 PASS / 0 SKIP / 0 FAIL**（两条构建完整性判据，见「UE 仓库的容器侧处置」） |
-| `fay-probe` | **41/43 通过 · 2 SKIP**（fork，qwen3.5:9b；本轮与 lite 同底数 43，重试分支没触发） |
-| `probe-origin-fay` | **42/44 通过 · 2 SKIP**（上游那份，同一模型；多的两条见下） |
-| `probe-yueshen` | **6/6**（chromadb 那条链路进容器后的独立一组：嵌入出口、工具清单、入库 `chunks=1 inserted=1`、检索带 MARKER、`stats.vectors == inserted`、配置指本栈容器，见「yueshen 知识库」一节） |
-| 收尾一条 | `[test] fay-lite 优雅停止（SIGTERM）退出码 0：一次正常的 stop 没被记成崩溃`（见「优雅停止」一节） |
-
-退出码只数 FAIL，所以九组都是绿的。三个实例的 SKIP 数相同（43/43/44 条里各 2 条），
-而且**这一轮没有一条是环境降级来的**：剩下的两条 SKIP 是 `window capture`
-（无头容器里连不上的服务器，README「未覆盖能力」记的边界，与显存无关）和
-`远程音频的 ASR 认出了文字`（卡在本机没起的 FunASR，宿主侧 `ws://host.docker.internal:10197`）
-—— 语音输入那条链上能测的两级反而是实打实的 PASS：`:10001` 连得上并注册了用户名，
-`远程 PCM 跨过了服务端的 VAD` 在 12s 内收到 `['聆听中...']`。上一版记的第三条 SKIP
-`yueshen rag` 这一轮已经变成两条正面 PASS（`MCP 现场连接离线服务器 yueshen rag` 连上取到
-3 个工具、`MCP 工具清单 server_id=4 yueshen rag`），所以每实例的 SKIP 从 3 降到 2、
-lite/fork 底数从 42 升到 43。这六条 SKIP 的收尾文案这次也是被量过的：三组印的都是
-「**其余 2 项 SKIP（成因逐条列在下面，与本轮 LLM 证据无关）**」，没有再替环境揽下
-「因本机 LLM 证据降级」这个没发生过的嫌疑。
-
-问答那一档每格都是当轮实测的字数，不是兜底语：
-
-| 实例 | 单次问答预算 | `/api/send → /api/get-msg` | :10002 `Output=false` | :10002 `Output=true` |
-|---|---|---|---|---|
-| `fay-lite` | 45s | 3.3s / 1 字 | 44 字 | 17 字，audio 帧 HTTP 取回 328146 字节 |
-| `fay`（fork） | 90s（LLM 基线 18.0s） | 20.9s / 1 字 | 43 字 | 52 字，audio 326028 字节 |
-| `origin-fay` | 90s（LLM 基线 2.5s，直连 9.4s 是换入成本） | 27.4s / 1 字 | 68 字 | 56 字，audio 266758 字节 |
-
-三格 `Output=true` 都是第一发命中 —— run #27 的重试分支没有触发（全轮 `重问` 0 次），
-所以 lite 与 fork 这轮底数同为 43。
-
-**run #24 是重试分支第一次在真实一轮里被触发**，而且触发的正是已知会偶发吐空的那一格
-（fork 的 `:10002 Output=true`）。原文照抄：
-
-```
-PASS  WS :10002 收到文字播报 (Data.Key=text)  —— 56 字: 我是您的智能助手，熟悉 Fay 大小模型协同、
-      OfficeEcho 功能介绍等知｜第 1 发正文为空 [3 帧、Keys=['log', 'question', 'text']、
-      text 帧 (IsFirst,IsEnd)=[(1, 1)]]，第 2 发（换用户名重问）拿到 56 字，判据按第 2 发计
-```
-
-这一发钉住了空正文的形状：**3 帧、`Keys` 里没有 `audio`、text 帧 `(IsFirst,IsEnd)=(1,1)`**
-—— 服务端把这条回复当成"已经说完且说完了空话"结的尾，不是探针提前收工；探针能看到 `IsEnd=1`
-却拿不到正文，正是它必须重发而不能傻等的理由。但 #24 是**换了用户名立刻重问**就撞上了第二发，
-run #25 在同一格里两发都空：容器日志显示上一轮 `:10003` 那次问答被 fork 的大小模型协同判成
-「闲聊判断器 finish 过长(106字)，追加核实」、转给了会独占单条 9b 约 98s 的后台工具链，紧跟着的
-`:10002` 这发正好落在这条链把显存占满的窗口里，两发都空不是巧合而是没给显存留排空时间。
-所以重试改成了**先排空再重问**：`probes/fay_probe.py` 里 `EMPTY_REPLY_DRAIN_SECONDS = 120.0`，
-两发之间 `time.sleep` 掉这 120s 让上一轮遗留的工具链释放显存。run #26 现场印证了它：
-`等 120s 让上一轮遗留的后台工具链释放显存后重问，第 2 发（换用户名）拿到 56 字，判据按第 2 发计`
-→ PASS。run #27 这一格第一发就直接拿到 52 字，重试分支没再触发（全轮 `重问` 0 次），lite 与
-fork 因此底数相同。重试路径触发时会多印一条 `WS :10002 … 注册并收到服务端帧`（第 1、2 发各一条），
-那是它自己的记账，不影响不触发时的底数。之前 README 说"重试分支从未在真实一轮里触发过"，
-判据用的 grep 是 `重试` 而探针措辞其实是 `重问`，`#21`/`#23` 里两词都是 0 次、结论碰巧成立用词不准；
-本轮起按实测改写。
-
-origin 组比 lite/fork 多的那一条判据（44 vs 43）与重试**不是同一回事**：origin 的
-`tools` 服务器 `autostart=false`，开机不在线（这轮它的管理面只报 `在线 [(6, '课程知识库')]`），
-于是「现场连接离线服务器 tools」本身成了一条判据；连上之后 `MCP stdio 示例工具真调用`
-才有东西可调，这次它 PASS。run #10 那轮这条没执行到，
-按 SKIP 记 —— 它在两次运行之间浮动的原因是现场连接的时序，不是容器集成。
-没执行到不等于通过，所以宁可记 SKIP。
-
-**后端自带 pytest 套件：39 passed**。9 个 alembic revision 在干净的 `dh-mysql` 上
-跑到 head，`care_echo_rehab`（业务库）与 `care_echo_rehab_test`（pytest 独立库）
-各 38 个对象（33 张 ORM 表 + `alembic_version` + 4 个视图：
-`v_admin_incident_dashboard` / `v_elder_home_summary` / `v_elder_training_today` /
-`v_volunteer_queue_pending`）。其中 7 个用例原本是红的，
-两类原因：参考语料缺失（6 个，见「三种手段」里的 seed 层）和上游测试自身的
-bug（1 个，见 `containerd/patches/service/`）。跑多之后又冒出第二处上游测试 bug：
-`test_medication_missed_scan`（patch `0002-medication-missed-scan-clock-frozen.patch`）。
-它是**只在午夜附近才红**的时钟相关 bug —— 用例用 `now - 2h` 造一个"过去的提醒时刻"，
-而上游 `notification_service.slot_local_datetime` 把 `"HH:MM"` 钉到**今天**、
-`run_medication_missed_scan` 又跳过相对 `local_now + grace` 仍在未来的时刻，于是当容器
-本地钟走到 00:00~01:59 时，`now - 2h` 落到了昨天、被当成未来时刻全部跳过，`assert 0 >= 1` 必红
-（run #25 就是 02:0x 撞上的）。修法不碰被测代码，只在该用例里 `monkeypatch.setattr` 冻结
-扫描钟 `_local_now` 到今天 12:00，让"过去两小时"这个语义与真实挂钟解耦。验证没有等午夜、也没造假：
-本应用经 `ZoneInfo("Asia/Shanghai")` 取钟而用例的 slot 用容器本地朴素时间，把容器 `TZ` 临时改成
-`Asia/Dhaka`（UTC+6，真实 02:08 时容器钟 00:08）就能在 0.3s 复现——打补丁后 `1 passed`、
-还原原始文件同一 `TZ` 下 `1 failed`。还有一类红是后来才出现的：**跑多了**——
-run #14 上 `test_human_queue_flow` 红了，根因是上游 conftest 不清表而本栈的测试库跨轮存活，
-修法是每轮 pytest 前重建测试库（`containerd/tools/reset_test_db.py`，见「测试库必须是空的」），
-它不进镜像、每次跑完库都是新的，所以这 39 个用例从此与"这台机器上第几轮"无关。
-
-**Fay 契约探针：`fay-lite` 41/43 通过 · 2 SKIP**（run #27 共 43 条；底数从上一版的 42 涨到
-43 是连上的 yueshen 新增了 `MCP 工具清单 server_id=4 yueshen rag` 一条，SKIP 从 3 降到 2 是
-`yueshen rag` 不再是白名单里的离线服务器）。同一份 `probes/fay_probe.py` 分别打三个实例
-（`fay` = fork、`origin-fay` = 上游那份、`fay-lite` = 同镜像换 1.5b —— 前两个实例的那份
-表是撤掉参照实例之前的，现在探针打的是 `fay` 与 `fay-lite`），下表仍是 run #24
-（2026-09-20 23:44）那次 lite 组的逐条实际输出，作为最细颗粒的留档保留（run #27 相对它的
-结构变化只有两处：`yueshen rag` 那行从 SKIP 变两条 PASS、`:10002` 文字播报第一发命中没有触发
-重试；上面「实测通过的链路」那张汇总表才是 run #27 的当轮数字）：
-
-| 检查项 | 实测 |
-|---|---|
-| 就绪 + Web 控制台 | `/api/get-system-status` 通；页面引用的 **22 个 `/static/*` 全 200 且非空** |
-| 直连 LLM（不经 Fay） | 0.0s，`qwen2.5:1.5b` 权重驻留显存 100%（1166/1166MB） |
-| MCP 管理面 `:5010` | 6 台配置，在线 `[(1,'tools'), (6,'课程知识库')]`，2 台 autostart 自连完成（等 2s） |
-| MCP 现场 connect 离线服务器 | `Fay日程管理` 5 个工具、`logseq` 9 个工具，验完 disconnect；`yueshen rag` / `window capture` 在无头白名单内 → SKIP |
-| MCP 工具清单 | `tools` → `['add','echo','now','ping','upper']`；知识库 → **8 个** `kb_*`；日程 5 个；logseq 9 个 |
-| MCP 工具真调用 | `ping` → `text='pong'`；`kb_list_sources` → 4045 字、`count=8`；`get_schedules` → 2 条真实日程 |
-| MCP SSE `:8765/sse` | `event: endpoint` + `session_id=…`（验 `uvicorn<0.35`+`websockets~=10.4` 钉法） |
-| MCP 预启动（prestart）三档 | 注册进 `:5010` 且 runnable 清单看得到 → 一句普通问答后 **`:10003` 的 `panelReply` 里出现 `<prestart keep="true">` 包着的 `kb_list_sources` 真实输出** → 注销后清单回到**登记前那一份**。不是"回到空"：overlay 里那条 `(4, query_yueshen)` 是配置，探针登记的是 id=6 上另一个工具，而注册/注销共用一次整表回写 —— 要求全空就会把配置当成残留摘掉，顺著 bind-mount 写进宿主的 JSON |
-| 远程音频输入口 TCP `:10001` | 连得上、用户名注册成功（`probe_mic_…`），随后 16k 单声道 PCM 推 12s |
-| 远程 PCM 过 VAD | 通：12s 内收到 1 条 `log` 帧，内容 `['聆听中...']` —— recorder 真的判定"有人在说话" |
-| 远程音频的 ASR | **SKIP**：VAD 已过、识别结果为空，ASR 后端是宿主侧 `ws://host.docker.internal:10197`（`ASR_mode=funasr`），本机没起 FunASR，与容器化无关 |
-| 决策面谈 `:5001`（genagents）三条 | `POST /api/start-genagents` → HTTP 200 且 `:5001` 0.0s 内 bind；`GET :5001/` → 200、30094 字节且含那句指令；`POST :5001/api/shutdown` → monitor 线程 1.5s 内 release 端口 |
-| OpenAI 兼容层 `/v1/chat/completions` | 通，0.4s |
-| HTTP `/api/send` → `/api/get-msg` | 通，3.3s，1 字「好」 |
-| WS :10003 面板契约 | 通，12 帧，扁平 `panelMsg/panelReply/robot`（顶层还有 `Username`） |
-| WS :10002 human 契约 | 通，`{Topic:'human', Data:{Key,Value}}`；`Output=false` 会话 4 帧、`Output=true` 会话 5 帧 |
-| `Data.Key=text` 文字播报 | 通，35 字 / 31 字真实中文回复（「我是ChatGPT，我能够回答各种问题、提供信息、执行任务等多种任务。」/「我不需要介绍我自己，因为我是一个用于提供学习资料和工具的工具。」，不是兜底语） |
-| `Data.Key=audio` 音频帧 | **只跟客户端注册的 `Output` 走**：`Output=false` 无 audio，`Output=true` 的 `Keys=['audio','log','question','text']` |
-| audio 帧的 `HttpValue` | 通，`GET http://fay-lite:5000/audio/sample-*.wav` 取回 544058 字节 |
-| TTS `ms_tts_sdk.Speech.to_sample()` | 通，`edge_tts` 出网合成 188436 字节 wav |
-| 仿生记忆向量真伪 | 通：**真向量 1024 维、0.0s**，与上游兜底算法逐维比对不一致（首维差 0.0285），出口 `qwen3-embedding:0.6b` |
-| `Lips` 口型字段 | 三个实例都没有 —— 符合预期（上游只在 Windows 分支产出） |
-
-与模型无关的那半张表（`/api/get-system-status`、22 个静态资源、WS 注册、:10003 面板契约、
-`human` 帧形、`Output=false` 不推音频、`Lips` 缺失、TTS 出网、MCP 管理面/清单/SSE、
-prestart 那三档、`远程 PCM 跨过 VAD`、日程工具真调用、**决策面谈那三条**）在两个 9b 实例上同样是 PASS ——
-run #24 的 fork 组连 audio 帧都取回了 389532 字节、origin 组 577928 字节（正文 80/56 字
-与 65/59 字）。容器集成部分没有回归。而 run #12 里
-origin-fay 连问答前提那几条也是正面通过的（230 字回复 + audio 帧 + 563110 字节 wav
-+ 1024 维真向量，耗时 55.4s），这是「`AUDIO_GRACE_SECONDS` 修的是探针自己的时机、
-不是把故障糊过去」最直接的对照：同一份探针、同一条 9b 链路，#10 假红、#12 真绿。
-
-`./run.sh smoke` 六步全绿：`/api/v1/health` → adapter `/healthz`
-→ dev-login 拿 JWT → 建会话 → **重启 `fay` 后那一行还在**（卷持久化）→ 发一句话。后端返回 `fay_forwarded=true`、
-`fay_error=null`、`tier=medium`，并落库为完整中文回复：
-
-```
-id  role       content                                    len
-4   assistant  作为您的康养伙伴，我会提供持续的陪伴和康…   53
-3   user       你好，用一句话说说你能为康复期的老人做什…   22
-```
-
-### run #28：换基线之后的第一轮完整九组（2026-09-21 下午）
-
-`fay/` 换成 `chuan918/Fay@f702528`、补丁与依赖整套重落之后跑的。九组全绿、退出码 0，
-但**不是一口气一轮跑完的**：换基线后先单跑 `probe-fay-lite`（13:4x），两组 9b 随后
-14:13~14:58，其余六组 15:02~15:20（其中四组为把每组数字逐条抄全又重跑了一遍，
-`39 passed` 那次就是这次记的）。
-
-| 组 | run #28 实测 |
-|---|---|
-| `backend-test` | **39 passed（3.34s）** |
-| `backend-probe` | **11 PASS / 0 SKIP / 0 FAIL** |
-| `adapter-test` | **11/11** |
-| `probe-selftest` | **[ws-timing] 10/10** |
-| `probe-fay-lite` | **41/43 通过 · 2 SKIP** —— 与 run #27 同一档：问答、MCP（含 yueshen rag 3 工具）、prestart、TTS、远程 PCM 跨 VAD、决策面谈全部正面通过 |
-| `ue-audit` | **2 PASS / 0 SKIP / 0 FAIL** |
-| `fay-probe` | **35/45 通过 · 8 SKIP（LLM 证据降级）+ 2 SKIP（边界）** |
-| `probe-origin-fay` | **38/46 通过 · 6 SKIP（降级）+ 2 SKIP（边界）**（跑完之后这个参照实例被撤掉了，见本节开头）|
-| `probe-yueshen` | **6/6** |
-| 收尾一条 | `[test] fay-lite 优雅停止（SIGTERM）退出码 0` |
-
-与 run #27 最要紧的差别是**这一轮 `check_llm_host()` 置了 `DEGRADED_LLM_HOST`**：
-`qwen3.5:9b` 不再 100% 驻留（同机还有别的进程占着显存），直连第一发 fay 侧 73.6s、
-origin 侧 34.5s，都是"要先换入"的量级。于是探针按设计把问答耗时类判据降成 SKIP 而不是
-记红 —— 两组合计 14 条降级 SKIP 全是这个成因，逐条理由印在探针输出里，没有一条是 FAIL。
-能在 9b 上正面过的仍然是那批不依赖首字延迟的：MCP 清单/真调用/SSE 握手、prestart 三档、
-TTS 出网、`:10003`/`:10002` WS 契约、决策面谈三条、`远程 PCM 跨过 VAD`（12s 内 `['聆听中...']`）。
-QA 链的正面证据由 lite 那组给。**这不是换基线换来的回归**：run #27 之所以能全是硬判，
-是因为当时显存刚好腾得下两份 9b。
-
-两组各多出的那 2 条底数（45/46 vs run #27 的 43/44）同理 —— `fay_probe.py` 这轮只改了
-一处路径字符串（`patches/origin_fay/0004` → `patches/fay/0004`），断言集没变，
-是「收帧不足就重连一遍」的重试分支这轮真触发了，日志里能看到
-`probe_..._ws100020_r2` 这样的二次注册判据。run #27 特意记过「`重问` 全轮 0 次」，
-这次反过来证明了那条分支是可达的。
-
-另有两条与本轮 LLM 无关的老 SKIP，两个 9b 实例都是它们：`window capture`（无头容器连不上
-的桌面服务器，「未覆盖能力」记的边界）与 `远程音频的 ASR 认出了文字`（VAD 已过、
-本机没起 FunASR）。容器集成部分没有回归。
-
-`overlay/*/mcp_servers.json` 会被运行期回写这件事，本轮也留下了具体后果：跑完测试
-`git status` 必脏（探针现场 `connect`/`disconnect` 与 Fay 自己写 `connection_time` 都落在这
-三份 bind-mount 的可写文件上，当时还挂着 origin-fay 那一份），而 `run.sh test` 的
-「构建输入是否比镜像新」又是按 mtime 判的，所以下一轮一上来就白重建一次镜像 —— 镜像 ID 没变（这三份是运行时
-挂载、根本没进镜像），BuildKit 全量命中缓存，所以只是空转。**没有**为此改挂载方式：
-把 `faymcp/data/` 换命名卷要动运行期注册表的落盘位置，收益不值那个风险。提交前
-`git checkout -- overlay/<实例>/mcp_servers.json` 即可，纯时间戳漂移。
-（**run #30 之后"下一轮白重建一次"这半句失效了**：那道闸的输入清单改成只点名
-`overlay/**/requirements*.txt`，见 run #30 那节；`git status` 必脏照旧，`checkout --` 仍是正确动作。）
-`config.json` 那份回写值得单说一句，因为它让"纯漂移"这个判断不能凭 diff 行数下：Fay 用
-`json.dump` 默认口径写回，中文全变成 `\uXXXX` 转义、行尾换行也没了，26 行的 diff 解码回来
-与种子一字不差 —— 但同一份文件里可能夹着**真状态**：`record.enabled` 就被运行期翻成了 `true`
-（**不是探针干的** —— `grep -rn record probes/` 只命中读源码注释那几行，是管理台/配置面板那侧写的）。
-所以 `checkout --` 之前先读 diff 的**语义**而不是形状。三份可写挂载各自的脏法、以及为什么
-上面那句"`checkout --` 仍是正确动作"从 2026-09-23 起只对 `mcp_servers.json` 无条件成立，
-见上面「不改上游代码的三种手段」那一节。
-
-### run #29：撤掉参照实例之后的第一轮八组（2026-09-21 17:24~17:45）
-
-`origin_fay` 整条撤掉（compose 服务、镜像 ARG、四个卷、overlay、探针组、文档）之后跑的，
-21 分钟走完，八组全绿、退出码 0。
-
-| 组 | run #29 实测 |
-|---|---|
-| `backend-test` | **39 passed（3.30s）** |
-| `backend-probe` | **11 PASS / 0 SKIP / 0 FAIL** |
-| `adapter-test` | **11/11** |
-| `probe-selftest` | **[ws-timing] 10/10** |
-| `probe-fay-lite` | **41/43 通过 · 2 SKIP（都是边界，本轮无降级）** |
-| `ue-audit` | **2 PASS / 0 SKIP / 0 FAIL** |
-| `fay-probe` | **39/43 通过 · 2 SKIP（LLM 证据降级）+ 2 SKIP（边界）** |
-| `probe-yueshen` | **6/6** |
-| 收尾一条 | `[test] fay-lite 优雅停止（SIGTERM）退出码 0` |
-
-底数从 run #28 的 45/46 回到 43/43：多出来的那 2 条是「收帧不足就重连一遍」的重试分支
-（日志里形如 `probe_..._ws100020_r2`），这轮没触发。43~46 浮动是设计内的，不是断言集变了。
-
-显存比 run #28 还紧（`qwen3.5:9b` 权重只驻留 6%，387/6149MB，直连第一发 47.3s），
-`DEGRADED_LLM_HOST` 照样置起，但**降级只剩 2 条而不是 8 条**：问答链本身这轮是拿到真回复的
-（`:10002` 两轮 `Data.Key=text` 分别 60 字、43 字，音频帧也按 Output 开关各就各位），
-被降级的只有「直连下限」那一条测量和 `HTTP /api/send → /api/get-msg`（90.1s 内 0 字，
-按环境判 SKIP 而不是红）。同一轮 lite 侧 1.5b 满驻留（1166/1166MB、直连 3.4s），
-所以那组一条降级都没有。
-
-`fay` 镜像这轮被 mtime 判成「构建输入比镜像新」而重建了一次 —— 因为 `images/fay.Dockerfile`
-真被改过（`FAY_SRC`/`PATCH_DIR`/`REQS_DIR` 三个 ARG 删掉，而它们正在 `COPY` 的指令文本里）。
-日志当场把这次印成「重建后镜像 ID 没变（2738eb20c5bc）」，**那句话是错的**：`dh-fay:local`
-现在指向 `0db394dea218`、`Created=17:30:35` 正落在这轮里。错因在核对 ID 那一步用
-`docker compose images -q <svc>` 读 ID，而那张表第一列是 CONTAINER —— 旧容器还在跑时它报的是
-「容器用的镜像」而不是 tag 指向的镜像，于是重建完 tag 已经挪走、它还在拿旧 ID 跟旧 ID 比。
-run #30 起改成只跟 compose 拿 `REPOSITORY:TAG`、ID 用 `docker image inspect` 按 tag 现查
-（`run.sh` 的 `image_id_of()`）。**但"内容没变"这个结论本身是对的**，只是它不该由那条日志担保：
-`docker image inspect` 对两个 ID 逐层比 `.RootFS.Layers`，前 7 层（base + apt + pip）摘要一字不差，
-第 8~12 层全换了摘要 —— 而 `COPY` 会把源文件的 mtime 打进 tar 头，`fay/requirements.txt`
-在 17:05 被 touch 过一次（内容与 HEAD 一致，`git -C fay status` 到这一步仍是 0 dirty），
-再加上那三条 `COPY` 的指令文本本身改了 cache key。重新导出的是层，不是代码。
-
-### run #30：外部语料进库之后的第一轮八组（2026-09-21 18:03~18:25，22 分钟）
-
-第一次把 `seed/kb_corpus/`（项目方那 14 份科普文档的切片，见「外部语料」）挂进
-`yueshen-rag` 之后跑完整一轮，八组全绿、退出码 0。
-
-| 组 | run #30 实测 |
-|---|---|
-| `backend-test` | **39 passed（3.64s）** |
-| `backend-probe` | **11 PASS / 0 SKIP / 0 FAIL** |
-| `adapter-test` | **11/11** |
-| `probe-selftest` | **[ws-timing] 10/10** |
-| `probe-fay-lite` | **41/43 通过 · 2 SKIP（都是边界，本轮无降级）** |
-| `ue-audit` | **2 PASS / 0 SKIP / 0 FAIL** |
-| `fay-probe` | **40/45 通过 · 3 条 LLM 证据降级 + 2 条边界 SKIP** |
-| `probe-yueshen` | **6/6 —— 入库 `chunks=576 inserted=576 用时 5.1s`、`vectors=576`** |
-| 收尾一条 | `[test] fay-lite 优雅停止（SIGTERM）退出码 0` |
-
-**知识库那组是这一轮的主角**：向量库从 1 条涨到 576 条之后，六条判据一条没松动，MARKER
-检索仍然排进 top3（回来的还是那 251 字）。唯一的物理变化是嵌入模型换入的成本 ——
-`知识库嵌入出口可用` 这条单独跑时是 0.1s，这一轮 9b 正压着显存，它花了 **58.1s**；
-0002 补丁把这条超时开到 180s 就是为了这种情况。`fay-probe` 侧同一轮里
-`仿生记忆向量真伪` 也是 56.3s 真向量，两条对得上。
-
-`fay-probe` 的分母是 45 而不是 43：多出来的 2 条是「收帧不足就重连一遍」的重试分支
-（日志里 `probe_..._ws100020_r2` / `_ws100021_r2`）。这轮它真的触发了两次 —— 两处
-`WS :10002 收到文字播报` 第 1 发都是正文为空（只回 `log` + `question` 两帧），探针按
-120s 排空重问，第二发分别拿到 45 字、42 字，判据按第二发计。**这条正好是 run #27 给
-「排空重问」写下的用途的第一次实际命中**。本轮环境依旧不给退路：9b 权重只驻留 6%
-（387/6149MB、直连第一发 32.9s），`DEGRADED_LLM_HOST` 置起，被降级的三条是「直连下限」
-那条测量、`OpenAI 兼容层 /v1/chat/completions`（TimeoutError）和 `HTTP /api/send →
-/api/get-msg`（90.1s 内 0 字，按环境判 SKIP 而不是红）；lite 侧 1.5b 满驻留
-（1166/1166MB、直连 3.7s），一条降级都没有。
-
-这一轮仍然出现了一次空转重建（trigger 是 `overlay/fay/mcp_servers.json`），报的
-「重建后镜像 ID 没变（0db394dea218）」这次是对的 —— 全轮结束后 `Created` 还是 17:30:35。
-**这两件事在 run #30 之后都收掉了**，根因比"mtime 会骗人"具体：那道闸把 `overlay/<src>/`
-整个目录当构建输入，而 Dockerfile 从 overlay 拿走的只有 requirements（`grep -n overlay
-images/*.Dockerfile` 一共 4 行），`system.conf` / `config.json` / `mcp_servers.json` 全是
-运行期 bind-mount —— Fay 起来就把 `connection_time` 回写进去，于是每一轮的 mtime 必然比镜像新、
-每轮必空转重建一次。清单改成点名那几份 requirements 之后，复跑 `./run.sh test backend-test`
-已经不再打印「先重建它」（39 passed / 2.93s）。另一个假阴性（run #29 末段那条）也修了：
-核对 ID 改成 `image_id_of()`，只跟 compose 拿 `REPOSITORY:TAG`、ID 用 `docker image inspect`
-按 tag 现查，不再读容器上的旧 ID。
-
-### run #31：CareEcho H5 接进来之后的两组（2026-09-21 19:08~19:10）
-
-这一轮**只跑了新加的两组**，不是完整十组 —— `frontend-test` 全程打假后端、
-`frontend-probe` 只发一问，两组各自 1 分多钟，没必要为它们重烧那三组 9b。
-集成细节见「CareEcho H5 前端」一节。
-
-| 组 | run #31 实测 |
-|---|---|
-| `frontend-test` | **17/17 通过**（含负面自检：改坏 `Set-Cookie` 后判据 8 确实变红） |
-| `frontend-probe` | **3/3** —— 外壳发产物 1583 字节、`/api/health` ok、真实一问 **86.5s / 47 字 / 会话 7 / cookie 有** |
-| 收尾一条 | `[test] fay-lite 优雅停止（SIGTERM）退出码 0`（两组各带一次） |
-
-86.5s 这一发比 run #30 里 9b 那三组的 172~301s 快 —— 但这一轮 ollama 那条单队列上
-只有它自己（另外三组 9b 问答没跑），所以这是"没有排队"的数，不能记成"机器变快了"，
-也不作为对其它轮次的基线。它证明的是：**从外壳进去的那一问，能穿过后端→adapter→Fay→
-宿主机 Ollama 拿到真回复再回来**。外壳那 90s 的上限当时是**擦着过的**（86.5s / 90s），
-浏览器那 30s 从一开始就不够 —— 这就是超时链一节里"H5 一定先报错"的具体数字。
-（这句当时写成"90s 够用"，run #32 把它证伪了：同一条判据那一轮 90.4s 撞死，见下一节。）
-
-### run #32：麦克风这条链接进来之后的第一轮十三组（2026-09-21 22:53:21~23:27:13，33 分 52 秒）
-
-第一次把 `ws-relay-test` / `asr-test` / `asr-probe` 三组放进完整一轮。这一轮**没有**拿到
-`[test] 全部通过`：十三组里十组全绿，`fay-probe` 与 `frontend-probe` 各红一条，
-`probe-yueshen` 按环境就地收工（退出码 0，但只判了两条）。三条的成因是同一条，见本节第二段。
-
-| 组 | run #32 实测 |
-|---|---|
-| `backend-test` | **39 passed（3.41s）** |
-| `backend-probe` | **11 PASS / 0 SKIP / 0 FAIL** |
-| `adapter-test` | **11/11** |
-| `probe-selftest` | **[ws-timing] 10/10** |
-| `frontend-test` | **19/19**（17、18 两条是本轮为 WS 转发与 `DEBUG` 耦合补的，19 是负面自检） |
-| `ws-relay-test` | **14/14**（新组：外壳那条同源转发，含 3 条负面自检 A/B/C，见「426」那节） |
-| `asr-test` | **13/13**（新组：`ASR_FAKE_MODEL=1`，不加载 torch；12 条线上协议判据 + 1 条负面自检） |
-| `probe-fay-lite` | **41/43 通过 · 2 SKIP**（`window capture` + `远程音频的 ASR`，两条都是划出的边界） |
-| `ue-audit` | **2 PASS / 0 SKIP / 0 FAIL** |
-| `fay-probe` | **33/44 · 8 项按环境降级 SKIP · 1 FAIL**（红的是 `MCP 现场连接离线服务器 yueshen rag`） |
-| `probe-yueshen` | **只判了 2 条**：第 1 条 PASS，嵌入出口那条 240.1s 超时记降级 SKIP，后面 4 条没跑 |
-| `frontend-probe` | **2/3 · 1 FAIL**（那一问 90.4s 后拿到 502，`后端 POST /chat/sessions/11/messages 不可达：timed out`） |
-| `asr-probe` | **9/9**（新组，全套最末） |
-| 收尾一条 | `[test] fay-lite 优雅停止（SIGTERM）退出码 0：一次正常的 stop 没被记成崩溃` |
-
-三条红/收工共用一个成因，而且**在栈外**：这轮开跑前显存就被别的进程占掉了 13.2 GiB
-（`nvidia-smi` 里那台 `freetoken` 的 python，16376 MiB 总量下只剩约 1.2 GiB 给 ollama），
-于是 `ollama ps` 报的是 `qwen3.5:9b 6.1 GB 94%/6% CPU/GPU` —— **94% 的权重在 CPU 上**。
-宿主侧同时是 `available 6.0 GiB / swap 已用 18.7 GiB`、`si` 长期十万量级。后果按链长度依次是：
-9b 问答从 60s 起（run #27 那轮 GPU 满驻留时是 6.3s）、嵌入模型换入 240s 不返回、
-`frontend-probe` 那一问在 90s 处超时。`check_llm_host()` 据此置了 `DEGRADED_LLM_HOST`，
-所以那 8 条问答类判据是**按环境降级**而不是硬判红 —— 这正是这套三态设计要挡住的事：
-把"这台机器今天没显存"写成"这条链坏了"。
-
-**两条红里只有一条在隔离重跑里翻绿了**（23:31 起只跑 `fay-probe probe-yueshen`，同一台机器、同一批镜像、
-显存占用没变）：`fay-probe` 那组重跑是 **41/45 通过 · 2 项降级 SKIP · 2 项边界 SKIP · 0 FAIL**，
-其中 run #32 里红的那条 `MCP 现场连接离线服务器 yueshen rag` 直接 PASS（"连上并取到 3 个工具，
-验完断开"），`WS :10002 收到文字播报` 走到了 120s 排空重问那条分支 ——
-第 1 发正文为空、第 2 发（换用户名）拿到 70 字，判据按第 2 发计；`HTTP 取到 audio 帧指向的音频文件`
-也从降级里回来（`http://fay:5000/audio/sample-….wav` 362014 字节）。
-同一轮里 `本地 LLM 主机就绪` 那条直连测到的是 **61.3s 且"模型未常驻(首次请求要先换入)"** ——
-run #27 那个 6.3s 的数要 GPU 满驻留才拿得到，两者差的那十倍就是本节上一段说的显存被占。
-底数从 44 变 45 也不是漂移：重问分支一旦触发，那次重问自己会多记一条同名判据。
-
-`frontend-probe` 那条重跑**复现了**（23:51 单跑，仍是 `90.3s → 502`，msg 一字不差是
-`后端 POST /chat/sessions/12/messages 不可达：timed out`），于是它不该被记成排队抖动：
-这是**超时链的最短那一环**在起作用。外壳给后端的预算是 `CARECHO_UPSTREAM_TIMEOUT`（默认 90s），
-9b 不驻显存时这一发要 172~301s（run #30 量过），所以 90s 处必然 502 ——
-把它调到 300s 也只是把错误往后挪，因为**浏览器侧 axios 那 30s 是伙伴方代码里写死的**
-（`request.js:6`）。也就是说这条链的真实边界是：`9b 答得比 30s 慢，H5 就已经放弃了`。
-所以 run #32 的两条红一条是排队（重跑即绿，但没写进白名单：完整一轮里它就是红，
-`./run.sh test` 的退出码就是 1），一条是**结构**（重跑仍红，改判据不如改部署前提：
-要么让 9b 常驻显存，要么把语音/问答放到显存充裕的机器上）。
-
-同一轮里 `probe-yueshen` 补跑回 **6/6**，代价的对比很干净：嵌入出口那一发 **57.0s**
-（run #30 那轮它是几秒），576 块语料 ingest **74.8s**（run #30 记的是 **5.1s**），
-检索 3 条命中 251 字、`vectors=576` 与 `inserted` 对上。同一条链、同一个模型、同一批镜像，
-差的只有"嵌模型今天有没有坐在显存里"—— 这就是为什么这组的预检只给自己找降级、
-不给后面的判据找通过的理由。
-
-`probe-yueshen` 那条"只判了 2 条"顺带暴露了一个观测漏洞：嵌入出口不通时它 `return fail_count()`
-= 0，退出码绿、收尾那行 tally 却整个没打，日志看上去像"这组跑完了"。已补一行收工说明
-（判了几条、后面几条为什么测不了），并把 `远程音频的 ASR` 那条 SKIP 的理由改了 ——
-它原文写"本机没有起 FunASR 服务"，而这一轮之后 `dh-funasr` 就在栈里跑着，那句话变成假的；
-现在它点名的是真正的边界：10197 上那是 Fay 自己的另一套方言（裸文本 + `{"vad_need":…}`），
-与本栈为 H5 起的 `{"text","is_final"}` 未接。
-
-`asr-probe` 那 9/9 里有两个数值得单独记：15.26s 的真实语音（`course_package_player_intro_abin_final.wav`，
-edge_tts 产出的）只认出 **0.5 字/秒**，而 2.64s 的合成句是 3.4 字/秒 —— 前者 final 是
-`飞。Ai.Ai.Ai.飞。飞。Z.Hip h.Ttp.Api.现在。Exceed.Mcp.拍上来。Cp.`。这不是判据松（那条判的是
-"字数与时长同量级 0.5~15 字/秒"），是 `CHUNK_BYTES=32000` 每次一发无上下文的 `generate` 的代价，
-详见「一个必须写下来的质量边界」。同一条链路的耗时构成也在这一组里第一次量到：
-15.9s 推流 + 0.5s 收尾 → 全组约 32s。
-
-本轮收尾又跑了几件，都归到上面那条成因里、不另开编号（23:52~00:06）：
-`./run.sh audit` 报四个上游仓库仍 `0/0` 且 `0 dirty`（containerd 侧 11 份补丁、13 个测试件、
-3 份自研 python 源文件）；`./run.sh smoke` **仍红在第 6 步**，前 5 步全过 ——
-`500.46s` 拿到 `HTTP 502: 等待 Fay 回答超时（500s，用户名 elder_1）`。它开跑那行自报的是
-`qwen3.5:9b 驻留显存 6%（387/6149MB）`，而等它收工再 `ollama ps`，9b 已经**根本不在清单里**
-（只剩嵌模型 `45%/55%`）：这发的失败连"换入"都没在 500s 内完成，与 `frontend-probe`
-撞的 90s 是同一件事的两个长度 —— 一个是外壳替浏览器做的决定，一个是 adapter 替后端做的决定。
-麦克风那三组在按上节那条把 `funasr-cache` 卷删了重建之后重跑是 **14/14 · 13/13 · 9/9**、
-`ASR READY secs=17.8 src=local bytes=1299078750`，与卷建好那次的 19.7s 同量级：
-这卷是**缓存不是状态**，删了重拷不影响任何判据，也因此才敢为消那行警告删它。
-
-本轮改动过的那两份探针，在提交之后各复跑了一次（00:14~00:38，同一台机器、显存占用没变）。
-`probe-yueshen` 这轮是**完整 6/6**：预检那发 21.5s 把嵌模型换进显存，576 块 ingest 只花 **5.5s**
-—— 与 run #30 的 5.1s 同量级，而 run #32 那轮它是 74.8s。也就是说这条链本来该有多快，
-是排队顺序决定的一半、显存决定另一半。
-`fay-probe` 是 **36/45 通过 · 8 项 SKIP（4 项按环境降级）· 1 FAIL**，但红的那条**换了**：
-run #32 里红的 `MCP 现场连接离线服务器 yueshen rag` 这次 PASS，红的改成 `TTS edge_tts 合成`
-（`返回 None`），而同一条判据在 run #32 的日志里是 `PASS … sample-….wav 188436 字节`。
-把它拖下来的还在栈外，而且这次连"去哪看证据"都要照判据说的做：`FAIL` 那行只写
-`返回 None｜原因被 ms_tts_sdk 吞在 except 里，只打到本容器 stdout 的那一行，去看它`，
-去翻那行是 `Cannot connect to host speech.platform.bing.com:443 … [Temporary failure in
-name resolution]`（00:21:44）—— 这台机器的 DNS 出口到 00:2x 之后连 Bing 那条也不通了，
-而 `check_tts` 是硬判、不给自己找降级，所以它红；同一轮两条 audio 判据的成因行也明写了
-"这是外部依赖，不是容器化回归"。这一条同时说明这组的判据分布是活的：**同一轮里可以一条红
-换一条绿**（run #32 红的那条 MCP 这次 PASS），拿"上次那几条红"当白名单就会把这次的漏
-看成上次的抖动。
-
-我给自己那处改动补了一个必做的对照：`probe-yueshen` 新加的收工 tally 只在嵌入出口不通时才走，
-而上面那次是通的 —— 等于那行**没被执行过**，光"跑过 6/6"不能算它验证了。
-于是用 `--timeout 0.01` 人为把预检做坏，它就打出来了：
-`[probe] 2 条已判（其中按环境降级 1 条），后面 4 条（工具清单/入库/检索/stats）没有嵌入出口
-就测不了，本组就地收工`，退出码 0。对比的意义就在这一行：改之前**同一条路径也是 rc=0，
-但一个字都不打**，日志读起来像"这组把 6 条跑完了"。
-
-
-
-### 「Fay 会调工具」这句话，探针只敢证到中间那一档
-
-外部看一个数字人有工具，容易把三件不同的事混成一句「支持 MCP 工具调用」。这三档
-的强度差别很大，而**探针只证到了前两档**，所以分开记：
-
-| 档 | 含义 | 探针判据 | 结论 |
+| 组 | 量什么 | 全绿时的形状 | 逐条判据 |
 |---|---|---|---|
-| ① 管理面能调 | **我们**通过 `:5010` 的 HTTP 管理接口连服务器、列工具、真调用一次 | `MCP 管理面 /api/mcp/servers`、`MCP 工具清单`、`MCP stdio 示例工具真调用`、`MCP 知识库工具真调用`、`MCP 日程工具真调用` | PASS，与模型无关（三个实例同绿） |
-| ② 一轮对话顺带执行了工具 | 用户说一句自然语言，Fay **因为工具被配置成 prestart** 而在进程内执行它，结果进回答流 | `MCP 预启动工具注册与可运行清单`、`一轮对话真的执行了 MCP 工具（prestart 结果进回答流）`、`MCP 预启动工具注销后清单回到登记前` | PASS（run #20 首次，run #21 三个实例各现造一帧）；与模型无关，见下 |
-| ③ 模型自己决定调工具 | 模型读了工具清单，**主动**规划出「该调哪一发」再执行 | —— | **未证**，见下 |
+| `backend-test` | service 自带的 pytest（39 个用例），跑在每轮重建的空测试库上 | `39 passed`（3.4s 量级） | 「测试库必须是空的」 |
+| `backend-probe` | 活进程 + 业务库 schema + 带鉴权的读路径 + 活体写路径 + 调度器 | `11 PASS / 0 SKIP / 0 FAIL`，几秒 | 「后端活体探针」 |
+| `adapter-test` | 本层自己写的 adapter，全程假 Fay、不打任何模型端点 | 18 条全过（2026-09-22 之前是 11 条） | 「adapter 自己的契约测试」 |
+| `probe-selftest` | 探针自己的收工时机 + 收尾那行的统计口径，假 Fay WS 服务端 | `[ws-timing] 10/10` | 「探针自己的时机测试」 |
+| `frontend-test` | CareEcho 外壳的契约，假后端起在同容器里 | `19/19`（含一条负面自检） | 「外壳的判据」 |
+| `ws-relay-test` | 外壳那段 `/funasr-ws` 同源转发，假上游 + 手造掩码帧 | `14/14`（含 3 条负面自检） | 「三组测试件，各测一段」 |
+| `asr-test` | `asr/server.py` 的线上协议（`ASR_FAKE_MODEL=1`，不加载 torch） | `13/13`（12 条协议 + 1 条负面自检） | 同上 |
+| `probe-fay-lite` | 43 条 Fay 契约打在 `qwen2.5:1.5b` 上 —— 全套里唯一能给"问答链路真的通"正面证据的一组 | `41/43 · 2 SKIP` | 「AI 端点落在哪里」+ 下面两段 |
+| `ue-audit` | UE 那两份产物的构建完整性 | `2 PASS / 0 SKIP / 0 FAIL` | 「UE 仓库的容器侧处置」 |
+| `fay-probe` | 同一份探针打主实例（对话端点 = `.env` 里那个） | 与 lite 同底数；问答类可能按证据降级成 SKIP | 同上 |
+| `probe-yueshen` | chromadb 那条链路：嵌入出口、工具清单、入库、检索带 MARKER、`stats.vectors == inserted`、配置指本栈容器 | `6/6`（嵌入模型没在显存里时它会就地收工） | 「yueshen 知识库」 |
+| `frontend-probe` | 活体：外壳发出去的那一问真的穿过 外壳→backend→adapter→Fay→对话端点 答回来 | 3 条 | 「CareEcho H5 前端」 |
+| `asr-probe` | 真模型 + 真音频 + 真推流节奏，全套唯一真跑一次 CPU 推理的一组 | `9/9` | 「三组测试件，各测一段」 |
+| `kb-ingest` | 外部语料入库 + 12 问 recall@k（三档）+ 那条反向对照 | `12/12` | 「外部语料」 |
 
-②这条判据的可信度全在「**这条执行不经 :5010**」：注册 prestart 之后，探针只发一句
-普通问答，收到的是 `:10003` 上一帧 `panelReply`，里面出现 `<prestart keep="true">`
-包着的 `kb_list_sources` 真实输出（`count` 字段那种）。而 in-process 那条路走的是
-`faymcp/runtime_bridge.call_tool`，压根不经过 `:5010` 的 Flask 路由 —— 探针没有能力
-在自己进程里造出这一帧。所以「一帧里出现工具输出」只能来自 Fay 自己的执行。
+**一条判据要能红才算存在。** 上表里带「负面自检」或「反向对照」的那几组，各自都真跑过
+一次"故意改坏它必须变红"；`backend-probe` 的十一条里有七条做过变异验证，逐条记在
+`AGENTS.md`「后端活体探针的七次变异验证」。
 
-代码里这条链是通的，读得出来：`llm/nlp_cognitive_stream.py:2374` 的
-`_run_prestart_tools(content)` 在**拼 prompt 之前**跑（:462 的调用点），拿清单走
-`faymcp/runtime_bridge.py:53 list_runnable_prestart_tools()`，它要求服务器
-`status == "online"`（`faymcp/mcp_service.py:1248` 那个注册口），执行走
-`call_tool(sid, tool, params, skip_enabled_check=True)`，结果在 :2664 用
-`write_sentence(prestart_stream_text, force_first=…)` 播出去。
+问答那一档的绿有两种：**硬判**（`check_llm_host()` 直连 `.env` 里那个对话端点量出的下限
+说明这台机器判得了这一条，于是过就是真过、不过就记红）和**按证据降级**（权重驻留不足或
+单发太慢时，耗时类判据记 SKIP 并把证据印在详情里）。降级只能由那条直连证据触发，
+而退出码不数 SKIP —— 所以一轮里出现 SKIP，先读它写的成因，再判断是不是回归。
+常态下那两条与显存无关的 SKIP 是 `window capture`（无头容器里连不上的桌面服务器，
+「未覆盖能力」记的边界）和 `远程音频的 ASR`（10001 那条链只到 VAD，10197 上是 Fay 自己的
+另一套方言，见「FunASR」那节的差别）。
 
-两个 surface 对 prestart 的处理不对称，这是踩到才知道的：`core/fay_core.py:2929-2931`
-在往 `:10002`（数字人）发之前把 `<prestart>` 标签剥掉了，`gui/flask_server.py:1407`
-对 HTTP 回复同样剥；但 `:10003`（面板）上 `panelMsg` 会被 :2835 跳过，而 :2856
-`if content_id is not None` 那条 `panelReply` 照发，文本只过
-`__truncate_think_for_panel`。所以判据必须盯 `:10003` 的 `panelReply`，盯 `:10002`
-会稳定假红。
+`./run.sh smoke` 量的是另一件事：六步打通链路 —— `/api/v1/health` → adapter `/healthz`
+→ dev-login 拿 JWT → 建会话 → **重启 `fay` 后那一行还在**（记忆确实落在 `fay-memory`
+具名卷里，不是容器的可写层）→ 发一句话。后端要回 `fay_forwarded=true`、`fay_error=null`、
+`tier=medium`，并把这一问和回答落成 `chat_message` 的两行。第 5 步故意排在最后那次问答
+**之前**：它不依赖 LLM，就不该被"这台机器显存不够"连累。
 
-③ 到现在仍然没有判据，也就仍然没证到。此前把它归给「这台机器显存不够」，run #21
-把这半句证伪了：那一轮 9b 权重 100% 驻留、直连 3.0s，单发问答在 :10002 上拿到
-34~42 字，显存不是卡点。真正没量的是 fork 那条决策路 ——
-`llm/nlp_cognitive_stream.py:3059` 的 `_call_planner_llm`，一次问答要多发好几发 LLM，
-而 run #20 观测到的自适应预算（`fay-lite` 45s→90s、直连基线 0.0s→7.0s）说明
-「一次生成」和「一轮问答」不是一个数量级：预算翻倍仍然可能不够那几发排队。
-判不了就是判不了，不写成 PASS，也不顺手编一条「模型自己决定调工具」的判据 ——
-那条判据要能区分「模型选了工具」和「prestart 替它选了」，得先设计怎么把 ② 关掉。
-
-### `:10002` 上的空回复：一次「同一次生成、三个落点」的排查
-
-run #20 那条唯一的红是 `WS :10002 收到文字播报 —— 一帧 text 都没收到`。这条判据在
-run #9 是绿的，代码同一份。当时先按探针自己的时机缺陷处理（见上面
-`probes/ws_timing_test.py` 第七条），修完还剩一个说不通的问题：**为什么只有 :10002 空**。
-
-嫌疑有两个，得分开量。一是 `Output` 这个开关（`core/fay_core.py:1568` / `:2212` 用
-`get_client_output(username)` 决定往 :10002 推什么），二是 :10002 发送前的标签剥离
-（`fay_core.py:2931-2933` 依次过 `__remove_prestart_tags` / `__remove_think_tags`，
-剥完为空且不是结束标记就在 :2946 整段 `return`）。要区分它们就得**在同一次生成上比落点**：
-不同轮次的观察拼不出结论，因为每一轮都是新的一次生成，模型这轮吐空、下轮不吐空，
-就足以解释「同一条判据两次运行结果不同」。
-
-于是 22:33 拿一个用户名同时注册 :10003 与 :10002（`Output=false`），只 POST 一次
-`/api/send`，三个落点一起收：
-
-| 落点 | 实测 |
-|---|---|
-| `:10003` 面板 | `panelReply` 两句（正文 42 字，payload 字段合计 498 字） |
-| `:10002` human | **2 帧真正文，42 字**：`'我是一个人工智能助手，由蜻蜓菲菲智能科技开发，'` (IsFirst=1,IsEnd=0) + `'致力于为您提供准确、有用的信息和帮助。'` (0,1) |
-| 记忆库 | 同一句 `type='fay'` 行 |
-
-而 `Output=false` 这同一格（fork 镜像 × `qwen3.5:9b` × 这句长问题）在 22:27 那一发是
-**空**：3 帧 = `log` / `question` + 一帧 `Value=''` 的 text 终止帧，探针按修好的时机
-等满 240s 预算才收工。所以：
-
-- **「`Output=false` 会掐断 :10002 的文字」被否证** —— 同一格既能空也能不空；
-  换 1.5b 的 `fay-lite` 同参数给出 69 字，`只回一个字：好` 这种短问题给出「好」。
-  `Output` 不是解释变量。
-- **剥离路径没有吃字** —— 有正文时它正常放行，而这轮回答里本来就没有 `<prestart>` /
-  `<think>` 标签可剥。
-- 剩下能说的是：**这是一次概率性的生成侧吐空**。:10002 通道本身没坏（run #20 里
-  origin-fay 同问题、同模型、同机器给了 64 字真回复），它跟着模型走（换 1.5b 就没再出现）。
-  静态读代码读不出一个可以下补丁的点，所以这里**不打补丁** —— 没有根因的补丁就是猜测。
-
-判据的处置是把它量出来，而不是糊过去：:10002 那两格第一发拿到空正文时，探针明确
-**再开一个会话量第二发**，两发各自的形状（帧数 / `Keys` / text 帧的 `(IsFirst,IsEnd)`）
-都写进同一条判据的详情里；第二发有正文才按第二发计 PASS，**两发都空仍然判红**。
-代价是真发生吐空时那一格要多等一个完整预算（今天实测等满 240s —— 这正是 #35 修好之后
-的必然后果：不再被空终止帧提前武装 6s 静默窗口）。三种形状都用合成帧单独验过走向：
-只有空终止帧 → FAIL 且详情带形状、有正文 → PASS、一帧 text 都没有 → FAIL。
-要说清的是：**run #21 与 run #23 那三组各六个 :10002 格子全部第一发命中**，所以那两轮
-这条分支只有合成帧自测的凭据。这个状态在 **run #24 结束了**：fork 组的
-`:10002 Output=true` 第一发拿到 3 帧、`Keys` 里没有 `audio`、text 帧
-`(IsFirst,IsEnd)=(1,1)` 且正文为空，探针换用户名重问，第 2 发 8 帧 / 56 字，判据按第 2 发
-计 PASS（原文与三点结论见「实测通过的链路」里那段引用）。也就是说这条分支现在既有合成帧
-的三种走向，也有一次活体触发 —— 而且活体那次吐出的形状与 #35/#36 静态推断的空终止帧形状
-逐字段一致。顺带纠一处用词：那段话里"`重试` 出现 0 次"的 grep 关键字是错的，探针的措辞是
-`重问`；#21/#23 两个日志里两个词都是 0 次，所以结论没错、依据不稳，本轮起按 `重问` 计。
-
-### 「外部 TTS 出口不通」和「容器 audio 推送坏了」是两件事
-
-`:10002` 上收不到 audio 帧、或者 audio 帧的 `HttpValue` 取不回文件，红可能有两种成因，
-而它们指向完全不同的地方：一是**外部依赖**（`edge_tts` 要出公网到
-`speech.platform.bing.com`，容器没网/被墙/配额没了都算这条），二是**容器自己**
-（`core/fay_core.py:2212` 那个 `get_client_output` 分支不推帧、或 `:5000/audio/…` 那个
-静态落地路径坏了）。把前者判成后者，会让人去改本来没坏的容器代码。
-
-分法写死在探针里：`check_tts()` 直接调 `tts/ms_tts_sdk.Speech.to_sample()`，结论除了
-自己那条判据，还写进 `TTS_OK`；audio 那条判据先看会话里有没有带 `HttpValue` 的帧，
-没有的话 —— `TTS_OK is False` 就记 **SKIP**（理由写"出口不通，见 check_tts 那条"），
-`TTS_OK` 为真才记 **FAIL**（"会话里没有带 HttpValue 的 audio 帧"，这才该怀疑容器）。
-
-这个口径用一次受控变异验过（23:13、23:15 第一次；把实验台收进 `tools/` 之后 23:37、23:38
-两臂复跑，同一份 `probes/fay_probe.py`、同一个 `dh-fay:local` 镜像、同样的只读挂载，
-唯一差别是一行 `--add-host`）：
-
-| 臂 | `check_tts` | `TTS_OK` | 下游那条（两臂喂的是同一份「一帧 audio 都没有」的会话） |
-|---|---|---|---|
-| 出口正常 | PASS，1.8s（复跑 5.4s），`./samples/sample-…wav 188436 字节` | True | **FAIL** —— 会话里没有带 HttpValue 的 audio 帧 |
-| `--add-host speech.platform.bing.com:127.0.0.1` | FAIL，0.5s（复跑 0.7s），`返回 None` | False | **SKIP** —— 出口不通（见 check_tts 那条）=> 没有 audio 帧，也就没有 URL 可取 |
-
-同一份下游输入，两臂给出两种判据、且各自指对方向 —— 这就是「分清」的全部含义。
-顺带量到两个事实：出口不通时 `to_sample()` **不抛异常，返回 `None`**（`ms_tts_sdk.py:116`
-那个 `except Exception` 只 `util.log` 出「[x] 原因: …」，探针拿不到原因，所以现在 FAIL
-的详情里直接写明去哪看），而且**失败得很快**（0.3~0.7s），不会把整组拖到超时。
-
-复现命令（一次性容器，挂载全是 `:ro`，不碰任何在跑的实例；不打 LLM、不占显存）。
-实验台本身是仓库里的一份工具，不在 `/tmp` 里，所以这条命令在别的机器上也照抄得动：
-
-```
-docker run --rm --network digitalhuman_default \
-  --add-host speech.platform.bing.com:127.0.0.1 \
-  -v "$PWD/probes:/probe:ro" \
-  -v "$PWD/overlay/fay/system.conf:/app/system.conf:ro" \
-  -v "$PWD/overlay/fay-lite/config.json:/app/config.json:ro" \
-  -v "$PWD/tools:/tools:ro" -w /app dh-fay:local python /tools/tts_negative_control.py
-```
-
-（基线臂就是删掉 `--add-host` 那一行。`tools/tts_negative_control.py` 里只有三件事：
-`fp.check_tts()`、`fp.check_audio_url([{一帧 log，没有 audio}], "http://fay-lite:5000")`、
-把 `fp.TTS_OK` 和那条下游判据的三态打出来，两臂判据没分开时它自己非零退出。）
-
-要说清边界：**这是诊断口径的反证，不是"外部出口真的挂过"的观察**。本栈每一次完整轮里
-TTS 都是通的（run #21、#23、#24 各三个实例，九次都是 188436 字节），所以 `TTS_OK is False` 那条 SKIP 分支
-至今没有在真实一轮里走过 —— 它今天是被我用 `--add-host` 造出来的。
-
-### 决策面谈 `:5001`：一个按需拉起的子服务，起落两向都判
-
-Fay 的 `genagents` 那条链以前只被记成"5001 没起"，等于没测。它不是常驻端口：
-`gui/flask_server.py:1706` 的 `POST /api/start-genagents` 才把它拉起来，
-`genagents/genagents_flask.py` 里 `:5001` 上的 `GET /` 渲染 `templates/decision_interview.html`，
-`POST :5001/api/shutdown` 立一个 flag、由那条路由自己起的 monitor 线程等干净后 release 端口。
-run #24 起探针把这条起落做成三条判据，三个实例上都是 PASS（fork 组示例）：
-
-| 判据 | 实测 |
-|---|---|
-| 启动路由 | `POST :5000/api/start-genagents` → HTTP 200，回报 `'http://127.0.0.1:5001/'`，`:5001` 在 0.0s 内 bind |
-| 页面渲染 | `GET http://<容器名>:5001/` → HTTP 200、30094 字节，且页面里带着探针传进去那句指令与 `instructionText` |
-| 收尾 | `POST :5001/api/shutdown` → monitor 线程在 1.5s 内 release，`:5001` 关回不监听 |
-
-三处口径值得单写，因为它们是读代码读出来、不是猜的：
-
-1. **这条 POST 必须是 JSON 体**。`flask_server.py:1721` 读的是 `request.get_json()`，
-   探针里那个给 `/api/send` 用的 `http_post()` 发表单，套到这条上只会得到
-   400「缺少克隆要求参数」——所以新加了 `_post_json()`，别顺手复用。
-2. **回报的 URL 是 `127.0.0.1` 硬编码的**（`flask_server.py:1803` 拼的是
-   `http://127.0.0.1:PORT/`）。探针在**另一个容器**里，照着这个 URL 去连必然连到探针自己，
-   所以判据只把回报值当字面证据打印，真正拨号用的是容器名 + 5001。这不是容器的缺陷：
-   在同机浏览器里那个 URL 本来就是对的。
-3. **`check_genagents_interview` 排在预算测量之前、`check_tts` 之后**，因为它只验"镜像里那套
-   模板与 `genagents` 包能不能在容器里拉起一个子服务"，与显存和 LLM 无关，不该被问答预算拖着。
-
-另外记一个**不打补丁的上游静默空转**：`gui/flask_server.py:1753-1758` 那条"清除之前的记忆"
-只有 `from llm.nlp_cognitive_stream import clear_agent_memory`（函数确实存在，fork 里在
-`llm/nlp_cognitive_stream.py:3193`），**导入之后没有调用**，下一行就 `util.log` 出
-"已清除之前的决策分析记忆"。run #24 的容器日志正好把这条坐实了 —— 探针只发了启动与关闭，
-23:48:26 那一句"已清除"照样打了出来。`origin_fay` 同一段一字不差
-（`gui/flask_server.py:1754-1758`，符号在 `llm/nlp_cognitive_stream.py:2402`）。
-它是功能缺失而不是容器化缺陷，探针不去调一个没接线的函数，本栈也不为此改上游 ——
-与本节其它"读到但不动手"的记录同规格。
+**逐轮的实测数字不在这份文档里。** 每一轮跑了几组、通过数与耗时、红的那条是怎么排出来的、
+重试分支在哪几轮触发过、最新一轮离全绿差哪两条，全部按轮次与类型记在
+`AGENTS.md`「逐轮实测记录与失败复盘」—— 照本文部署不需要读它，想改判据的人必须先读，
+否则很容易把一条被实测否证过的决定再改回去。
 
 ## yueshen 知识库：chromadb 那条链路怎么进容器
 
@@ -1691,7 +880,7 @@ run #24 起探针把这条起落做成三条判据，三个实例上都是 PASS�
   `Request` 的视图函数会让 Starlette 再补一个 Response，把 `event: endpoint` 首帧挤掉。
 - `patches/yueshen_rag/0002`：把 `EmbeddingBackend._call_api` 里写死的 `timeout=30`
   开成 `YUESHEN_EMBED_TIMEOUT`。上游那个 30s 撞上的表现很坏：本机换入嵌入模型要 70s 以上
-  （见「真实瓶颈是显存」），超时会落进 `upsert_chunks` 的 `except: 跳过这条 chunk`
+  （见 `AGENTS.md`「真实瓶颈是显存」），超时会落进 `upsert_chunks` 的 `except: 跳过这条 chunk`
   （`server.py:363`），于是 `ingest_yueshen` 返回 `success: true, inserted: 0` ——
   一句错都不报。
 - `overlay/{fay,fay-lite}/mcp_servers.json`：两份都把 id=4 从
@@ -1739,15 +928,15 @@ simulation_engine.gpt_structure import get_text_embedding` 必然失败，
 `_fallback_encoder` 留成 None，嵌入失败就一路 raise 到 `upsert_chunks`，被跳过的那条 chunk
 让 `inserted < chunks` 暴露出来 —— 判据要的就是这个形状。
 
-**这一节全部是 run #27 实测的**（`probe-yueshen` 6/6，且三台 Fay 实例各自把 yueshen
-从白名单 SKIP 变成了两条正面 PASS）。逐条：配置 `id=4 transport=sse ip=http://yueshen-rag:8766/sse`
-（overlay 挂载生效）→ 嵌入出口直连 ollama `/v1/embeddings` `1024 维 0.0s`（qwen3-embedding:0.6b，
-这一步顺手把模型换进显存，下一步入库才不撞冷启动）→ 工具清单 `['ingest_yueshen','query_yueshen',
-'yueshen_stats']` → 入库 `chunks=1 inserted=1 用时 0.1s`（语料 `/app/corpus`，嵌入
-`http://host.docker.internal:11434/v1`）→ 检索「编号里的专项随访要求里，血压与体重要在多长时间内录回系统？」
-返回 1 条命中 251 字、里面带构建期造进 docx 的 MARKER → `yueshen_stats vectors=1` 对上 ingest 的
-`inserted=1`（持久化 `/app/persist`，集合 `yueshen_kb`）。容器内的 SSE 握手冒烟输出
-`event: endpoint` + `session_id=…`，验的就是 0001 那份裸 ASGI 端点没把首帧挤掉。
+`probe-yueshen` 那六条判据就是照这条链排的，一条一环：**配置指向本栈容器**（overlay 挂载
+生效，`id=4 transport=sse ip=http://yueshen-rag:8766/sse`）→ **嵌入出口直连** ollama
+`/v1/embeddings`（1024 维；这一步顺手把模型换进显存，下一步入库才不撞冷启动）→
+**工具清单** `['ingest_yueshen','query_yueshen','yueshen_stats']` → **入库**
+`chunks == inserted`（判据要的就是这个等式，它防的正是上面那种静默跳过）→ **检索**回来的
+那块里带构建期造进 docx 的 MARKER → **`stats.vectors == inserted`**（持久化 `/app/persist`、
+集合 `yueshen_kb`）。容器内的 SSE 握手另判一条：输出 `event: endpoint` + `session_id=…`，
+验的是 0001 那份裸 ASGI 端点没把首帧挤掉。三台 Fay 实例各自还有两条，把 yueshen 从早先的
+白名单 SKIP 变成了正面 PASS。**逐条的实测数字（维度、耗时、字数）在 `AGENTS.md`「run #27」那节。**
 
 ### 外部语料：项目方给的那 14 份 .docx 怎么进库
 
@@ -1788,45 +977,19 @@ bind-mount 挂成 `/app/corpus/kb`，不打进镜像层，有两个原因：27 M
 `inserted:0`。所以 `probes/kb_ingest.py` 在入库之外还必须真问一遍；那 12 问的期望词各自只出现在该去的
 那份文件里，它们同时是**切片质量**的验收：合成语料那种「段落里有个标记词」测不出表格摊平得好不好，真实问法测得出。
 
-**2026-09-22 06:44 的 recall@k 择优**（`./run.sh kb --sweep 3,5,8`，同一套 12 问、同一份 576 向量库）：
+**2026-09-22 06:44 的 recall@k 择优**（`./run.sh kb --sweep 3,5,8`，同一套 12 问、同一份 576
+向量库）：k = 3 / 5 / 8 三档**都是 12/12** —— 表是平的。所以三个旋钮里只动了 `top_k`：
+`overlay/{fay,fay-lite}/mcp_prestart_tools.json` 的 `params.top_k` 钉在 **3**；距离度量维持
+上游默认的 L2、不加阈值（`patches/yueshen_rag/0003` 因此**不打**），切片粒度也不动。
+为什么"没 MISS 就不打补丁"、以及那两个旋钮各自的触发条件，写在
+`AGENTS.md`「知识库那三个旋钮」。
 
-| k | 3 | 5 | 8 |
-|---|---|---|---|
-| recall@k | **12/12** | 12/12 | 12/12 |
+`--sweep` 这条择优本身有反向对照守着：它末尾会临时把某条金标的期望词换成一个语料里确实
+不存在的串，要求这一档**必须变红**；它红了才说明 12/12 是检索给的，不是判据写松了。
 
-三个旋钮里这轮只动了结论能支撑的那一个：
-
-- **`top_k` 取 3，不取 5。** 表是平的 —— k=3 已经把 12 问全捞回，多注入的两条只是让
-  prompt 变长、模型更可能整段抄原文而不是答问题。所以
-  `overlay/{fay,fay-lite}/mcp_prestart_tools.json` 的 `params.top_k` 钉在 3；
-  判据饱和之前不该靠加大 k 换"看起来更准"。
-- **距离度量维持 L2、不加阈值。** 上游建 collection 没传 `hnsw:space`，所以是默认 L2，
-  且 `query` 不做任何阈值过滤（空库才返回空）。开 cosine + 阈值是
-  `patches/yueshen_rag/0003` 的活，触发条件是「top-3 里混进无关片段导致 MISS」——
-  这轮 12/12 没有 MISS，**所以那份补丁不打**，别让一次没有证据的改动进补丁表。
-  留一手可判断据：这轮的 L2 距离实测量程是 0.367（最紧的「康复训练有哪些禁忌情况？」）
-  到 1.008（「人上了年纪肌肉…」第 8 名），真要做阈值，落在 0.55 附近才切得开
-  "期望那份"与"顺带回来的那份"，且必须先有一批 MISS 来验它切掉的是噪声不是答案。
-- **切片粒度这轮不动。** `--max-chars 900` + 服务端二次切 600/120 是 1609 行那笔对账的
-  前提（516 片段 → 575 chunk），而 12 问的 recall 在 k=3 就饱和了：**换成 900/150 再跑
-  一遍也不会让 12/12 变成 13/12**，这把尺子量不出差别。要动它得先加更难的金标问题
-  （跨片段、需要上下文拼接才答得对的那种），否则比较没有读数。
-
-这条「按数据择优」本身有反向对照守着：`--sweep` 末尾那条 PASS 会临时把某条金标的期望词
-换成一个语料里确实不存在的串，要求这一档**必须变红**；它红了才说明 12/12 是检索给的，
-不是判据写松了。
-
-**BuildKit 的 pip 缓存挂载这次单独量了值，也记了为什么 Fay/service 故意不给**。给
-`yueshen_rag.Dockerfile` 的 `pip install` 层加 `--mount=type=cache,target=/root/.cache/pip`
-（并去掉 `PIP_NO_CACHE_DIR`）后，量到向镜像源的实际吞吐只有 ~22–170 kB/s，一次冷缓存要拉
-chromadb 23.3 MB 那个 wheel 约 1067s；缓存挂载命中后同一层重放只要 **2.1s**（整轮 pip 阶段冷建
-累计到 t≈3263s）。但这道挂载对**已经全绿**的 Fay/service 镜像是有害无益的：pip 层的缓存 key 是
-被 COPY 进去的 requirements 文件的**内容哈希**，requirements 没变时 BuildKit 本来就整层复用、
-根本不重跑 pip，加不加 cache mount 结果一样；而 cache mount 会把构建产物偷偷留在 BuildKit 那侧
-（这台机器的 BuildKit 缓存已顶到 GC 上限 45GB），一旦哪天换 requirements，它会用缓存里的旧 wheel
-补上，绕开「requirements 是这一层唯一输入」这个干净假设。所以只给全新、还在反复调 requirements 的
-yueshen 层用，成熟镜像维持不带。另一个坑：同一 Dockerfile 并发跑两次 build 会把这条本就慢的链路
-带宽对半劈、两次都更慢 —— 一次建、盯到底。
+`yueshen_rag` 那层另有一个构建期的取舍：它的 `pip install` 层挂了 BuildKit 的 pip cache，
+而 Fay/service 两层故意不挂 —— 原因与量到的数字在 `AGENTS.md`「pip 缓存挂载只给还在改
+requirements 的那一层」。
 
 ### 业务侧：那一问里知识库到底有没有被用上（`./run.sh kbq`）
 
@@ -1838,7 +1001,7 @@ yueshen 层用，成熟镜像维持不带。另一个坑：同一 Dockerfile 并
 这一问真的驱动了它（回帧里 `<prestart>` 块的 `query=` 逐字等于问句）→ 注入回来的是带
 `〔文件·章节〕` 出处标记、且含期望词的语料片段 → 这一问真的答出来了 → 回帧以 `<dh-end>`
 收尾 → 两问反向对照（假词不许命中；把注册摘掉再问一轮，注入块必须消失）→ 按摘之前读到的
-那份参数把注册恢复回去并回读确认。2026-09-23 首次跑通：**10/10**，远端 26B 单轮 8.1s；
+那份参数把注册恢复回去并回读确认。2026-09-23 首次跑通：**10/10**，那台 26B 单轮 8.1s；
 同日按同一条问法复跑 **9/10 + 1 SKIP**，SKIP 的正是下面第三条那条软证据 —— 同一行两次跑出
 两种颜色，但都不是红，这正是那条要的设计。
 
@@ -1891,114 +1054,28 @@ yueshen 层用，成熟镜像维持不带。另一个坑：同一 Dockerfile 并
 |---|---|---|
 | TCP :10001 连得上并注册用户名 | `fay` PASS ／ `origin-fay` **FAIL** `ConnectionResetError(104)` | 两个实例都 PASS |
 | 远程 PCM 跨过服务端 VAD（:10002 上出现 `Key=log, Value=聆听中...`） | 两个实例都没过（`fay` 是 0 帧，`origin-fay` 根本连不上） | 两个实例都 PASS |
-| ASR 认出文字 | — | SKIP：本栈 `ASR_mode=funasr` 指向 `ws://host.docker.internal:10197`，本机没起 FunASR 服务，与容器化无关 |
+| ASR 认出文字 | — | SKIP：`ASR_mode=funasr` 指向的 `ws://host.docker.internal:10197` 是 **Fay 自己的另一套方言**（裸文本 + `{"vad_need":…}`），而本栈为 H5 起的 `dh-funasr` 说的是 `{"text","is_final"}` —— 两者未接是划出的边界，与容器化无关 |
 
-**第二条是这次新加判据时第一次跑就抓出来的东西**，两条独立的缺陷：
+**第二条是这条判据第一次跑就抓出来的**，抓到的是上游的两条独立缺陷：
 
-> **基线已换，读这两条前先记一句**：下面量的是**旧** `fay/`（`45b44e9`，与上游无共同历史的
-> 一份源码导入）。2026-09-21 起 `fay/` 子模块指向 `chuan918/Fay@f702528`，那是 v4.8.1 的直接
-> 后代、Python 源码与上游逐字节相同 —— 于是**第 2 条那个 fd/线程泄漏在新基线上不存在**（它
-> 属于旧导入版），只剩第 1 条竞态；两个实例现在共用 `patches/fay/0004` 这一份补丁。两段复测
-> 数字都保留原文，因为它们是当时那两个镜像的真实测量，只是不再描述当前的 `dh-fay`。
+1. **监听线程一上线就自杀** —— `__init__` 里 `thread.start()` 排在
+   `self.deviceConnector = deviceConnector` 之前，而 `run()` 第一句就读它，于是新线程
+   几乎必然抛 `AttributeError`；上游把 `except` 从 `pass` 改成「记日志 + 退出 +
+   `close()`」之后，这次异常从「1 秒后自愈」变成「连接被关掉」，客户端看到
+   connect 后立刻 `ConnectionReset`。
+2. **每条连接泄漏一个 fd 和两个线程**（旧基线那份 fork）—— 内层循环既不查
+   `__running` 也不判 `recv()` 返回空字节，对端 FIN 之后线程在死连接上空转。
 
-1. **`origin_fay`（贴近上游那份）的监听线程一上线就自杀。** 上游提交
-   `74b49ae`（"大小模型逻辑重构 + 单模型模式 + 多处优化"）把 `except` 从 `pass`
-   改成「打日志 + `__running = False`」并在循环后 `close()` socket，但
-   `DeviceInputListener.__init__` 里仍是 `self.thread.start()` 在
-   `self.deviceConnector = deviceConnector` **之前** —— `run()` 第一句就读
-   `self.deviceConnector`，于是新线程几乎必然抛 `AttributeError`。改之前这只是
-   1 秒后重试自愈的一次静默异常；改之后它变成「线程永久退出 + 关掉刚 accept 的
-   socket」，客户端表现就是 connect 后立刻 `ConnectionReset`。服务端日志是决定性
-   证据，每条连接一行：
-   `[系统] 远程音频设备 User 监听异常，停止监听线程: 'DeviceInputListener' object has no attribute 'deviceConnector'`
-   （用户名还是默认的 `User`，说明线程在读到注册帧之前就死了。）
-   → `patches/fay/0004-remote-audio-listener-thread-race-CRLF-source.patch`
-   只调这两行的顺序，不动上游那套「记日志 + 退出」的语义。
-2. **（旧基线）`fay`（fork 那份）每条远程音频连接泄漏一个 fd 和两个线程。** 它的
-   `while self.deviceConnector:` 既不查 `__running` 也不判 `recv()` 返回空字节，
-   对端优雅关闭（FIN）后线程就在这条死连接上空转，`stop()` 置的 `__running`
-   也退不出内层循环。实测（`/proc/1/task` / `/proc/1/fd`，PID 1 就是 `main.py`）：
-   5 次 connect/disconnect 让 `dh-fay` 从 `线程=66 fd=96` 涨到 `线程=76 fd=101`，
-   再等 15 秒（keepalive 走完一轮）只回落到 `75/100`；断开完全靠 10 秒一次的心跳
-   扫出来（日志里断开时刻总是落在 10s 网格上）。同一份测量在 `dh-origin-fay` 上
-   是 `90→92→90` 且 fd 全程不动 —— 它不泄漏，代价是连接根本用不了。
-   → `patches/fay/0004-remote-audio-listener-thread-race-CRLF-source.patch`
-   把上游 `74b49ae` 的三段（`and self.__running` / `if not data: break` /
-   线程退出前 `close()`）移植过来，**并且同时带上顺序修正**：只移植上游那段会把
-   fork 也变成第 1 条那个死线程，等于用一个缺陷换另一个。
-   打完补丁复测：fd `38→40→38`、线程 `31→36→34`，约 40 秒后回到基线 31
-   （线程要等自己那一轮 `sleep(1)` 收尾，比 fd 慢是正常的），
-   服务端日志出现补丁新增的 `[系统] 远程音频设备 <user> 连接已关闭，停止监听线程`。
+→ `patches/fay/0004-remote-audio-listener-thread-race-CRLF-source.patch`
+一份补丁同时做两件事：**调那两行的顺序**（治第 1 条）和**补上退出条件**（治第 2 条）。
+两件事必须一起做 —— 只把上游那三段移植进 fork，等于用一个缺陷换另一个，fork 也会变成
+第 1 条那种一上线就自杀的线程。
 
-**这条判据排在同组任何问答之前**（`main()` 里 `check_mcp_sse` 之后、
-`check_llm_baseline` 之前），因为 `core/recorder.py:267` 在 `wake_word_enabled=false`
-时只要 `FeiFei.speaking` 为 True 就丢弃拾音，而 `speaking` 挂在共享的 `FeiFei` 对象上
-（`fay_core.py:1888` 置位，只有 `play_end()` 清），与用户名无关。
-**但「一次成功的带音频回复会把后面的拾音打死」这句推论实测不成立**：在 `fay-lite` 上
-先做一次 `Output=true` 的真回复（audio 帧在 +7.6s 到达），立刻喂同一段 PCM，VAD 照样
-出 `聆听中...`，等 120s 再喂还是出 —— 播放模拟循环走完会调 `play_end` 把 `speaking` 清掉。
-也就是说上面「打补丁前 fay 也 0 帧」这件事**没有**被这条 latch 解释掉：那个实例当时
-已经跑了 4 小时、中间有大量超时中断的会话，重启之后（同时打上 0004）才变绿，两个变量
-没有分离。能确定的是：竞态和泄漏都是代码里读得出来、并且补丁后测量值真的变了的；
-不能确定的是那次 0 帧的成因，所以这里不下结论。排在问答前仍然是对的做法，成本为零。
-
-## 优雅停止：一次正常的 `docker stop` 不该长得像崩溃
-
-`./run.sh test` 收尾会 `compose stop fay-lite`。run #20 之后 `compose ps -a` 里那个实例
-留着 **Exited (1)**，看起来像跑完测试跑挂了 —— 实际它是被 SIGTERM 正常停掉的。今天
-（2026-09-20 22:03/22:04）拿健康的容器直接量了一次，两个实例都复现：
-
-| | `docker stop` 墙钟 | 退出码 | 日志末行 |
-|---|---|---|---|
-| `fay-lite`（fork，未打 0005） | 5.27s | **1** | `清理超时，立即强制退出...` |
-| `origin-fay`（上游，未打 0005） | 5.45s | **1** | 同上 |
-| `fay-lite`（打 0005 后） | 3.84s | **0** | `所有线程已停止` → `程序即将强制退出...` |
-| `origin-fay`（打 0005 后） | 3.88s | **0** | 同上 |
-
-退出码由应用自己决定，跟容器运行时没关系，所以这条只能改代码，而两边代码是同一份：
-`fay/scheduler/thread_manager.py` 与 `origin_fay/` 那份**字节相同**（`diff` 为空），
-上游 `main.py` 的 `signal_handler` 也在同样的行号上。所以这是上游缺陷，不是 fork 回归。
-
-机制是两处叠加，缺一不可：
-
-1. `main.py:155` 给清理线程的预算是 `join(timeout=5.0)`，而 `thread_manager.stopAll()`
-   的第二个循环是**每个线程各排 2 秒**的 `join(timeout=2.0)`。向线程 `raise_exception()`
-   之后只能等它自己回到解释器才收得到 `SystemExit`，卡在 C 层 `recv()` 上的连接线程收不到，
-   于是每个都要满额 2 秒。两个这样的线程（`Thread-1/2 (__connect)`）就 4 秒，加上前面
-   关服务约 0.5 秒和 `cleanup_and_exit` 里那句 `time.sleep(1.0)` —— 5 秒预算正好被吃光，
-   而超时的分支是 `os._exit(1)`。
-2. 走到那个分支并不代表停止失败：它只说明**有几个非守护线程不肯退**，而这正是 `os._exit`
-   存在的理由（服务侧清理在此之前已经全部打完日志完成）。把 SIGTERM 的收尾报成非零，
-   在 `restart: on-failure` 下会把一台本该停下的实例重新拉起来。
-
-补丁做两件事：`stopAll()` 的等待改成**共享一个 2.0s 截止时刻**（`raise_exception()` 早已
-全部发完，剩下的只是等，逐个等满没有意义），`signal_handler` 超时分支改 `os._exit(0)`。
-为什么线程数才是关键：打补丁那次 lite 实际有 8 个线程没能在截止时刻前退干净
-（`__connect`×2、`run`×2、`memory_scheduler_thread`、`__record`、
-`accept_audio_device_output_connect`、`device_socket_keep_alive`），旧写法按 2 秒一个
-摊开是 16 秒 —— 那已经越过 docker 默认的 `stop_grace_period=10s`，dockerd 会直接 SIGKILL。
-**这一步是算术，不是实测**：上表 before 那一行只打出 2 行超时，是因为预算在第 3 个 join
-刚开始时就到期了，"2" 是它来得及处理的个数，不是线程总数。
-
-判据接在 `run.sh test` 的收尾：那里本来就要 `stop fay-lite`，顺手读 `State.ExitCode`
-即可，零额外成本、也不碰显存。只在「停止前它确实在跑」时才判 —— 单独跑某一组
-（`./run.sh test ue-audit`）时 lite 可能早就停着，那时 inspect 读到的是上次留下的旧码，
-拿它判等于伪造证据，这种情况明确打一行「本轮没有证据可取（不算通过）」。这条判据的反证：
-把 cid 指向一个 `ExitCode=1` 的容器，分支如实报红并把整轮 `rc` 置 1。
-
-## 已清理的本地改动
-
-按「bundle + 文件备份后清理」执行，四个仓库现在都是 `main` == `origin/main`、
-工作树干净、无任何未推送提交。当初清理掉的是**不属于上游的本地分支与提交**（用户指示），
-备份当时的归档物包括：`fay` 全分支 bundle（含本地分支 `kb-embedding-test`）、移出的
-`新知识库/` 语料、`chromadb_yueshen/` 向量库、`faymcp-data/` 改过的 MCP 配置。
-
-> **归档已移除**：本次仓库整理时，那份 `_backup/` 归档（约 155MB，含 127MB 的 bundle）经
-> 确认无需回滚后已删除，工作区内不再有这些备份文件，因此上述"拷回/`git fetch <bundle>`"式
-> 的恢复**在本 workspace 内已不可用**。四仓仍与 `origin/main` 一致，未受影响；`service`
-> 仓库里那条 `stash@{0}: local uv.lock changes` 保留未动（不是提交，与清理无关）。
-> 注：`kb-embedding-test` 等是本地专属分支、未推送上游；其唯一副本随本次删除而移除，
-> 属用户在"确认无需回滚"前提下的知情决定。
+两条缺陷的完整排查（决定性日志原文、`/proc/1/task` 与 `/proc/1/fd` 的前后测量、
+新基线为什么让第 2 条不再适用、以及那次 0 帧为什么不能归因给 `FeiFei.speaking`
+那条 latch）在 `AGENTS.md`「远程音频那两个缺陷：`patches/fay/0004` 的来历」。
+这条判据仍排在同组任何问答之前 —— 成本为零，而问答组的拾音会被它先行验过的
+状态影响。
 
 ## CareEcho H5 前端（伙伴方的第四个仓库）
 
@@ -2070,30 +1147,6 @@ compose 里的 `frontend` 是第 7 个常驻服务，默认只绑 `127.0.0.1:517
 于是每一发都是新设备、新会话。判据 7/8 现在钉的就是它，负面自检改坏 cookie 名字之后
 判据 8 确实变红（run #31 里 17/17 + 自检变红同时成立）。
 
-### 密钥不给全，产物里连 ID 都会消失（Vite 的 DCE，不是构建坏了）
-
-数字人形象是魔珐 Xmov SDK，三个 `VITE_XMOV_*`（APP_ID / APP_SECRET / GATEWAY）。
-最初给它们留空，结果构建产物里**连那个 APP_ID 的字符串都搜不到**，一度以为
-"Vite 不认 build arg"。逐条排掉三个假设（`docker run --entrypoint env` 证明 ARG/ENV
-确实进去了；干净小项目里复现证明 vite 6.4.3 的 `resolveConfig().env` 会读 `process.env`；
-不是 `.env.production` 抢占）之后，根因是 **rollup 的死代码消除**：
-`src/api/xmov.js:79` 是
-
-```js
-if (!XMOV_APP_ID || !XMOV_APP_SECRET) { reject(…); return }
-```
-
-两个常量在打包时是字面量，只要有一个为空，这个 `if` 恒真、后面整段（包括那两个
-字面量本身）被摇掉。实测对照：只给 ID → 产物 `index-C34WNEPg.js` **122.39kB、
-`grep -c "nebula-agent\|XMOV\|xingyun3d"` = 0**；两个都给 → `index-CkSrAofW.js`
-**126.77kB、哨兵字符串全在**。
-
-所以本仓库默认构建的是**不含密钥**的那一份（`ARG` 留空）：两个 GitHub 仓库都是公开的，
-把伙伴方的 SDK key 烤进镜像再推上去就是泄漏。要接数字人形象，得自己
-`--build-arg VITE_XMOV_APP_ID=… --build-arg VITE_XMOV_APP_SECRET=…` ——
-**并注意 BuildKit 会警告 `SecretsUsedInArgOrEnv`**：ARG 会留在客户端构建上下文和
-`docker history` 里，这种镜像不能推公开仓库（要推就先去掉那层，或改成 BuildKit secret）。
-
 ### 外壳的判据：`probes/frontend_test.py`（不打 LLM，几十秒）
 
 和前一份自研代码同一套路（假上游在进程内、`check(ok,name,detail)`、负面自检）：
@@ -2114,7 +1167,7 @@ token 过期 → 自动重登换会话并答上 · 两设备并发各进各的�
 `msg` 点名是哪个口 · 负面自检：把 `Set-Cookie` 里的名字改坏一个字母，判据 8 必须撑不住。
 
 `probes/frontend_probe.py` 则相反，它打的是**活栈**：真后端、真 adapter、真 Fay、
-宿主机 Ollama。三条就够 —— 外壳发得出产物、`/api/health` 通、那一问真的答上
+栈外那个对话端点。三条就够 —— 外壳发得出产物、`/api/health` 通、那一问真的答上
 （run #31：86.5s、47 字）。连续性和降级路径不在这组里重复证明，它们已经钉死在上面
 那 19 条里，而那 19 条不依赖显存。
 
@@ -2207,9 +1260,9 @@ ASR LISTEN ws://0.0.0.0:10095  入=PCM16/16k/mono  出={"text","is_final"}
 （同一天实测：修完脚本重跑 asr-seed，Labels 仍为 null、警告照旧）。所以脚本遇到"卷在但没 label"
 只把删除重建那一行原样打出来，不代删 —— 那里面可能是别人下好的 1.3GB。
 
-### 为什么不走宿主 Ollama
+### 为什么不接宿主上现成的 AI 服务
 
-这是本栈第二处**不走** ollama 的 AI 依赖（第一处是浏览器里的 Xmov 云 TTS），
+这是本栈第二处**不由栈外那个 AI 服务提供**的能力（第一处是浏览器里的 Xmov 云 TTS），
 理由不是偏好：ollama 的 `/api/chat` 只收 `text` + `images`，**没有音频输入口**，
 模型清单里也没有 paraformer。与其写一段"我们优先用本地"再悄悄绕过，不如把它写成一行事实。
 
@@ -2222,43 +1275,14 @@ ASR LISTEN ws://0.0.0.0:10095  入=PCM16/16k/mono  出={"text","is_final"}
 | `asr-probe` | 真模型 + 真音频 + 真推流节奏 | 加载（约 20s） | 9 条 |
 
 `asr-probe` 排在**全套最后**：它是这一轮唯一会真的把 torch 拉起来推理的组，
-而这台机器的 CPU 还要留给 ollama 那些不驻留显存的权重 —— 排序规则和 `fay-probe`
-那几组同理（见「实测通过的链路」里的排法）。它的音频不来自任何运行期产物，
+而这台机器的 CPU 还要留给那些没全进显存的模型权重 —— 排序规则和 `fay-probe`
+那几组同理（排在谁前面、为什么，写在 `run.sh` 里 `ALL_GROUPS` 那段注释）。它的音频不来自任何运行期产物，
 而来自仓库里那份 `fay/samples/course_package_player_intro_abin_final.wav`
 （15.26s，16kHz 单声道 16bit —— 正好是模型要的格式，所以只重采样不转码），
 理由是 `fay/main.py:181 __clear_samples()` 会在每次启动清空 `./samples`：
 那个卷是**临时目录，不是语料库**，拿它当测试输入会得到一跑就空。
 另有一层可选的"已知原文"验证（`to_sample` 合成一句我们知道的话再断言关键词命中），
 出网不通时只 SKIP 那半条。
-
-### 13 条判据全绿的那晚，手机仍一个字都识别不出来：426
-
-`ws-relay-test` 第一次跑就 13/13，可同一天从宿主经外壳打真链路是：
-
-```
-dev 直口    192.168.x.x:10095/ -> 101  final='飞。Ai.Ai.'  wall=1.5s
-经外壳转发  192.168.x.x:5173/funasr-ws -> HTTP/1.1 426 Upgrade Required
-```
-
-外壳自己没回这个 426（它的 `ws_dispatch` 只会回 400/404，拨号失败回 502）—— 它回的是**上游**的
-426：转发在建上游请求时把客户端的 `Upgrade` 透传了一份、又在末尾统一补了一份，上游收到两条
-`Upgrade`。拿同一份握手对真 ASR 直接试三种头组合：单条 `Upgrade` → 101，两条 → 426，
-两条 `Connection` → 仍然 101（`Server: Python/3.10 websockets/16.1`，实测 2026-09-21 22:44）。
-所以这不是"哪个上游更挑剔"的运气问题：`open_tunnel` 的剔除名单漏了一个名字。
-
-测试为什么没抓住更值得记：假上游用 `dict` 收请求头，同名头被折叠成一条，判据 5 于是永远看不见
-重复 —— **假上游比真上游宽松一寸，转发侧的 bug 就只在生产里露头**。三处一起改：
-
-- `frontend/carecho_web.py` 的剔除名单加 `"upgrade"`（客户端那条一律不进上游，由补回的那两条统一给）；
-- `probes/wsutil.py` 的 `server_handshake` 改成"照真上游的严度"：`Connection`/`Upgrade`/
-  `Sec-WebSocket-Key`/`Sec-WebSocket-Version` 任一重复就回 426 并记名（所以判据 4 会红，
-  detail 直接写"上游因为重复的请求头拒了握手"），头对象换成带 `.duplicates` 的 `RequestHeaders`
-  —— 观测能力没变窄，但重复这件事不再是不可见的；
-- 新增**负面自检 C**：把剔除名单里的 `"upgrade"` 删掉（即精确还原这次的 bug），判据必须变红。
-  改完 `ws-relay-test` 是 14/14，其中 `13 … 变红=True —— 上游因为重复的请求头拒了握手：['upgrade']`。
-
-修完再跑那次真链路，两个方向数字一致（外壳转发 wall=1.2s、直口 1.5s，同一条 final），
-这才是「生产里 H5 靠同源转发拿到识别」这句话的证据 —— 在此之前它只有假上游那一半。
 
 ### 一个必须写下来的质量边界
 
@@ -2328,7 +1352,7 @@ UE 自己按 BOM 定字符集，读得懂，所以判据必须先认 BOM。实�
   **没证的是**让 9b 在一次问答里自己决定调用工具。原因不是显存（run #21 那一轮 9b
   权重 100% 驻留、直连 3.0s，单发问答照出 34~42 字），而是 fork 的决策路
   `_call_planner_llm` 一次问答要多发好几发 LLM，预算按「一次生成」标定撑不到
-  「一轮问答」—— 分档判据和这条边界怎么设计的，见上面「『Fay 会调工具』这句话，探针只敢证到中间那一档」。
+  「一轮问答」—— 分档判据和这条边界怎么设计的，见 `AGENTS.md`「探针只敢证到中间那一档」那节。
 - **桌面侧的 MCP 服务器连不上，但探针只对「白名单内的失败」给 SKIP。**
   `mcp_servers.json` 六台里 id=5 `window capture` 要桌面窗口 —— 无头容器里注定连不上，
   写进 `fay_probe.HEADLESS_UNAVAILABLE`。语义是**允许失败的白名单**，不是断言不能用的黑名单：
@@ -2341,7 +1365,7 @@ UE 自己按 BOM 定字符集，读得懂，所以判据必须先认 BOM。实�
   （compose 里挂的是 `overlay/<实例>/`，不是 `fay/`），宿主机上的 `fay/` 仓库不会被改动
   （`./run.sh audit` 盯的就是这条）。代价是**脏的是 containerd 自己**：那三份是 git 跟踪的
   bind-mount 可写文件，每跑一轮测试 `connection_time` 就变一次，提交前要 `git checkout --`
-  掉，别把运行期漂移混进基线提交（成因与为什么不换挂载方式，见「run #28」末段）。
+  掉，别把运行期漂移混进基线提交（成因与为什么不换挂载方式，见 `AGENTS.md`「run #28」末段）。
 - **语音输入的麦克风那一半**：容器无声卡，`record.enabled=false`，`RecorderListener`
   这条路不会被触发。准确地说它停在哪一步：`fay_booter.py:416-417` 无条件起了这个线程，
   但 `RecorderListener.get_stream()` 第一件事是每 0.1s 轮询 `record.enabled`，
@@ -2404,7 +1428,7 @@ UE 自己按 BOM 定字符集，读得懂，所以判据必须先认 BOM。实�
   语料 `fay/fay_player_knowledge`（13MB）没有被 `.dockerignore` 排掉。
   另一条 `mcp_servers/yueshen_rag/`（id=4）此前记的是「不在本 compose 的能力范围内」，
   理由是它的 `requirements.txt` 要 chromadb 而依赖层按启动链收窄时刻意不装
-  （见「依赖层为什么不能直接用 fay/requirements.txt」）。**这条现在改成了单开一个服务**：
+  （见`AGENTS.md`「依赖层为什么不能直接用 fay/requirements.txt」）。**这条现在改成了单开一个服务**：
   `images/yueshen_rag.Dockerfile` + compose 里的 `yueshen-rag`，chromadb 装在那一边、
   Fay 这半边的 `uvicorn<0.35` + `websockets~=10.4` 一道也不动。要让 Fay 连得过去还差两处，
   都不在上游仓库里：`patches/yueshen_rag/0001` 把只有 stdin 的 stdio transport 开成
@@ -2417,45 +1441,3 @@ UE 自己按 BOM 定字符集，读得懂，所以判据必须先认 BOM。实�
 - **UE5**：不进 compose。判据、数字和"零处引用"到底是怎么否证掉裸 `10002` 命中的，
   见上面「UE 仓库的容器侧处置」。
 
-## 与既有宿主服务的隔离
-
-宿主机已经跑着 `mysql`（占 0.0.0.0:3306）和 `redis` 两个容器。本栈新建的是**自己的**
-`dh-mysql` / `dh-redis`，宿主端口用 13306 / 16379，内部走 compose 网络，互不影响；
-数据在 `mysql-data` / `redis-data` 卷里，`./run.sh reset` 会连卷一起删。
-
-`dh-redis` 是**跟着上游的依赖声明建的，不是被测出来的**：`service/app/core/config.py:28`
-有 `redis_url` 字段、`pyproject.toml:17` 依赖 `redis>=8.0.1`，但全仓 grep 不到任何一处
-使用 —— 上游自己的 `.env.example:13` 和 `README.md:20` 都写着「预留，当前核心流程未强依赖」。
-所以「redis 健康」不是后端功能正常的证据，反过来说，后端把 Redis 停掉也不会有任何测试变红；
-等它真被用上（缓存/任务队列）时，这条得补进测试件。
-
-工程根目录里那份 `compose/docker-compose.yml`（2026-08-16）**不是本栈的前身或备用配置，
-而是一张便条**：它的全部 `services:` 都被注释掉了，注释里写的是「当前环境已有
-Docker MySQL + Redis 运行，数据库 `care_echo_rehab` 已创建」—— 也就是原作者当年直接
-复用了宿主上别人的容器。本栈不复用、也不改它：依赖自建、端口另开，才谈得上可复现。
-它旁边那份 `compose/.env`（2026-08-16）同理**只属于那张便条**：那份 yml 去掉注释行后
-只剩三个空行（一个能跑的 service 都没有），自然也没有任何生效的 `env_file:` 指向它；
-本栈的密钥由 `run.sh` 从 `.env.example` 复制并随机填充成 `containerd/.env`
-（被 `containerd/.gitignore` 排除）。两份的键名有重叠
-（`MYSQL_*` / `JWT_*` / `REDIS_*`）但值互不相同，且那份还带着 `WECHAT_APP_SECRET` 等第三方
-凭据 —— 本栈既不读它、也不把它复制进任何镜像层或 `.env`；**没删它**，那属于上游作者的本地文件。
-四个上游仓库的容器化覆盖情况：`fay/`、`service/`（+ 新增的 `adapter/`）、`frontend/`
-进 compose 并被测试件覆盖，`ue/` 的边界与判据见上面「UE 仓库的容器侧处置」。
-
-还有一处端口撞车值得记下来：dev 档位给 Fay 音频桥选的宿主端口是 **10199 而不是 9001**，
-因为这台机器的 9001 已经被别人的 nextcloud 占着。本栈不复用、也不重启宿主上任何
-既有容器 —— 需要端口时让 `FAY_BRIDGE_PORT` 可以让它落在别处。
-
-### ⚠️ 宿主机遗留：git 的 insteadOf 里躺着明文 token
-
-这一条不属于本栈，但会影响每一个照本 README 操作的人，所以记在这里而不是塞进根 README 的门面：
-
-本机 `~/.gitconfig` 里有一条全局改写
-`url."https://<用户>:gho_…@github.com/".insteadOf = "https://github.com/"`，
-把 `gh auth` 的 OAuth token 以明文写死，并让**所有** GitHub remote 在 `git remote -v`
-里显示成带 token 的形式 —— 包括 `fay/` 里那个 `upstream` remote。实际上四个上游仓库各自的
-`.git/config` 存的都是干净 URL，token 只在克隆/拉取时由这条改写注入。
-
-建议的处理：删掉这条 insteadOf，改用已装好的 `git credential helper`（`gh auth git-credential`）；
-主机若共享，还应**轮换该 token**，因为删配置不会让它从未出现在进程列表和 `git remote -v` 的历史里。
-这是宿主机全局 git 配置，本仓库不代为修改，也不把它当成集成问题来"修"。
