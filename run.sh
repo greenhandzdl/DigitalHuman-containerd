@@ -25,6 +25,9 @@
 #                      是多少？」），取那一问的原始回帧判注入与引用；换问法时不给期望词则
 #                      「片段含词/正文用上了」两条按 SKIP 处理，只判注入这条路通不通
 #   ./run.sh logs [s]  看日志（s 可为 fay/backend/adapter/frontend/funasr/mysql/redis）
+#   ./run.sh env       .env → 容器的映射视图：每一行落到哪个服务（容器里的变量名与 .env 里
+#                      的名字不一致时会标出来），以及两份对账 —— compose 会读但 .env 没写的
+#                      键（走默认值）、.env 里写了但没有任何服务读的键（改了不生效）
 #   ./run.sh ps|down|reset
 set -euo pipefail
 cd "$(dirname "$(readlink -f "$0")")"
@@ -69,6 +72,10 @@ use_profile() {
 }
 
 ensure_env() {
+  # 与 .env 同族的一件事：overlay 那三份 json 是 Fay 运行期会整份回写的 bind-mount 源，
+  # 仓库里只留 .example 模板，本地那份由 tools/gen_overlay.py 首跑复制。放在早退之前，
+  # 这样每一条会起容器的命令都覆盖得到；文件都在时它完全静默。
+  python3 tools/gen_overlay.py
   if [ -f .env ]; then return; fi
   # 随机 DB 密码与 JWT 密钥的生成逻辑收敛到 tools/gen_keys.py（单一来源）
   python3 tools/gen_keys.py
@@ -536,7 +543,9 @@ case "${1:-up}" in
     echo
     echo "[audit] containerd 侧的全部改动都在这些目录里（上游零改动）："
     echo "  patches/  $(find patches -name '*.patch' | wc -l) 个补丁：$(find patches -name '*.patch' -printf '%P ' 2>/dev/null || echo 无)"
-    echo "  overlay/  $(find overlay -type f | wc -l) 个覆盖文件"
+    # overlay 的计数要说清两件事：这里 find 到的是**本地目录**，含首跑生成、不入库的那几份；
+    # 而 .example 的份数正好等于「Fay 会整份回写、所以只把模板交给 git」的那几份。
+    echo "  overlay/  $(find overlay -type f | wc -l) 个覆盖文件（其中 $(find overlay -type f -name '*.example' | wc -l) 份是 .example 模板，配对的实值由首跑生成、不入库）"
     echo "  seed/     $(find seed -type f | wc -l) 个参考语料"
     echo "  probes/   $(find probes -name '*.py' 2>/dev/null | wc -l) 个测试件：$(find probes -name '*.py' -printf '%P ' 2>/dev/null || echo 无)"
     # tools/ 也是"不改上游、全在 containerd 侧"的一部分（跑 pytest 前重建测试库那个脚本），
@@ -690,11 +699,23 @@ case "${1:-up}" in
       -c 'cp -a /from/. /to/ && printf "  文件 %s 个 / %s\n" "$(find /to -type f | wc -l)" "$(du -sh /to | cut -f1)"'
     echo '[asr-seed] 已拷入；下次起 funasr 就是本地命中（docker logs dh-funasr 里看 ASR MODEL src=local）'
     ;;
+  env)
+    # 「我改的这行到底进不进那个容器」——一条命令看清 .env → 容器的映射，顺带对三份账。
+    # 统计口径固定把**两份 compose 与两个 profile 全算上**：变量表是跨档位的，只按当前档位
+    # 扫会把 dev 才引用的 FAY_BRIDGE_PORT / FUNASR_PORT 误报成没人读，也会把只有
+    # fay-lite 读的 FAY_LITE_MODEL_ENGINE 报成死键。
+    shift
+    ensure_env
+    use_profile
+    python3 tools/env_map.py \
+      --compose docker-compose.yml --compose docker-compose.dev.yml \
+      --tier "$DH_ENV" "$@"
+    ;;
   build)   ensure_env; use_profile; $COMPOSE build ;;
   smoke)   shift; ensure_env; use_profile; smoke ;;
   ps)      shift; use_profile; $COMPOSE ps ;;
   logs)    shift; use_profile; $COMPOSE logs -f --tail=120 ${1:-} ;;
   down)    shift; use_profile; $COMPOSE down ${1:-} ;;
   reset)   shift; use_profile; echo "[run] 将删除全部卷（DB/记忆/日志），5 秒内 Ctrl-C 取消"; sleep 5; $COMPOSE down -v ${1:-} ;;
-  *)       echo "用法: $0 {up|build|test|smoke|audit|upstream|kbslice|kb|kbq|ps|logs [svc]|down|reset}" >&2; exit 1 ;;
+  *)       echo "用法: $0 {up|build|test|smoke|audit|upstream|kbslice|kb|kbq|env|logs [svc]|ps|down|reset}" >&2; exit 1 ;;
 esac

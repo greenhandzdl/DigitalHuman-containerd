@@ -23,8 +23,11 @@ containerd/
 ├── docker-compose.dev.yml      ★ dev 档位叠加层：放开应用面端口 + DEBUG=true + FAY_URL
 │                               （只在 ./run.sh dev 时被叠上，见「dev / prod 档位」）
 ├── run.sh                      up · dev · build · test · smoke · audit · upstream · logs
-│                               · kbslice · kb · kbq · asr-seed · ps · down · reset
-├── .env.example                模板；run.sh 首次执行会复制成 .env 并填随机密钥（DH_ENV 也在里面）
+│                               · kbslice · kb · kbq · env · asr-seed · ps · down · reset
+├── .env.example                全部旋钮的完整清单（注释掉的行 = 不设）；run.sh 首次执行会逐字
+│                               复制成 .env 并填随机密钥（DH_ENV 也在里面），见「配置这一层」
+├── tools/env_map.py            `./run.sh env` 的实现：扫两份 compose，打印每行 .env 的去向
+│                               与三份账的对账（哪些键没人读、哪些键没写、模板漏了谁）
 ├── images/
 │   ├── fay.Dockerfile          Fay 镜像（唯一一份 Fay 源码 ../fay；原先靠 ARG FAY_SRC
 │   │                           多构建一个上游参照镜像，那三个 ARG 随实例一起删了）
@@ -35,8 +38,11 @@ containerd/
 │   └── funasr.Dockerfile       torch(cpu) + funasr，运行时代码是本层的 asr/server.py（见「FunASR」）
 ├── overlay/                    ★ 覆盖层：不改源码的配置手段
 │   ├── {fay,fay-lite}/system.conf      仓库里不存在，容器里必须有（见下）
-│   ├── {fay,fay-lite}/config.json      关麦克风、关本地播放、换 edge_tts 音色
-│   ├── {fay,fay-lite}/mcp_servers.json  把 id=4 yueshen 从 stdio 换成 sse 指向容器（每实例一份、可写）
+│   ├── {fay,fay-lite}/{config,mcp_servers,mcp_prestart_tools}.json.example
+│   │                               跟踪的是**模板**：这三份是可写挂载的源，Fay 会整份回写，
+│   │                               所以实值不入库，本地那份由 tools/gen_overlay.py 首跑复制
+│   │                               （config.json 关本地播放与直播间；麦克风这份按现状开着）
+│   │                               mcp_servers.json 把 id=4 yueshen 从 stdio 换成 sse 指向容器，每实例一份
 │   ├── 依赖清单只有一份：
 │   │   overlay/fay/requirements-docker.txt     fay 与 fay-lite 同一镜像、同一份清单
 │   └── {service,yueshen_rag,funasr}/requirements-docker.txt  其余镜像各自的依赖清单（冲突处理见下）
@@ -58,6 +64,8 @@ containerd/
 │                               · asr_test.py（FunASR 协议自测：假模型、不加载 torch）
 │                               · asr_probe.py（真模型链路：把仓库里的真语音按浏览器节奏推进去）
 ├── tools/                      reset_test_db.py（跑 pytest 前重建测试库）· tts_negative_control.py
+│                               · gen_keys.py（.env.example → .env，只填三个随机密钥）
+│                               · gen_overlay.py（overlay 的 .json.example → 本地那份，只补缺失的）
 │                               · make_yueshen_corpus.py（构建期造 yueshen 语料，见「yueshen 知识库」）
 │                               · slice_kb_corpus.py（把项目方给的 .docx 按原序摊平成可检索的切片）
 │                               · check_mermaid.py（两份 README 里 mermaid 块的离线结构自查，见「服务拓扑」末）
@@ -157,6 +165,8 @@ cd containerd      # 本目录（仓库里唯一有可执行入口的地方）
                    # 换问法：./run.sh kbq <问题> [期望词]（不给期望词则「含词」那两条记 SKIP）
 ./run.sh asr-seed  # 本机若已有别处下好的 FunASR 模型缓存卷，拷进本栈的卷（省 1.3GB 下载）
 ./run.sh logs fay  # 单独看某个服务（fay/backend/adapter/frontend/funasr/mysql/redis）
+./run.sh env       # .env → 容器的映射与对账：哪一行进了哪个容器、哪个键没写所以走默认值、
+                   #   哪一行写了但没有任何服务读（改了不生效）。见「配置这一层」一节
 ```
 
 入口：
@@ -203,6 +213,106 @@ compose 只把前三个
 默认只绑 `127.0.0.1`。要给别的机器（手机、跑 UE 的那台 Windows）连，用的是
 **`./run.sh dev`**，不是手改 `BIND_ADDR` —— 后者在 prod 档位下会被直接拒掉，
 理由见下一节。
+
+## 配置这一层：`.env` 里哪一行真的进得了容器
+
+容器里的环境变量只有两处来源：compose 各服务 `environment:` 里手写的键，和
+`--env-file .env` 提供的那些 `${VAR}` 插值。**这两处对不上的时候 docker 不报错** ——
+`.env` 里多出来的键没人读，改了等于没改，而屏幕上什么都不会发生。这类事靠人记住
+50 个 `${VAR}` 各自被谁读是靠不住的，所以写成了一条命令：
+
+```
+./run.sh env        # 三栏：每行落到哪个容器 / compose 会读但 .env 没写的键 / 没有任何服务读的键
+```
+
+第一栏顺手解决另一个坑：`.env` 里的键名与容器里的键名**经常不一样**，肉眼对不出来 ——
+`MYSQL_ROOT_PASSWORD` 进后端三兄弟时改叫 `MYSQL_PASSWORD`，`YUESHEN_EMBED_MODEL` 进
+Fay 时改叫 `FAY_EMBEDDING_MODEL`（一组键喂两侧是故意的，见 compose 的 `x-llm-endpoint`），
+`REDIS_PASSWORD` 则分别以命令行参数和嵌在 `REDIS_URL` 里两种形态出现。这些都在第一栏标出来。
+
+第二栏是"想改但找不到那一行"的出口：compose 读了它、`.env` 没写，于是走 `${VAR:-默认}`
+里那个默认值 —— 要改就得**新增**一行，而不是去改一个名字看着像、其实没接上的键。
+
+### 这一条命令是被一次真事逼出来的（2026-09-23）
+
+切到远端那台 26B 时往 `.env` 写了：
+
+```
+FAY_GPT_MODEL_ENGINE=gemma-4-26b-a4b-nvfp4
+FAY_BIG_MODEL_ENGINE=gemma-4-26b-a4b-nvfp4
+```
+
+而 `docker exec dh-fay env | grep MODEL_ENGINE` **一条都没有**，`docker exec dh-fay python -c
+"from utils import config_util as c; c.load_config(); print(c.gpt_model_engine)"` 印出来的是
+`system.conf` 里的 `qwen3.5:9b`。原因是 `x-llm-endpoint` 那个锚点只透传了
+patches/fay/0009 放开的端点与密钥，漏了 0006 放开的模型名两条 —— lite 实例反而有
+（`FAY_LITE_MODEL_ENGINE` 单独写在它自己那段里），所以这个洞只有主实例会踩。
+
+它为什么没被发现：**远端不校验 `model` 字段**。同一台远端 `/v1/models` 实测只返回
+`['gemma-4-26b-a4b-nvfp4']` 一条，请求里写 `qwen3.5:9b` 它照答，于是"配的模型名"和
+"真正在答的那个模型"这两件事一直没对上过账面，而 `kbq` / `smoke` 全绿。换一台严格一点的
+OpenAI 兼容服务端（vLLM 默认就校验），症状立刻变成每一发 500 —— 那才是这个洞真正的代价。
+
+修法就是把两条键补进锚点，默认值仍是空：补丁写的是
+`os.environ.get('FAY_GPT_MODEL_ENGINE') or 原值`，空串走 `or` 分支，所以
+**不设这两条时逐字等于改之前**（回落 `system.conf`），新克隆的行为一点没动。
+复跑 `./run.sh kbq` 仍是 9/10 + 1 SKIP、退出码 0、8.1s 一发 —— 这一问的注入与正文与换名之前
+同构，因为对端本来就只有一个模型。
+
+### 于是定了三条纪律
+
+1. `.env.example` 是**所有可调旋钮的完整清单**：compose 引用的每个 `${VAR}` 在模板里都有一行
+   （没写的那 14 个是这次补的：`ADAPTER_SETTLE_SECONDS`、`FUNASR_MODEL` 那四条模型钉版本、
+   `JSON_DATA_DIR`、`MYSQL_TEST_DB`、`YUESHEN_EMBED_TIMEOUT`、`YUESHEN_RAG_PORT`、
+   lite 那三条、以及刚才那两个模型名）。`./run.sh env` 的第三栏就是这条规矩的自检。
+2. **注释掉 = 不写进 `.env`**。`tools/gen_keys.py` 是逐字复制模板再填三个随机密钥的，
+   所以"活跃"的那 27 个键就是新克隆的默认行为，其余全按注释态给（注释里写的值就是
+   compose 的 `:-` 默认值，照它改不会错）。键名行**不带行尾注释**：dotenv 对内联 `#` 的处理
+   按版本有差异，写在上一行才安全。
+3. 每一行标 `# ↳` 说明它落在哪个容器：`↳ dh-fay` / `↳ 不进容器`（只被 `ports:`、`extra_hosts:`
+   用的那九条端口键和 `BIND_ADDR`）/ `↳ run.sh`（`DH_ENV`、`OLLAMA_PORT`）。
+   端口那几条尤其值得标出来 —— 它们看起来像"容器的配置"，其实改的是宿主发布，
+   容器内部永远听自己的 8080/8000/5000。
+
+### 同一条规矩也管 overlay 那三份 json（2026-09-23）
+
+`config.json` / `mcp_servers.json` / `mcp_prestart_tools.json` 是**可写** bind-mount 的源文件，
+Fay 运行期整份重写回来。三种噪声都是实测的，没有一种是人写的：
+
+| 文件 | 谁写的 | 这轮量到的样子 |
+|---|---|---|
+| `mcp_servers.json` | `faymcp/mcp_service.py:132` 每次连接/断开刷新 `connection_time` | 重启一次就变 `17:44:24`，六个字段里三条跟着动 |
+| `config.json` | 控制台一保存，`json.dump` 默认 `ensure_ascii=True` | 全部中文变 `\u5eb7\u517b\u966a\u4f34` 这种转义，diff 一片红 |
+| `mcp_prestart_tools.json` | `prestart_registry.py:61-69` 的 `json.dump` 不补行尾 | 唯一的改动是 `\ No newline at end of file` |
+
+它们从容器化那次提交起就在跟踪里（历史版本里现在就躺着 `"connection_time": "2026-09-21 12:10:55"`），
+后果不是泄露什么，而是**每轮提交都得人肉判断一遍这行是谁写的**。所以按 `.env` 那条同款规矩拆开：
+
+```
+overlay/{fay,fay-lite}/*.json.example     跟踪：人写的基线（UTF-8 原字、带换行）
+overlay/{fay,fay-lite}/*.json             忽略：本地实值，run.sh 首跑由 tools/gen_overlay.py 复制
+```
+
+生成只在目标缺失时发生，存在就一个字不动 —— 已经调好的设定不会因为又跑了一次 `up` 被抹掉；
+反过来改了模板要 `python3 tools/gen_overlay.py --force` 才落到本地。挂载路径本身没变，
+所以 compose 那十一条 volume 一行没动。
+
+这次顺手把 `record.enabled` 定成 `true`（本地麦克风采集开着）。容器里没有音频输入设备，
+代价是启动日志多一行、然后照常就绪，实测：
+
+```
+[系统] 打开麦克风时出错: No Default Input Device Available
+[系统] 服务启动完成!
+```
+
+验证是按"会不会再脏"来做的：`docker compose restart fay` + 一整轮 `./run.sh kbq`
+（**9/10 + 1 SKIP**，跳的还是那条正文复现原词的软证据）之后，生成那三份拿到了新时间戳，
+三份 `.example` 的 md5 一字未变；再把六份本地文件全删掉、只跑 `./run.sh env` 就都回来了。
+
+**一个坑记在这里**：bind-mount 在容器创建时就把 inode 钉住了。`git mv` 把文件改名之后，
+还在跑的旧容器会把它那份内存里的状态写回**改名后的那个 inode** —— 也就是写进模板。
+这轮真踩到一次（模板被回成了改动前的时间戳，只能再 `git show HEAD:` 覆盖回去）。
+所以：改过任何一条挂载指向的文件，必须先 `up -d --force-recreate` 再谈内容对不对。
 
 ## dev / prod 档位与跨机流量
 

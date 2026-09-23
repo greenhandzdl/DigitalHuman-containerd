@@ -6,7 +6,11 @@ name: digitalhuman
 # 设计约束（对应上游分析里的四条断裂接缝）：
 #   * 不改 fay / service / ue 任何一行代码。环境差异全部由 overlay 挂载解决：
 #       containerd/overlay/fay/system.conf -> /app/system.conf   (仓库里不存在，必须提供)
-#       containerd/overlay/fay/config.json -> /app/config.json   (关掉麦克风与本地播放)
+#       containerd/overlay/fay/config.json -> /app/config.json   (关本地播放与直播间)
+#     这三份 json（config / mcp_servers / mcp_prestart_tools）在仓库里存的是 **.example
+#     模板**：它们都是下面那种**可写**挂载的源文件，Fay 运行期会整份重写回来（connection_time、
+#     ensure_ascii 把中文转成 \uXXXX、末尾换行被吃掉），所以实值不进 git，本地那份由 run.sh
+#     首跑复制（tools/gen_overlay.py）。挂载路径本身没变，但新克隆得先跑过一次 run.sh。
 #   * 后端与 Fay 的契约不同形（后端 POST /api/chat，Fay 只有异步 /api/send + /api/get-msg
 #     轮询），由 adapter 服务在中间转换，两边源码保持原样。
 #   * 所有 AI 能力走宿主机 Ollama：extra_hosts 用 host-gateway 拿到 host.docker.internal。
@@ -74,6 +78,13 @@ x-llm-endpoint: &llm-endpoint
   # Fay 写进仿生记忆的向量与知识库检索用的向量必须出自同一个模型、同一个端点，分叉的
   # 症状是「检索永远命中不到刚灌进去的内容」，且不报错（本机踩过一次，见 EMBEDDING_TIMEOUT
   # 上面 run #7 那段）。留空时两边各自回落默认，实测仍指向同一个宿主 ollama。
+  # patches/fay/0006 放开的其实是四个键：base_url / api_key / **model_engine** 各两条。
+  # 下面四个端点键来自 0009，模型名这两条却是后补的 —— 漏的时候 `.env` 里写
+  # FAY_GPT_MODEL_ENGINE 一点作用也没有（`docker exec dh-fay env` 里根本没有这个键），
+  # 改的人以为换了模型，实际发的还是 system.conf 里那个名字。留空 = 逐字回落 system.conf
+  # （补丁的写法是 `os.environ.get(...) or 原值`，空串走 or 分支），所以这两条默认空是安全的。
+  FAY_GPT_MODEL_ENGINE: ${FAY_GPT_MODEL_ENGINE:-}
+  FAY_BIG_MODEL_ENGINE: ${FAY_BIG_MODEL_ENGINE:-}
   FAY_EMBEDDING_MODEL: ${YUESHEN_EMBED_MODEL:-}
   FAY_EMBEDDING_BASE_URL: ${YUESHEN_EMBED_BASE_URL:-}
   FAY_EMBEDDING_API_KEY: ${YUESHEN_EMBED_API_KEY:-}
@@ -121,6 +132,8 @@ x-fay-healthcheck: &fay-healthcheck
 # 详见 patches/yueshen_rag/0001。两份而不是共用一份，因为 mcp_service.py:132 在每次
 # 连接/断开后整份重写这个文件（更新 connection_time），两个容器写同一个宿主文件会互相盖。
 # 所以这条挂载刻意不带 :ro。两个实例各挂自己那份，见 overlay/{fay,fay-lite}/。
+# 「会整份重写」这一条也是这三份 json 在仓库里只以 .example 存在的直接原因 —— 同一条挂载
+# 上，人手写的基线进 git、机器回写的实值留本地，两件事不再混在一个文件里。
 
 services:
   mysql:
@@ -236,6 +249,8 @@ services:
       <<: [*llm-timeouts, *llm-endpoint]
     volumes:
       - ./overlay/fay/system.conf:/app/system.conf:ro
+      # 下面这三条的宿主侧源文件不在仓库里 —— 仓库里是同名的 .example 模板，本地这份
+      # 由 run.sh 首跑复制（它们都是可写挂载，Fay 会回写）。
       - ./overlay/fay/config.json:/app/config.json
       - ./overlay/fay/mcp_servers.json:/app/faymcp/data/mcp_servers.json
       # prestart 注册表：让知识库在 LLM 推理之前就先跑一次 query_yueshen，

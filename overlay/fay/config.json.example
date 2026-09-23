@@ -41,7 +41,7 @@
         },
         "record": {
             "device": "",
-            "enabled": false
+            "enabled": true
         },
         "wake_word": "你好",
         "wake_word_enabled": false,

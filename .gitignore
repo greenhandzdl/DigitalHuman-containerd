@@ -3,6 +3,16 @@
 **/__pycache__/
 *.pyc
 
+# Fay 运行期会**整份重写**的那三份 bind-mount 源。仓库里只留同名的 .example 模板，
+# 本地这份由 run.sh 首跑复制出来（tools/gen_overlay.py，与上面的 .env 同一条规矩）。
+# 挡的不是秘密而是噪声：mcp_servers.json 的 connection_time 每次连接都刷新、config.json
+# 一旦被控制台保存中文就全变 \uXXXX 转义、mcp_prestart_tools.json 的末尾换行被 json.dump
+# 吃掉 —— 三者都不是人改的，但都常驻 `git status`，于是每次提交都要人肉判断一遍"这行是谁写的"。
+# 挂载源路径不变，所以新克隆必须先跑过一次 run.sh（任何子命令都行）再起容器。
+overlay/*/config.json
+overlay/*/mcp_servers.json
+overlay/*/mcp_prestart_tools.json
+
 # 项目方给的科普语料的切片产物。**数据不进 git，工具进**（tools/slice_kb_corpus.py、
 # probes/kb_ingest.py、compose 里那条 bind-mount、README 那节都在）。理由不是体积而是
 # 归属：这批 .docx 是伙伴方的交付物，而 DigitalHuman 与 DigitalHuman-containerd 两个
